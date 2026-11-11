@@ -1,0 +1,16 @@
+name: Идея / Feature request
+description: Чего не хватает в кооперативе
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Что хочется
+      description: Что должно работать в кооперативе и как это выглядит в одиночной игре
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Зачем
+      description: Когда это мешает играть вдвоём

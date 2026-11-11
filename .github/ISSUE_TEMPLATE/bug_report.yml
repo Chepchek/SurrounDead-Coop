@@ -1,0 +1,50 @@
+name: Баг / Bug report
+description: Что-то не работает или работает не так
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо! Чтобы баг можно было найти, очень нужны логи: файл `SurrounDead\Binaries\Win64\ue4ss\UE4SS.log` **сразу после проблемы** (при следующем запуске игры он перезаписывается) — лучше с обоих компьютеров. Перед отправкой можно заменить в логе свои ники.
+  - type: input
+    id: version
+    attributes:
+      label: Версия мода
+      description: Строка `[SNAP] head v=…` в логе или имя архива
+      placeholder: 0.6.61
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: У кого проблема
+      options:
+        - У хоста
+        - У клиента
+        - У обоих
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло
+      description: Что делали, что ожидали, что вышло вместо этого. Скриншот или видео очень помогают.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить
+      placeholder: |
+        1. Хост загружает сохранение
+        2. Клиент подключается и ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: Перетащите сюда UE4SS.log хоста и клиента (можно в .zip)
+  - type: input
+    id: network
+    attributes:
+      label: Как подключались
+      placeholder: Radmin VPN / ZeroTier / проброс порта / один ПК

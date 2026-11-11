@@ -1,0 +1,24 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.4
+        run: sudo apt-get update -q && sudo apt-get install -y -q lua5.4
+      - name: Syntax (luac -p)
+        run: |
+          for f in mods/SDCoop/scripts/*.lua; do luac5.4 -p "$f"; done
+          echo "$(ls mods/SDCoop/scripts/*.lua | wc -l) files OK"
+      - name: Accidental globals
+        run: |
+          python3 tools/globalscan.py luac5.4 mods/SDCoop/scripts/*.lua | tee scan.txt
+          # sdc_perf wraps RegisterHook / NotifyOnNewObject on purpose
+          if grep ': global ' scan.txt | grep -v -E "sdc_perf.lua: global WRITE '(RegisterHook|NotifyOnNewObject)'"; then
+            echo "unexpected global access"; exit 1
+          fi

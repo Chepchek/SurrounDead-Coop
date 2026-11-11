@@ -1,0 +1,16 @@
+# build output and local tools
+dist/
+tools/lua54/
+tests/_tmp/
+
+# per-install settings and logs
+mods/SDCoop/config.ini
+*.log
+*.dmp
+
+# editors / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
