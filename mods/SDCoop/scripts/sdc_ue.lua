@@ -59,7 +59,25 @@ function M.valid(o)
     return ok and v == true
 end
 
--- Converts FString / FText / FName / numbers to a Lua string.
+-- UE4SS 3.0.1 reads a property the object does not have (GetPropertyValue,
+-- obj.Name) as a TrivialObject, not nil: a value with no methods whose
+-- tostring is "TrivialObject: <address>". Seen in the 2026-11-12 logs: a
+-- QuestState's "QuestName" (logged as the quest's name) and a boss's "Name"
+-- (BP_ZombieBoss has AIName). M.prop passes it on unchanged; M.missing /
+-- M.has_prop tell it from a real value, and M.str turns it into "".
+local TRIVIAL = "TrivialObject:"
+local function is_trivial(v)
+    local t = type(v)
+    if t ~= "userdata" and t ~= "table" then return false end
+    local ok, s = pcall(tostring, v)
+    return ok and type(s) == "string" and s:sub(1, #TRIVIAL) == TRIVIAL
+end
+M.is_trivial = is_trivial
+
+-- No value: nil, or UE4SS's read of a property the object does not have.
+function M.missing(v) return v == nil or is_trivial(v) end
+
+-- Converts FString / FText / FName / numbers to a Lua string ("" for no value).
 function M.str(v)
     if v == nil then return "" end
     local t = type(v)
@@ -68,7 +86,10 @@ function M.str(v)
     local ok, s = pcall(m_to_string, v)
     if ok and type(s) == "string" then return s end
     ok, s = pcall(tostring, v)
-    if ok and type(s) == "string" then return s end
+    if ok and type(s) == "string" then
+        if s:sub(1, #TRIVIAL) == TRIVIAL then return "" end
+        return s
+    end
     return ""
 end
 
@@ -105,6 +126,12 @@ function M.prop(o, name)
     local ok, v = pcall(m_get_prop, o, name)
     if ok then return v end
     return nil
+end
+
+-- The object has this property with a value (see is_trivial above: a
+-- missing property does not read as nil).
+function M.has_prop(o, name)
+    return not M.missing(M.prop(o, name))
 end
 
 -- A property of an object known to be alive (a hook's own context object

@@ -145,6 +145,8 @@ The mod never ships game assets and never edits `.pak` files; it only calls the 
 
 - Engine objects are touched only on the game thread (`sdc_ue.delay` / `every`); never in `LoopAsync`.
 - No Lua work in a `RegisterKeyBind` callback. UE4SS runs it on its own thread while native hooks on the game thread take no lock, so Lua runs on two threads at once. A bind only flips an existing flag that the frame loop acts on (`main.lua`, F7). Better still, read the key on the game thread with `PlayerController:IsInputKeyDown` (`sdc_vehicles`, Tab). An `ExecuteInGameThread` from a Tab bind was the 0.7.1 host crashes.
+- Reading a property the object does not have returns a UE4SS `TrivialObject`, not `nil`, so `ue.prop(o, X) ~= nil` is always true. Check with `ue.has_prop` / `ue.missing`; `ue.str` gives `""` for it. Mocks must return such an object too (`tests/mock_quests_bounty_shared.lua`). In 0.7.1 this broke quest names and shared laptop bounties.
+- An actor destroyed with `K2_DestroyActor` stays valid until the garbage collector, and its location reads (0, 0, 0). Remember what you destroyed and treat (0, 0, 0) as "no place" (`sdc_deathbox`).
 - No synchronous `LoadAsset` in hot paths on clients (it froze clients); use assets already in memory.
 - Lua's 200-locals limit per function/chunk is real here; big modules group locals in tables.
 - Never send one network message per world object; batch and queue (see `sdc_world` and `sdc_containers`).

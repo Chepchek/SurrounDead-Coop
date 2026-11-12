@@ -297,6 +297,17 @@ local function task_desc(t)
     return call_text(t, "GetTaskDescription") or ue.short(t)
 end
 
+-- A quest's name as its journal shows it (Journal_QuestButtonUI: Quest
+-- .GetQuestName = QuestName); the class without "_C" when it has no text.
+local function quest_title(q)
+    if not ue.valid(q) then return "" end
+    local s = ue.str(ue.prop(q, "QuestName"))
+    if s == "" then s = call_text(q, "GetQuestName") or "" end
+    if s == "" then s = (ue.class_name(q):gsub("_C$", "")) end
+    return s
+end
+M._quest_title = quest_title
+
 local function task_done(t, cur, req)
     local ok, v = pcall(function() return t:IsComplete() end)
     if ok and type(v) == "boolean" then return v end
@@ -310,8 +321,7 @@ local function snapshot(comp)
     each(ue.prop(comp, "QuestList"), function(q)
         if #list >= MAX_QUESTS or not ue.valid(q) then return end
         if tonumber(ue.prop(q, "QuestCompletion")) ~= QC_STARTED then return end
-        local entry = { name = ue.str(ue.prop(q, "QuestName")), cls = ue.class_name(q), tasks = {} }
-        if entry.name == "" then entry.name = ue.short(q) end
+        local entry = { name = quest_title(q), cls = ue.class_name(q), tasks = {} }
         local st = ue.prop(q, "CurrentState")
         if ue.valid(st) then
             each(ue.prop(st, "Branches"), function(b)
@@ -403,13 +413,18 @@ end
 
 local function shared_on() return own() and opt("quest_bounty_shared") ~= false end
 
--- The quest object an event of it belongs to (the first outer with a QuestName).
+-- The quest object an event of it belongs to: the first outer with a
+-- QuestName (event -> QuestState / QuestBranch -> quest). ue.has_prop, not
+-- "~= nil": UE4SS reads the state's missing QuestName as a TrivialObject, so
+-- the state itself passed for the quest - its name logged and sent in QX as
+-- "TrivialObject: <address>", and no laptop bounty recognised as one (logs
+-- of 2026-11-11 / 12).
 local function quest_of(ev)
     local o = ev
     for _ = 1, 5 do
         o = ue.try(function() return o:GetOuter() end)
         if not ue.valid(o) then return nil end
-        if ue.prop(o, "QuestName") ~= nil then return o end
+        if ue.has_prop(o, "QuestName") then return o end
     end
     return nil
 end
@@ -569,14 +584,7 @@ local cl = {
 }
 
 local function quest_name_of(ev)
-    local o = ev
-    for _ = 1, 5 do
-        o = ue.try(function() return o:GetOuter() end)
-        if not ue.valid(o) then return "" end
-        local n = ue.prop(o, "QuestName")
-        if n ~= nil then return ue.str(n) end
-    end
-    return ""
+    return quest_title(quest_of(ev))
 end
 
 local function on_reward_xp(ev_p, _, ctl_p)

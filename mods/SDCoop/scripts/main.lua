@@ -30,7 +30,7 @@
 --   sdc_throw   thrown items: a client's throw runs on the host; every throw is seen by everyone
 --   sdc_persist  other players' characters saved with the host's world (installed by sdc_progress via sdc_respawn)
 
-local VERSION = "0.7.1"
+local VERSION = "0.7.2"
 
 local log = require("sdc_log")
 local perf = require("sdc_perf")         -- [PERF] cost of every mod hook and task; wraps RegisterHook first

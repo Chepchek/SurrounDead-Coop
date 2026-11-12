@@ -3,7 +3,11 @@
 -- (QM, the host's copy stays), its tasks (QG / the host's own tracker), the
 -- go-to task done by anyone near, and the reward's XP. The harness (fake UE
 -- objects, real sdc_quests / sdc_dialogue / sdc_net / sdc_ue / sdc_config /
--- sdc_log) is mock_quests.lua's. usage: lua mock_quests_bounty_shared.lua <scripts dir>
+-- sdc_log) is mock_quests.lua's, except that a property the object does not
+-- have reads as a TrivialObject, as in UE4SS 3.0.1 (logs of 2026-11-11 / 12:
+-- the event's QuestState passed for its quest, "TrivialObject: <address>"
+-- logged and sent as the quest's name, no bounty recognised).
+-- usage: lua mock_quests_bounty_shared.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
 
@@ -64,7 +68,18 @@ function Obj:GetClass()
     return c
 end
 function Obj:GetAddress() return self._addr end
-function Obj:GetPropertyValue(n) return self._p[n] end
+-- UE4SS 3.0.1: a missing property is not nil but a TrivialObject (no methods)
+local Trivial = { __tostring = function(t) return string.format("TrivialObject: %016X", t._a) end }
+local trivial_addr = 0x1AF5CDE0000
+local function trivial()
+    trivial_addr = trivial_addr + 0x48
+    return setmetatable({ _a = trivial_addr }, Trivial)
+end
+function Obj:GetPropertyValue(n)
+    local v = self._p[n]
+    if v == nil then return trivial() end
+    return v
+end
 function Obj:SetPropertyValue(n, v) self._p[n] = v end
 function Obj:K2_GetActorLocation() return self._p._loc end
 function Obj:GetOwner() return self._p._owner end
@@ -369,6 +384,8 @@ local xev1 = quest_event({ "Quest_Event_RewardPlayerXP_C" }, st1, { Amount = 300
 fire(REWARD_XP, param(xev1), param(hpawn), param(hpc), param(hcomp))
 local qx = last("QX", rpc)
 check(qx and qx.f[3] == "300" and qx.f[4] == "Coyote Checkpoint", "host: the bounty's XP to the client too")
+check(logged("the host's laptop bounty 'Coyote Checkpoint' rewards 300 XP: shared") ~= nil,
+    "host: the reward recognised as the host's laptop bounty, logged with the quest's name")
 check(called(hpc._p.LevellingComponent, "AddXP") == nil, "host: the host's own bounty: its XP stays the game's (not added twice)")
 local rev1 = quest_event({ "Quest_Event_RemoveMarker_C" }, st1, { ActorTag = TAG1 })
 fire(REMOVE_MARKER, param(rev1), param(hpawn), param(hpc), param(hcomp))
@@ -428,6 +445,35 @@ check(jm[TAG2] == true and not jm["Lab"], "host: the joiner gets the shared boun
 local jqg = last("QG", jpc)
 check(jqg and jqg.msg:find("Classified case~", 1, true) ~= nil, "host: the joiner's QG has the other client's bounty")
 
+local function no_trivial(where)
+    local bad
+    for _, l in ipairs(LOG) do if l:find("TrivialObject", 1, true) then bad = l break end end
+    for _, e in ipairs(W.out) do if not bad and e.msg and e.msg:find("TrivialObject", 1, true) then bad = e.msg end end
+    check(bad == nil, where .. ": no 'TrivialObject' in the log or the messages" .. (bad and (" (" .. bad:gsub("%s+$", "") .. ")") or ""))
+end
+no_trivial("host")
+
+print("H5. a quest name with no text: the class name")
+local _, _, st5 = bounty("Quest_Bounty_EliminateCoyotes003_C", "", { { desc = "Kill the coyotes", cur = 0, req = 5 } })
+local xev5 = quest_event({ "Quest_Event_RewardPlayerXP_C" }, st5, { Amount = 300 })
+fire(REWARD_XP, param(xev5), param(rpawn), param(rpc), param(rcomp))
+qx = last("QX", rpc)
+check(qx and qx.f[4] == "Quest_Bounty_EliminateCoyotes003", "host: no QuestName text: the quest's class name in QX")
+-- (pcall: the checks also run against a build without these helpers)
+local function try(f) local ok, v = pcall(f); return ok and v end
+check(try(function() return quests._quest_title(nil) == "" end), "quest_title(nil) is empty")
+
+print("U. sdc_ue and UE4SS's missing property")
+local ue = require("sdc_ue")
+local tv = st5:GetPropertyValue("QuestName")
+check(tostring(tv):find("^TrivialObject: ") ~= nil, "mock: a state's QuestName reads as a TrivialObject (as UE4SS)")
+check(ue.str(tv) == "", "ue.str: a TrivialObject is no text")
+check(try(function() return ue.missing(tv) and ue.missing(nil) and not ue.missing("") and not ue.missing(false)
+    and not ue.missing(st5) end), "ue.missing: nil and TrivialObject only")
+check(try(function() return ue.has_prop(q1, "QuestName") and not ue.has_prop(st5, "QuestName")
+    and not ue.has_prop(nil, "QuestName") end), "ue.has_prop: the quest has QuestName, its state not")
+check(ue.str(q1:GetPropertyValue("QuestName")) == "Coyote Checkpoint" and ue.str(42) == "42", "ue.str: real values unchanged")
+
 -- ============================================================== off
 quiet_print("== host: quest_bounty_shared off")
 new_world(true)
@@ -475,6 +521,17 @@ quests.status_lines(lines)
 check(table.concat(lines, "\n"):find("Coyote Checkpoint", 1, true) ~= nil, "client: F7 panel lists it")
 deliver("SDC1|QG")
 check(logged("shared laptop bounty 'Coyote Checkpoint' left its owner's log") ~= nil, "client: done / gone: shown")
+-- the client's own quest's reward event ran here (the 2026-11-12 log line)
+local _, _, cst = bounty("Quest_TheSafeZone_C", "The Safe Zone", { { desc = "Go to The Valley Safe Zone", cur = 1, req = 1 } })
+local cxev = quest_event({ "Quest_Event_RewardPlayerXP_C" }, cst, { Amount = 300 })
+fire(REWARD_XP, param(cxev), param(cpawn), param(cpc), param(cpc._p.NarrativeComponent))
+check(logged("quests: client: quest 'The Safe Zone' reward event ran here (+300 XP") ~= nil,
+    "client: the reward event logged with the quest's name")
+deliver("SDC1|QX|300|The Safe Zone")
+run_delayed()
+check(logged("quest 'The Safe Zone' +300 XP from the host: the reward event ran here already") ~= nil,
+    "client: the host's QX for it: same name, not added again")
+no_trivial("client")
 
 quiet_print(string.format("%d checks, %s", checks, fails == 0 and "ALL OK" or (fails .. " FAILED")))
 os.exit(fails == 0 and 0 or 1)

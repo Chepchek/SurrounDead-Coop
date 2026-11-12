@@ -63,7 +63,7 @@ SurrounDead has no official multiplayer (co-op is only in the developer's plans)
 |---|---|---|---|
 | Approach | One shared host world on the engine's own netcode (listen server); the mod syncs what the game does not send over the network | Every player runs their own single-player game; the mod mirrors state between them | A UE4SS installer and a small script that fixes the client spawn; the rest is the game's built-in network mode |
 | Joining | Through Steam ("Join Game", no network setup) or by IP: Radmin VPN, ZeroTier, port forwarding | Through Steam, no network setup | By IP |
-| Players | Tested by two | Up to four | — |
+| Players | Tested by three | Up to four | — |
 | Client's character | Lives in the host's world, the host saves it | Their own character from their own world | — |
 
 In short: in SurrounSync everyone plays their own single-player game and the mod carries state between them. SDCoop takes a different approach: it is literally one world. Zombies, vehicles, crates and buildings are the same objects for everyone; one car for two, with a driver and a passenger, shared loot. The price: the single-player game had to be taken apart piece by piece to find which of its functions silently do nothing over the network.
@@ -126,7 +126,7 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 - **Two seats per vehicle**: driver and passenger.
 - **No "downed" state with reviving a teammate**, no kick and no server password.
 - **Load**: UE4SS intercepts the game's calls, which is noticeable on weak PCs. Only a custom UE4SS build can fix that (see plans).
-- **Tested by two players.** More players should work in theory, but has not been tested.
+- **Tested by three players.** More players should work in theory, but has not been tested.
 - **Fresh fixes** are often verified only by tests without the game — check the logs and report if something is off.
 - **Game version**: tested on SurrounDead v0.8.0 (UE 5.6.1). A game update may break something.
 

@@ -32,6 +32,18 @@
 -- and slot: what keeps a box that looks empty.
 -- Client: DBOXGONE removes the "Location of your death" marker of that box
 -- (BP_Marker, spawned locally by the box's BeginPlay) and logs it.
+--
+-- A destroyed actor stays valid for a while (until the garbage collector; the
+-- shared box list is kept 30 s) and its location then reads (0, 0, 0). In
+-- 0.7.1 (2026-11-12, three players) the host destroyed the same box again
+-- every 3 s for half a minute and sent DBOXGONE at (0, 0, 0) each time; a
+-- client's copy of a box that had gone out of its network range also read
+-- (0, 0, 0), so the client took it for the removed one and dropped the marker
+-- of that player's own, still full, death box. Now: the host never checks a
+-- box it destroyed again, skips boxes at (0, 0, 0) and sends no DBOXGONE
+-- without a real place; the client keeps the last real place of a box,
+-- ignores DBOXGONE at (0, 0, 0) and removes the marker of one box only - the
+-- nearest one, a box whose copy here has already gone first.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -95,6 +107,17 @@ local function dist2(a, b)
     local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
     return dx * dx + dy * dy + dz * dz
 end
+
+-- A place, or nil when there is none: a destroyed actor (or one being
+-- destroyed) reads (0, 0, 0); no death box lies exactly there.
+local function real_loc(l)
+    if type(l) ~= "table" then return nil end
+    local x, y, z = tonumber(l.X), tonumber(l.Y), tonumber(l.Z)
+    if not x or not y or not z then return nil end
+    if math.abs(x) < 1 and math.abs(y) < 1 and math.abs(z) < 1 then return nil end
+    return l
+end
+M._real_loc = real_loc
 
 local watch_tried = false
 local function boxes()
@@ -214,6 +237,8 @@ end
 -- ===========================================================================
 
 local state = {}   -- [box address] = { name, peak, total, visible, sig, empty_since, logged_first }
+local gone = {}    -- [box name] = os.clock() when the host destroyed it (never checked again)
+local GONE_KEEP_S = 300
 local check_at = -100
 
 local function remove_marker(m)
@@ -230,7 +255,7 @@ local function was_opened(box, comp)
 end
 
 local function destroy(box, why)
-    local loc = ue.location(box)
+    local loc = real_loc(ue.location(box))
     local name = ue.short(box)
     local marker = ue.prop(box, "DeathMarker")
     local ok, err = pcall(function() box:K2_DestroyActor() end)
@@ -238,13 +263,19 @@ local function destroy(box, why)
         log.warn("deathbox: %s is empty on the host, but destroying it FAILED: %s", name, tostring(err))
         return false
     end
+    gone[name] = os.clock()
     M.stats.removed = M.stats.removed + 1
     local m = remove_marker(marker) and ", its map marker here removed" or ""
     log.info("deathbox: %s is empty on the host (%s) -> destroyed (K2_DestroyActor on the host; the box replicates, so it goes on every machine)%s",
         name, why, m)
-    if loc and S and #(S.remote_pcs or {}) > 0 then
-        net.broadcast(S.remote_pcs, "DBOXGONE", name, string.format("%.0f", loc.X), string.format("%.0f", loc.Y),
-            string.format("%.0f", loc.Z))
+    if S and #(S.remote_pcs or {}) > 0 then
+        if loc then
+            net.broadcast(S.remote_pcs, "DBOXGONE", name, string.format("%.0f", loc.X), string.format("%.0f", loc.Y),
+                string.format("%.0f", loc.Z))
+        else
+            log.warn("deathbox: %s had no place on the host: no DBOXGONE sent (the clients' copy goes with the replicated actor, its marker stays)",
+                name)
+        end
     end
     return true
 end
@@ -252,9 +283,17 @@ end
 local function check_box(box, now)
     local k = addr(box)
     if not k then return end
+    local name = ue.short(box)
+    -- destroyed already (it stays valid until the garbage collector) or
+    -- being destroyed by someone else: (0, 0, 0)
+    if gone[name] then return end
+    if not real_loc(ue.location(box)) then
+        state[k] = nil
+        return
+    end
     local st = state[k]
-    if not st then
-        st = { name = ue.short(box), peak = 0 }
+    if not st or st.name ~= name then
+        st = { name = name, peak = 0 }
         state[k] = st
     end
     st.seen = now
@@ -313,6 +352,9 @@ function M.host_tick()
     for k, st in pairs(state) do
         if now - (st.seen or now) > 10 then state[k] = nil end
     end
+    for n, at in pairs(gone) do
+        if now - at > GONE_KEEP_S then gone[n] = nil end
+    end
 end
 
 -- ===========================================================================
@@ -332,7 +374,9 @@ function M.client_tick()
         if k then
             local e = track[k] or { name = ue.short(b) }
             e.box = b
-            e.loc = ue.location(b) or e.loc
+            -- a copy out of network range (or being destroyed) reads (0, 0, 0):
+            -- keep its last real place
+            e.loc = real_loc(ue.location(b)) or e.loc
             local m = ue.prop(b, "DeathMarker")
             if ue.valid(m) then e.marker = m end
             track[k] = e
@@ -349,13 +393,27 @@ end
 local function on_gone(f)
     if S == nil or S.role ~= "client" then return end
     local at = { X = tonumber(f[2]) or 0, Y = tonumber(f[3]) or 0, Z = tonumber(f[4]) or 0 }
-    local removed, here = 0, nil
+    if not real_loc(at) then
+        log.info("deathbox: the host removed the emptied death box %s, but sent no place (0, 0, 0): no marker removed here",
+            tostring(f[1] or "?"))
+        return
+    end
+    -- one box: the nearest in reach; a box whose copy here has gone (the
+    -- host's destroy replicated) before one that is still standing here
+    local best, best_k, best_rank = nil, nil, nil
     for k, e in pairs(track) do
-        if e.loc and dist2(e.loc, at) <= MARKER_REACH * MARKER_REACH then
-            here = here or e.name
-            if remove_marker(e.marker) then removed = removed + 1 end
-            track[k] = nil
+        local d = e.loc and dist2(e.loc, at) or math.huge
+        if d <= MARKER_REACH * MARKER_REACH then
+            local standing = ue.valid(e.box) and real_loc(ue.location(e.box)) ~= nil
+            local rank = (standing and 1 or 0) * 1e15 + d
+            if best_rank == nil or rank < best_rank then best, best_k, best_rank = e, k, rank end
         end
+    end
+    local removed, here = 0, nil
+    if best then
+        here = best.name
+        if remove_marker(best.marker) then removed = 1 end
+        track[best_k] = nil
     end
     M.stats.markers = M.stats.markers + removed
     log.info("deathbox: the host removed the emptied death box %s at (%.0f, %.0f, %.0f)%s%s", tostring(f[1] or "?"),
@@ -366,7 +424,7 @@ end
 -- ===========================================================================
 
 function M.reset()
-    state, track = {}, {}
+    state, track, gone = {}, {}, {}
     check_at, track_at = -100, -100
 end
 

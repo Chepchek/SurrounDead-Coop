@@ -9,6 +9,10 @@
 -- leftover in a container nobody can reach does not keep it; a box empty from
 -- the start goes once opened; config off keeps it. Client: DBOXGONE removes
 -- that box's death marker, not others'.
+-- 2026-11-12: a destroyed box stays valid at (0, 0, 0) for a while - the host
+-- destroys it once and never sends DBOXGONE at (0, 0, 0); a client keeps the
+-- last real place of a box out of range, ignores (0, 0, 0) and removes one
+-- marker per message.
 -- usage: lua mock_deathbox.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
@@ -311,6 +315,84 @@ handlers.DBOXGONE({ "Container_DeadPlayerLoot_C_8", "50000", "50000", "0" })
 check(has_log("info", "Container_DeadPlayerLoot_C_8 at (50000, 50000, 0) (not near this player)") ~= nil,
   "a box far away: logged, nothing removed")
 local _b7 = box7
+
+-- ============================================================ 7. host: a destroyed box stays valid, at (0, 0, 0)
+-- 0.7.1, 2026-11-12: K2_DestroyActor leaves the actor valid until the garbage
+-- collector (the shared list is kept 30 s) and its place reads (0, 0, 0); the
+-- host destroyed it again every 3 s and sent DBOXGONE at (0, 0, 0) each time.
+print("-- 7: host: a destroyed box is never checked again")
+for _, o in ipairs(world) do o.__valid = false end
+world = {}
+containers.reset()
+S.role = "host"
+destroyed, sent, logs = {}, {}, {}
+local function gone_msgs()
+  local out = {}
+  for _, s in ipairs(sent) do if s.kind == "DBOXGONE" then out[#out + 1] = s end end
+  return out
+end
+local box8, _, M8 = new_box("Container_DeadPlayerLoot_C_8", { X = 75112, Y = 63376, Z = 1341 })
+box8.K2_DestroyActor = function(self)   -- pending kill: still valid, no place
+  self.__loc = { X = 0, Y = 0, Z = 0 }
+  destroyed[#destroyed + 1] = self.__name
+end
+box8["Looted?"] = true                   -- someone opened it (as in the game's case)
+local coat = add(M8.TORSO, "Coat")
+tick()
+take(M8.TORSO, coat)
+tick(); tick(); tick()
+check(#destroyed == 1 and destroyed[1] == "Container_DeadPlayerLoot_C_8", "empty: destroyed")
+local g = gone_msgs()
+check(#g == 2 and g[1].args[2] == "75112" and g[1].args[3] == "63376", "DBOXGONE once to each client, at its real place")
+for _ = 1, 15 do tick() end
+check(#destroyed == 1, "still valid at (0, 0, 0) for 16 s: never destroyed again")
+check(#gone_msgs() == 2, "no DBOXGONE at (0, 0, 0)")
+check(count_log("Container_DeadPlayerLoot_C_8 is empty on the host") == 1, "host log: destroyed once")
+tick(301); tick()
+check(#destroyed == 1, "after the destroyed-list entry expires it still is not touched (no place)")
+-- a box destroyed by someone else: valid, (0, 0, 0), opened and empty
+local box9 = new_box("Container_DeadPlayerLoot_C_9", { X = 0, Y = 0, Z = 0 })
+box9["Looted?"] = true
+tick(); tick(); tick()
+check(#destroyed == 1 and deathbox._state()[box9.__addr] == nil, "a box at (0, 0, 0) is skipped")
+check(deathbox._real_loc ~= nil and deathbox._real_loc({ X = 0, Y = 0, Z = 0 }) == nil and deathbox._real_loc({ X = 5, Y = 0, Z = 0 }) ~= nil
+  and deathbox._real_loc(nil) == nil, "real_loc: (0, 0, 0) and nil are no place")
+
+-- ============================================================ 8. client: own box out of range
+-- 0.7.1, 2026-11-12: the client's copy of its own death box (far away, out of
+-- the network range) read (0, 0, 0); the host's DBOXGONE at (0, 0, 0) for
+-- another box removed the marker of this one.
+print("-- 8: client: a box out of range keeps its place, DBOXGONE at (0, 0, 0) is ignored")
+for _, o in ipairs(world) do o.__valid = false end
+world = {}
+containers.reset()
+S.role = "client"
+logs = {}
+local own, _, _, own_marker = new_box("Container_DeadPlayerLoot_C_10", { X = 126141, Y = 106119, Z = 1300 })
+local other, _, _, other_marker = new_box("Container_DeadPlayerLoot_C_11", { X = 75112, Y = 63376, Z = 1341 })
+T = T + 3; containers.client_tick()
+own.__loc = { X = 0, Y = 0, Z = 0 }       -- the player walked away from it
+T = T + 3; containers.client_tick()
+local e10 = deathbox._track()[own.__addr]
+check(e10 ~= nil and e10.loc.X == 126141, "the last real place of a box out of range is kept")
+other.__valid = false                     -- the host destroyed it: the copy goes
+handlers.DBOXGONE({ "Container_DeadPlayerLoot_C_2147379811", "75112", "63376", "1341" })
+check(other_marker.__valid == false, "the removed box's marker removed")
+check(own_marker.__valid ~= false, "own box's marker kept")
+handlers.DBOXGONE({ "Container_DeadPlayerLoot_C_2147379811", "0", "0", "0" })
+check(own_marker.__valid ~= false, "DBOXGONE at (0, 0, 0) (from an older host): own marker kept")
+check(has_log("info", "sent no place (0, 0, 0): no marker removed here") ~= nil, "client log: ignored")
+-- two boxes at one spot: one DBOXGONE removes one marker, the box whose copy went first
+local boxA, _, _, markerA = new_box("Container_DeadPlayerLoot_C_12", { X = 5000, Y = 5000, Z = 100 })
+local boxB, _, _, markerB = new_box("Container_DeadPlayerLoot_C_13", { X = 5050, Y = 5000, Z = 100 })
+T = T + 3; containers.client_tick()
+boxB.__valid = false
+handlers.DBOXGONE({ "Container_DeadPlayerLoot_C_99", "5000", "5000", "100" })
+check(markerB.__valid == false and markerA.__valid ~= false,
+  "two boxes in reach: only the one whose copy went loses its marker (not the nearer one still standing)")
+handlers.DBOXGONE({ "Container_DeadPlayerLoot_C_98", "5000", "5000", "100" })
+check(markerA.__valid == false, "the next DBOXGONE there takes the other one")
+local _b = boxA
 
 -- ============================================================ 6. reset
 containers.reset()
