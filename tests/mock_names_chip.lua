@@ -4,7 +4,7 @@
 --   * sdc_steamlink.clean_name: no control characters / '|', trimmed, 32 chars max
 --   * sdc_steamlink.persona(): kept after the helper's status goes stale
 --   * sdc_steamlink.peer_ping / peer_count: only "up" peers of a live helper
---   * chip strings (RU / EN) with the connection type and ping
+--   * the players table's strings (RU / EN): title, column heads, key toasts
 -- usage: lua mock_names_chip.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
@@ -96,16 +96,21 @@ NOW = NOW + 60   -- the helper stopped writing its status
 check(sl.peer_ping("76561190000000002") == nil and sl.peer_count() == 0, "stale helper status: no Steam peers")
 check(cfg.player_name() == "Друг Steam", "stale helper: the Steam name is still used")
 
--- ---------------------------------------------------------------- chip strings
+-- ---------------------------------------------------------------- players table strings
 local i18n = require("sdc_i18n")
 i18n.set("en")
-check(i18n.T("chip_client_via", "Alice", i18n.T("chip_via_steam"), 55) == "Host Alice · Steam · ping 55 ms", "EN client chip with Steam")
-check(i18n.T("chip_client_via_noping", "Alice", i18n.T("chip_via_ip")) == "Host Alice · IP", "EN client chip, IP, no ping")
-check(i18n.T("chip_player", "Bob", "Steam, " .. i18n.T("chip_ms", 35)) == "Bob (Steam, 35 ms)", "EN host chip entry")
-check(i18n.T("chip_client", "Alice", 55) == "Host Alice, ping 55 ms", "old client chip unchanged")
+check(i18n.T("hud_title", 3) == "Players: 3", "EN table title")
+check(i18n.T("hud_hint", "F8") == "F8 to hide", "EN key hint")
+check(i18n.T("hud_col_name") == "Player" and i18n.T("hud_col_ping") == "Ping", "EN column heads")
+check(i18n.T("hud_hidden", "F8") == "Player table hidden. F8 to show it.", "EN hide toast")
+check(i18n.T("hud_more", 2) == "and 2 more", "EN more rows")
 i18n.set("ru")
-check(i18n.T("chip_client_via", "Alice", i18n.T("chip_via_steam"), 55) == "Хост Alice · Steam · пинг 55 мс", "RU client chip with Steam")
-check(i18n.T("chip_player", "Bob", "IP, " .. i18n.T("chip_ms", 60)) == "Bob (IP, 60 мс)", "RU host chip entry")
+check(i18n.T("hud_title", 3) == "Игроки: 3", "RU table title")
+check(i18n.T("hud_hint", "F8") == "F8 — скрыть", "RU key hint")
+check(i18n.T("hud_col_name") == "Игрок" and i18n.T("hud_col_ping") == "Пинг", "RU column heads")
+check(i18n.T("hud_shown", "F8") == "Таблица игроков показана. F8 — скрыть.", "RU show toast")
+check(i18n.label("players_hud") == "Таблица игроков на экране (F8)", "RU setting label")
+check(cfg.get("players_hud") == true and cfg.get("players_hud_key") == "F8", "the table is on by default, key F8")
 
 print(string.format("names/chip: %d passed, %d failed", checks - fails, fails))
 print(fails == 0 and "ALL OK" or "FAILED")

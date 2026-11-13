@@ -38,9 +38,10 @@ local tools = require("sdc_tools")
 local wear = require("sdc_wear")
 local containers = require("sdc_containers")
 
+-- counters read by the log lines below (level_looks: mock_items_perf)
 local M = {
-    stats = { runtime = 0, level = 0, ghosts_removed = 0, inert = 0, reattached = 0, unhidden = 0, dropped_moved = 0,
-              loot_blocked = 0, proxy_battery = 0, owner_relevant = 0 },
+    stats = { runtime = 0, level = 0, ghosts_removed = 0, loot_blocked = 0, proxy_battery = 0, owner_relevant = 0,
+              level_looks = 0 },
     consume = consume,
     stations = stations,
     tools = tools,
@@ -102,7 +103,7 @@ local NEVER_SHOWN = {
 }
 
 local NEAR_LEVEL_ITEMS = 5000   -- cm: level pickups this close to a remote player replicate
-local COLLISION_NONE = 0
+local COLLISION_NONE = 0        -- ECollisionEnabled::NoCollision
 
 local addr = ctx.addr
 
@@ -302,7 +303,6 @@ local function on_drop_request(comp)
         end
     end
     if moved > 0 then
-        M.stats.dropped_moved = M.stats.dropped_moved + moved
         log.info("items: %d item(s) dropped by %s moved from the host to them (fallback)", moved, ue.short(owner))
     end
 end
@@ -336,7 +336,6 @@ local function on_drop_rpc(c, _, _, target_p)
         end
     end
     if moved > 0 then
-        M.stats.dropped_moved = M.stats.dropped_moved + moved
         log.info("items: %d item(s) that %s dropped out of %s moved to them", moved, ue.short(owner), tostring(src))
     end
     local pc = ue.prop(owner, "Controller")
@@ -378,14 +377,7 @@ end
 -- which also exists only on the host (a client keeps its inventory in UI
 -- widgets), so the host sends the durability of every equipped item too, and
 -- the client's GetDurability is corrected after it ran (see install()).
-local F_ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
-local F_USID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
-local F_INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local F_DUR = "Durability_22_A3557C454274D193D47AB9B71FB0C0CA"
-
-local function guid_str(g)
-    return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D)
-end
+local guid_str = consume.guid_str
 
 -- The tick's one walk of the player's inventory (sdc_consume.inventory; in
 -- `pass` when sdc_consume.host_player took it this tick), or a walk now.
@@ -465,6 +457,13 @@ local function send_uids(pc, pass)
         items_sent[addr(pc)] = tkey
         net.send_to(pc, "ITEMS", t)
     end
+end
+
+-- Host (sdc_consume, GHOSTQ): this player's ITEMS goes again with the next
+-- tick even if unchanged (the client's copy of it was old).
+function M.resend_items(pc)
+    local k = pc and addr(pc)
+    if k then items_sent[k] = nil end
 end
 
 -- Client: write the host's map into the own HelperComp.
@@ -704,7 +703,7 @@ local function level_look(a, k, now)
         lvl.known[k], lvl.cand[k] = nil, nil
         return nil
     end
-    M.stats.level_looks = (M.stats.level_looks or 0) + 1
+    M.stats.level_looks = M.stats.level_looks + 1
     local e = { til = now + LEVEL_TRUST + math.random() * LEVEL_SPREAD }
     if ue.prop(a, "bReplicates") == true or ue.is_runtime_spawned(a) or is_local_attachment(a) then
         e.skip = true
@@ -828,7 +827,8 @@ end
 -- ---------------------------------------------------------------------------
 -- [PERF] "parts": h:items broken down into h:items.consume / .stations /
 -- .containers (their ticks), .inv (the one walk of a remote player's
--- inventory + health, sdc_consume.host_player), .tools (binoculars / night
+-- inventory + health, sdc_consume.host_player; a big inventory's walk goes
+-- on in slices in later frames, also timed as .inv), .tools (binoculars / night
 -- vision), .uids (UIDS / ITEMS), .worn (worn items), .level (level pickups).
 -- The 2nd and later remote players' .inv / .tools / .uids and the later
 -- slices of a .level pass run in frames of their own, outside h:items.
@@ -881,7 +881,6 @@ local function worn_pass(remote_pawns)
             if is_remote and ue.prop(a, "bHidden") == true and M.visible_scale(a) and not NEVER_SHOWN[it.slot]
                 and not ue.class_name(a):find("FishingRod", 1, true) then
                 pcall(function() a:SetActorHiddenInGame(false) end)
-                M.stats.unhidden = M.stats.unhidden + 1
                 log.debug("items: %s on %s was hidden on the host, shown", ue.short(a), ue.short(p))
             end
         end
@@ -890,6 +889,15 @@ end
 
 function M.host_tick(remote_pcs)
     remote_pcs = remote_pcs or {}
+    -- UIDS / ITEMS sent: kept only for players still connected (a restarted
+    -- client at a reused controller address gets both again)
+    local live = {}
+    for _, pc in ipairs(remote_pcs) do
+        local k = addr(pc)
+        if k then live[k] = true end
+    end
+    for k in pairs(uids_sent) do if not live[k] then uids_sent[k] = nil end end
+    for k in pairs(items_sent) do if not live[k] then items_sent[k] = nil end end
     sub("h:items.consume", consume.host_tick, remote_pcs, true)
     sub("h:items.stations", stations.host_tick)
     consume_tick(tools.host_begin)
@@ -989,7 +997,6 @@ local function make_inert(a)
         end
     end
     inert[k] = rec
-    M.stats.inert = M.stats.inert + 1
 end
 
 -- `a` is the live actor of this tick, already checked to be the one in `rec`.
@@ -1071,7 +1078,6 @@ local function follow_attachment(a, wearer)
     end
     local cause = reattach_block(a, want, wearer)
     if cause then
-        M.stats.reattach_skipped = (M.stats.reattach_skipped or 0) + 1
         reattach_note(a, cause, "items: %s not put back on %s/%s (now %s/%s): %s - left as the game has it",
             ue.short(a), ue.short(want), want_socket, ue.short(cur), cur_socket, cause)
         return
@@ -1085,7 +1091,6 @@ local function follow_attachment(a, wearer)
     if st.done or now < st.next_at then return end
     if st.tries >= REATTACH_MAX then
         st.done = true
-        M.stats.reattach_gave_up = (M.stats.reattach_gave_up or 0) + 1
         reattach_note(a, "gave up " .. key, "items: %s does not stay on %s/%s (%d put-backs, now %s/%s) - left as the game has it",
             ue.short(a), ue.short(want), want_socket, st.tries, ue.short(cur), cur_socket)
         return
@@ -1093,7 +1098,6 @@ local function follow_attachment(a, wearer)
     if pcall(function() a:OnRep_AttachmentReplication() end) then
         st.tries = st.tries + 1
         st.next_at = now + 2 ^ (st.tries - 1)
-        M.stats.reattached = M.stats.reattached + 1
         local line = string.format("items: %s put back on %s/%s (was %s/%s, try %d)", ue.short(a), ue.short(want),
             want_socket, ue.short(cur), cur_socket, st.tries)
         if st.tries == 1 then log.info("%s", line) else log.debug("%s", line) end
@@ -1239,7 +1243,6 @@ local EVENT_HOOKS = {
     { PLAYER_FN .. "OnRep_FishingRodEquipped?", "weapon" },
 }
 local event_hooked = {}   -- [path] = true
-M.events = { hotbar = 0, actors = 0, weapon = 0 }
 
 -- Worn items of a replicated character: inert and where the host has them.
 local function settle_items(pawn)
@@ -1264,20 +1267,17 @@ local EVENT_FN = {
     hotbar = function(c)
         local p = helper_owner(c)
         if not p or not is_locally_controlled(p) then return end
-        M.events.hotbar = M.events.hotbar + 1
         M.hotbar_tick("event")
     end,
     actors = function(c)
         local p = helper_owner(c)
         if not p then return end
-        M.events.actors = M.events.actors + 1
         rerun_onreps(p, is_locally_controlled(p), "event")
         settle_items(p)
     end,
     weapon = function(c)
         local p = c and c:get()
         if not is_replicated_character(p) then return end
-        M.events.weapon = M.events.weapon + 1
         settle_items(p)
     end,
 }
@@ -1309,7 +1309,6 @@ end
 -- attached to the weapon). The host has no such problem: its game turns
 -- worn items' collision off on the server.
 local collision_logged = {}
-local COLL_NONE = 0
 function M.own_attached_no_collision(pawn)
     local root = ue.try(function() return pawn:K2_GetRootComponent() end)
     if not ue.valid(root) then return end
@@ -1325,9 +1324,9 @@ function M.own_attached_no_collision(pawn)
                 local owner = ue.try(function() return child:GetOwner() end)
                 if ue.valid(owner) and ue.name(owner) ~= pawn_name then
                     local coll = ue.try(function() return child:GetCollisionEnabled() end)
-                    if type(coll) == "number" and coll ~= COLL_NONE then
+                    if type(coll) == "number" and coll ~= COLLISION_NONE then
                         local resp = ue.try(function() return child:GetCollisionResponseToChannel(2) end)
-                        pcall(function() child:SetCollisionEnabled(COLL_NONE) end)
+                        pcall(function() child:SetCollisionEnabled(COLLISION_NONE) end)
                         changed = changed + 1
                         local key = ue.class_name(owner) .. "." .. ue.short(child)
                         if not collision_logged[key] then
@@ -1426,7 +1425,6 @@ local ghost_log = { pending = 0, at = 0 }
 -- pass (only items of this pass stay in it).
 local quiet = {}            -- [item address] = os.clock() until which it is skipped
 local QUIET_MIN_S, QUIET_SPREAD = 2, 4   -- 2..5 s, spread so they do not all come back at once
-M.stats.quiet_skipped = 0
 
 -- Client tick (1 s).
 function M.client_tick()
@@ -1479,7 +1477,6 @@ function M.client_tick()
         local q = k and quiet[k]
         if q and now_c < q and not worn[k] and not inert[k] then
             next_quiet[k] = q
-            M.stats.quiet_skipped = M.stats.quiet_skipped + 1
             goto next_item
         end
         do
@@ -1512,7 +1509,6 @@ function M.client_tick()
                     elseif ue.prop(a, "bHidden") == true and M.visible_scale(a) and not NEVER_SHOWN[worn[k] or ""]
                         and not ue.class_name(a):find("FishingRod", 1, true) then
                         pcall(function() a:SetActorHiddenInGame(false) end)
-                        M.stats.unhidden = M.stats.unhidden + 1
                     end
                 end
             end
@@ -1619,44 +1615,6 @@ function M.debug_head_report(tag)
     end
 end
 
--- Debug (client): the melee durability lookup done by the game itself
--- (GetEquipmentUID -> BP_JigMultiplayer.GetDurability over MainJigContainers).
-function M.debug_durability()
-    local me = ue.local_pawn()
-    if not me then return end
-    local helper = ue.prop(me, "BP_JigHelperComp")
-    local jig = ue.prop(me, "BP_JigMultiplayer")
-    local melee = nil
-    local okm, errm = pcall(function()
-        helper.EquipmentUIDs:ForEach(function(k, v)
-            local key, val = k:get(), v:get()
-            if ue.str(key.TagName) == "Jig.PlayerSlot.MeleeWeapon" then
-                melee = string.format("%d:%d:%d:%d", val.A, val.B, val.C, val.D)
-            end
-        end)
-    end)
-    local nc, ni, found = 0, 0, nil
-    local sample = {}
-    local ok, err = pcall(function()
-        jig.MainJigContainers:ForEach(function(_, c)
-            nc = nc + 1
-            local cont = c:get()
-            cont[F_ITEMS]:ForEach(function(_, it)
-                ni = ni + 1
-                local item = it:get()
-                local u = item[F_USID]
-                local us = string.format("%d:%d:%d:%d", u.A, u.B, u.C, u.D)
-                local d = item[F_INFO][F_DUR]
-                local ds = string.format("%.1f/%.1f", d.X, d.Y)
-                if us == melee then found = ds end
-                if #sample < 8 then sample[#sample + 1] = us .. "=" .. ds end
-            end)
-        end)
-    end)
-    log.info("durdbg melee uid=%s (map ok=%s%s) containers=%d items=%d found=%s (ok=%s%s) sample=[%s]",
-        tostring(melee), tostring(okm), okm and "" or (" " .. tostring(errm)), nc, ni, tostring(found),
-        tostring(ok), ok and "" or (" " .. tostring(err)), table.concat(sample, " "))
-end
 
 function M.reset()
     equip_sig = {}

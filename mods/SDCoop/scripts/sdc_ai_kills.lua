@@ -38,6 +38,37 @@
 -- If the redirect did not happen (redirect_player0 off), the host's counter is
 -- put back; the host's XP / popup cannot be (logged).
 --
+-- Vehicles (host): a car hits an AI in BP_VehicleMaster.ApplyDamageToAIBased
+-- OnSpeed: ApplyDamage(AI, Random(300, 350), None, GetPlayerCharacter(self,
+-- 0), DamageType) (@0 / @130; HitBoxCollision's overlap at >= 5 mph, @26159
+-- -> @26642 BP_AI: zombies, boss, animals; @26016 BP_MasterAICharacter:
+-- humans). That "player 0" is the vehicle's: sdc_vehicles names the client
+-- driver only while the host neither sits in that car nor presses / looks
+-- at it, else the host's character; nobody once the driver is out. So a
+-- run-over went to the host whenever the host rode along (host log
+-- 2026-11-13 17:03:04 / 17:12:02 / 17:24:12: one-hit kills on the path of a
+-- client-driven car with the host as passenger, "by <host> (host)"). Such a
+-- hit (no instigator, a player character as the causer and the plain
+-- DamageType class: only this call in the game's Blueprints; weapons pass
+-- Damage_Body_C / Damage_Headshot_C, the stomp its controller) counts for
+-- the driver of the car that hit: the car the causer sits in when it is
+-- within VEH_NEAR_CM of the victim, else the nearest such car a client
+-- drives or drove within VEH_GRACE_S (it rolls on: the game lets a driver
+-- out only below 10 mph, @163, and puts the handbrake on, @384). Its driver:
+-- the client whose seat is "driver" (sdc_vehicles.seat_of) and who sits in
+-- it; no client at the wheel and the host in it, or nobody lately: the
+-- host's, as the game. Passengers never count. No seat record names a
+-- driver, the host is not in it and the causer is a remote player sitting
+-- in it (sdc_vehicles made it the car's player 0) whose seat is not
+-- "passenger": that player's, as before this credit (a changed seat_of
+-- answer must not take a lone client driver's kills). The damage scope entry
+-- carries the decision (key nil = the host's): zombies, animals and the bear
+-- read it as for a weapon; humans' ReceiveAnyDamage and the boss's
+-- DeathEvent read it instead of their causer / killer. No car near the
+-- victim: the causer decides, as before. Log: "ai: kills: vehicle: <car> hit
+-- <AI> -> <controller | the host> (<why>)" (first 20), "... no car within"
+-- (first 3); the status line counts "vehicle hits: driver=N host=M".
+--
 -- Days survived: GameMode.EventBindMidnight adds a day on the host's
 -- controller only -> AIDAY -> the client adds one to its own.
 --
@@ -50,7 +81,7 @@ local ctx = require("sdc_ctx")
 
 local M = {
     stats = { marked = 0, redirected = 0, sent = 0, undone = 0, host_kept_xp = 0, got = 0, skill_points = 0,
-              days_sent = 0, days_got = 0 },
+              days_sent = 0, days_got = 0, veh_driver = 0, veh_host = 0 },
 }
 local core
 
@@ -96,9 +127,10 @@ local ANIMALS = {
 }
 local BOSS = "/Game/AI/Zombies/Boss/BP_ZombieBoss.BP_ZombieBoss_C"
 
--- { path, victim, instigator, causer } parameter positions after the context
+-- { path, victim, instigator, causer } parameter positions after the context;
+-- dtype: the DamageTypeClass (a vehicle's hit, see the header)
 local DAMAGE_FUNCS = {
-    { "/Script/Engine.GameplayStatics:ApplyDamage", 1, 3, 4 },
+    { "/Script/Engine.GameplayStatics:ApplyDamage", 1, 3, 4, dtype = 5 },
     { "/Script/Engine.GameplayStatics:ApplyPointDamage", 1, 5, 6 },
     { "/Script/Engine.GameplayStatics:ApplyRadialDamage", nil, 8, 7 },
     { "/Script/Engine.GameplayStatics:ApplyRadialDamageWithFalloff", nil, 11, 10 },
@@ -109,12 +141,18 @@ local LATENT_S = 1.0         -- boss / animals: the credit runs on the next fram
 local LATENT_TTL = 3.0
 local HIT_TTL = 3.0          -- humans: Death runs 0.1 s + a tick after the damage
 local DAY_GAP_S = 30
+local VEH_PATH = "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C"
+local PLAYER_CLASS = "BP_PlayerCharacter_C"
+local VEH_NEAR_CM = 1200     -- the hitting car's centre to its victim (a long truck's bumper ~5 m ahead)
+local VEH_GRACE_S = 4.0      -- a car still counts for its last client driver this long (polled once a second)
 
-local scope = {}             -- host: damage calls in progress: false | { key, victim, radial, was_dead, tagged }
+local scope = {}             -- host: damage calls in progress: false | { key, victim, radial, was_dead, tagged, vehicle }
 local dying = {}             -- host: [address] = { key, t, ttl, used, src, before, kind, popup, skill, vkey, latent }
-local hits = {}              -- host: [address] = { key, t, tagged } (humans' last remote hit)
+local hits = {}              -- host: [address] = { key (false: a car's, the host's), t, src } (humans' last remote hit)
 local credited = {}          -- host: [victim full name] = clock
 local seen_dead = {}         -- host: [animal full name] = clock (seen dead in a damage call)
+local last_driver = {}       -- host: [vehicle address] = { key (false: the host), vname, path, t }
+local veh_class = {}         -- host: [class name] = is a BP_VehicleMaster_C
 local last_day = -1000
 local level_timer = {}       -- client: [component full name] = true
 local icons_tried = {}       -- client: [icon path] = true
@@ -138,13 +176,174 @@ local function dead_now(o)
     return ue.prop(o, "IsDead?") == true
 end
 
+-- -- vehicles (see the header) --------------------------------------------------
+
+local function is_vehicle(o)
+    local cn = ue.class_name(o)
+    if cn == "" then return false end
+    local c = veh_class[cn]
+    if c ~= nil then return c end
+    local cls = ue.find_object(VEH_PATH)
+    if not cls then return false end   -- not loaded: no vehicle exists; not cached
+    local ok, r = pcall(function() return o:IsA(cls) end)
+    if not ok then return false end
+    veh_class[cn] = r == true
+    return r == true
+end
+
+-- The vehicle a character sits in (its seat is an attachment; the game's
+-- driving state names it too), or nil.
+local function vehicle_of(ch)
+    if not ue.valid(ch) then return nil end
+    local p = ue.try(function() return ch:GetAttachParentActor() end)
+    if ue.valid(p) and is_vehicle(p) then return p end
+    if ue.prop(ch, "InVehicle?") == true then
+        local v = ue.prop(ue.prop(ch, "VehicleDrivingComponent"), "Vehicle")
+        if ue.valid(v) and is_vehicle(v) then return v end
+    end
+    return nil
+end
+
+-- sdc_vehicles' seat of remote player `key` ("driver" | "passenger"), or nil.
+local function seat_of(key)
+    local vm = package.loaded["sdc_vehicles"]
+    if type(vm) ~= "table" or type(vm.seat_of) ~= "function" then return nil end
+    local ok, seat = pcall(vm.seat_of, key)
+    if ok then return seat end
+    return nil
+end
+
+-- Remote players at a wheel now: { pc, key, v, a } (sdc_vehicles' seats).
+local function remote_drivers()
+    local out = {}
+    local vm = package.loaded["sdc_vehicles"]
+    if type(vm) ~= "table" or type(vm.seat_of) ~= "function" then return out end
+    for _, pc in ipairs(core.S.remote_pcs or {}) do
+        if ue.valid(pc) then
+            local key = ue.name(pc)
+            local v = seat_of(key) == "driver" and vehicle_of(ue.pawn_of(pc)) or nil
+            local a = v and addr(v)
+            if a then out[#out + 1] = { pc = pc, key = key, v = v, a = a } end
+        end
+    end
+    return out
+end
+
+local function note_driver(a, v, key, now)
+    last_driver[a] = { key = key, vname = ue.name(v), path = ue.path(v), t = now }
+end
+
+-- Host tick: who drives which car (the grace window's record); the host
+-- counts in a car no client drives.
+local function note_drivers(now)
+    local drivers = remote_drivers()
+    local taken = {}
+    for _, d in ipairs(drivers) do
+        note_driver(d.a, d.v, d.key, now)
+        taken[d.a] = true
+    end
+    local hv = vehicle_of(ue.local_pawn())
+    local ha = hv and addr(hv)
+    if ha and not taken[ha] then note_driver(ha, hv, false, now) end
+end
+
+local function dist2(p, q)
+    local dx, dy, dz = p.X - q.X, p.Y - q.Y, p.Z - q.Z
+    return dx * dx + dy * dy + dz * dz
+end
+
+-- A vehicle's hit on an AI: the plain DamageType class, no instigator and a
+-- player character as the causer (BP_VehicleMaster @130, see the header).
+-- A player as the victim is none (hunger, thirst, radiation: ApplyDamage(
+-- self, d, None, self, DamageType) every few seconds).
+local function vehicle_hit(victim, inst, causer, dtype)
+    if ue.valid(inst) or not ue.valid(dtype) or ue.short(dtype) ~= "DamageType" then return false end
+    return ue.class_name(causer) == PLAYER_CLASS and ue.class_name(victim) ~= PLAYER_CLASS
+end
+
+-- Whose a vehicle's hit on `victim` is: (remote controller key, how), or
+-- (false, how) = the host's, or nil = no car near it (the causer decides).
+local function vehicle_credit(victim, causer)
+    local vloc = ue.location(victim)
+    if not vloc then return nil end
+    local now = clock()
+    local lim = VEH_NEAR_CM * VEH_NEAR_CM
+    local function d2_of(v)
+        local l = v and ue.location(v)
+        return l and dist2(l, vloc) or nil
+    end
+    local drivers = remote_drivers()
+    -- the car the causer sits in (the host riding along, the client at the
+    -- wheel), else the nearest car a client drives or drove lately
+    local own = vehicle_of(causer)
+    local car = own
+    local d = car and d2_of(car)
+    if not d or d > lim then
+        car = nil
+        local best = lim
+        local function consider(v)
+            local dv = d2_of(v)
+            if dv and dv <= best then car, best = v, dv end
+        end
+        for _, x in ipairs(drivers) do consider(x.v) end
+        for _, r in pairs(last_driver) do
+            if r.key and now - r.t <= VEH_GRACE_S then consider(ue.find_object(r.path)) end
+        end
+    end
+    if not car then return nil end
+    local ca = addr(car)
+    for _, x in ipairs(drivers) do
+        if x.a == ca then
+            note_driver(ca, car, x.key, now)
+            return x.key, "driver", car
+        end
+    end
+    local hv = vehicle_of(ue.local_pawn())
+    if hv and addr(hv) == ca then return false, "host in it", car end
+    -- no seat record names its driver: a remote player in it as the causer
+    -- (the car's player 0), not seated as a passenger, as before this credit
+    local pc = own and addr(own) == ca and core.remote_pc_of(nil, causer)
+    if pc and seat_of(ue.name(pc)) ~= "passenger" then
+        note_driver(ca, car, ue.name(pc), now)
+        return ue.name(pc), "its player 0, no driver seat record", car
+    end
+    local r = last_driver[ca]
+    if r and r.key and now - r.t <= VEH_GRACE_S and r.vname == ue.name(car) and core.pc_by_key(r.key) then
+        return r.key, "rolling after its driver got out", car
+    end
+    return false, "nobody drives", car
+end
+
 local function scope_entry(spec, args)
     local causer = arg_value(args, spec[4])
-    local pc = core.remote_pc_of(arg_value(args, spec[3]), causer)
-    if not pc then return false end
+    local inst = arg_value(args, spec[3])
     local victim = spec[2] and arg_value(args, spec[2]) or nil
     local valid_victim = ue.valid(victim)
-    return { key = ue.name(pc), victim = valid_victim and addr(victim) or nil, radial = spec[2] == nil,
+    local key, how = nil, nil
+    if spec.dtype and valid_victim and vehicle_hit(victim, inst, causer, arg_value(args, spec.dtype)) then
+        local car
+        key, how, car = vehicle_credit(victim, causer)
+        if key ~= nil then
+            if key then M.stats.veh_driver = M.stats.veh_driver + 1 else M.stats.veh_host = M.stats.veh_host + 1 end
+            local say = core.line("kills.vehicle", 20)
+            if say then
+                say("ai: kills: vehicle: %s hit %s -> %s (%s)", ue.short(car), ue.short(victim),
+                    key and ue.short(core.pc_by_key(key)) or "the host", how)
+            end
+        else
+            how = nil
+            if core.first("kills.vehicle.none", 3) then
+                log.info("ai: kills: vehicle: a car-like hit on %s by %s, no car within %d m: the causer decides",
+                    ue.short(victim), ue.short(causer), VEH_NEAR_CM // 100)
+            end
+        end
+    end
+    if how == nil then
+        local pc = core.remote_pc_of(inst, causer)
+        if not pc then return false end
+        key = ue.name(pc)
+    end
+    return { key = key or nil, vehicle = how, victim = valid_victim and addr(victim) or nil, radial = spec[2] == nil,
              was_dead = valid_victim and dead_now(victim) or false, tagged = tagged(causer) }
 end
 
@@ -172,7 +371,16 @@ end
 local function scope_for(a)
     for i = #scope, 1, -1 do
         local s = scope[i]
-        if s and (s.radial or s.victim == a) then return s end
+        if s and s.key and (s.radial or s.victim == a) then return s end
+    end
+    return nil
+end
+
+-- the innermost vehicle hit on `a` in progress (s.key: its driver's; nil: the host's)
+local function vehicle_scope(a)
+    for i = #scope, 1, -1 do
+        local s = scope[i]
+        if s and s.vehicle and s.victim == a then return s end
     end
     return nil
 end
@@ -292,7 +500,7 @@ local function on_zombie_dying(c)
     local a = ue.valid(z) and addr(z) or nil
     if not a then return end
     local s = scope_for(a)
-    local key, src = s and s.key, "damage"
+    local key, src = s and s.key, s and s.vehicle and "vehicle" or "damage"
     if not key then
         local giver = ue.prop(ue.prop(z, "DamageComponent"), "CurrentFireDamageGiver")
         local pc = ue.valid(giver) and core.remote_pc_of(nil, giver) or nil
@@ -309,6 +517,9 @@ local function on_zombie_death(c, actor_p)
     local a = addr(z)
     local d = a and dying[a] or nil
     if a then dying[a] = nil end
+    -- run over by a car no client drives: the host's, whoever the causer
+    local vs = not d and a and vehicle_scope(a)
+    if vs and not vs.key then return end
     credit_now(z, actor_p and actor_p:get(), d, "z")
 end
 
@@ -322,8 +533,12 @@ local function on_human_damage(c, _, _, inst_p, causer_p)
     if not a then return end
     local causer = causer_p and causer_p:get()
     local pc = core.remote_pc_of(inst_p and inst_p:get(), causer)
-    if pc then
-        hits[a] = { key = ue.name(pc), t = clock() }
+    local key = pc and ue.name(pc) or nil
+    -- a vehicle's hit: its driver's (false: the host's), not the causer's
+    local vs = vehicle_scope(a)
+    if vs then key = vs.key or false end
+    if key ~= nil then
+        hits[a] = { key = key, t = clock(), src = vs and "vehicle" or nil }
     else
         hits[a] = nil
     end
@@ -335,9 +550,9 @@ local function on_human_stop_burning(kind, c)
     local b = c:get()
     local a = ue.valid(b) and addr(b) or nil
     local h = a and hits[a]
-    if not h or clock() - h.t > HIT_TTL then return end
+    if not h or not h.key or clock() - h.t > HIT_TTL then return end
     if ue.prop(ue.prop(b, "BP_AIComponent"), "Dead") ~= true then return end
-    mark(a, h.key, "damage", kind)
+    mark(a, h.key, h.src or "damage", kind)
 end
 
 -- <Human>.Death(Player), post
@@ -347,10 +562,13 @@ local function on_human_death(human, c, player_p)
     if not ue.valid(b) then return end
     local a = addr(b)
     local d = a and dying[a] or nil
+    local h = a and hits[a] or nil
     if a then
         dying[a] = nil
         hits[a] = nil
     end
+    -- run over by a car no client drives (on_human_damage): the host's, whoever the causer
+    if not d and h and h.key == false and clock() - h.t <= HIT_TTL then return end
     credit_now(b, player_p and player_p:get(), d, human.kind, {
         popup = ue.prop(b, "XpPopUpEnabled?") == true,            -- Death @987 / @798
         skill = human.boss_skill == true and ue.prop(b, "Boss?") == true,   -- Death @793
@@ -367,9 +585,16 @@ local function on_boss_death_event(c, player_p)
     if not a then return end
     local killer = player_p and player_p:get()
     if not tagged(killer) then return end
-    local pc = core.remote_pc_of(nil, killer)
-    if not pc then return end
-    mark_latent(boss, a, ue.name(pc), "killer", "b", { skill = true })   -- @1419: 25 % skill point
+    -- DeathEvent runs inside the damage call (DamageTaken -> Death delegate
+    -- @6793): a vehicle's hit names its driver (nil: the host's)
+    local vs = vehicle_scope(a)
+    local key, src = vs and vs.key, "vehicle"
+    if not vs then
+        local pc = core.remote_pc_of(nil, killer)
+        key, src = pc and ue.name(pc), "killer"
+    end
+    if not key then return end
+    mark_latent(boss, a, key, src, "b", { skill = true })   -- @1419: 25 % skill point
 end
 
 -- -- animals -------------------------------------------------------------------
@@ -398,7 +623,7 @@ local function on_animal_damage(animal, c)
     -- killed by this very damage call: alive when it started (an explosion
     -- does not name its victims: then "not seen dead before")
     if s.was_dead or (s.radial and before) then return end
-    mark_latent(o, a, s.key, "damage", animal.kind)
+    mark_latent(o, a, s.key, s.vehicle and "vehicle" or "damage", animal.kind)
 end
 
 -- BP_AnimalBear.Death, post (host): inside ReceiveAnyDamage, before the credit.
@@ -408,7 +633,7 @@ local function on_bear_death(c)
     local a = ue.valid(o) and addr(o) or nil
     if not a or dying[a] then return end
     local s = scope_for(a)
-    if s and s.tagged and not credited[ue.name(o)] then mark(a, s.key, "damage", "e") end
+    if s and s.tagged and not credited[ue.name(o)] then mark(a, s.key, s.vehicle and "vehicle" or "damage", "e") end
 end
 
 -- BP_SurroundeadGameMode.EventBindMidnight, post (host): DaysSurvived + 1 on
@@ -449,10 +674,32 @@ local function icon_of(path)
     return icon
 end
 
+-- The host's Difficulty.XPMultiplier (sdc_playermarks puts it into this
+-- client's CVar for the session, 0.7.3 wave) reaches the controller's
+-- LevellingComponent.Difficulty_MultiplierValue - AddXP's factor - through
+-- the game's CVar change callback (Event_Multiplier, LevellingComponent
+-- @110-133). Should that callback not have run for the change, the game's
+-- own Event_Multiplier gets the CVar's value here, before the kill's AddXP.
+local XP_CVAR, CONSOLE_UTILS = "Difficulty.XPMultiplier", "/Script/AutoSettings.Default__ConsoleUtils"
+local function xp_multiplier_check(comp)
+    local cu = ue.find_object(CONSOLE_UTILS)
+    if not cu or not FName then return end
+    local ok, want = pcall(function() return cu:GetFloatCVar(FName(XP_CVAR)) end)
+    if not ok or type(want) ~= "number" then return end
+    local have = tonumber(ue.prop(comp, "Difficulty_MultiplierValue"))
+    if have and math.abs(have - want) < 1e-4 then return end
+    local okc, err = pcall(function() comp:Event_Multiplier(want) end)
+    if core.first("kills.xpmult", 3) then
+        log.info("ai: kills: XP multiplier of the own controller %s, %s is %s: the game's Event_Multiplier ok=%s%s",
+            tostring(have), XP_CVAR, tostring(want), tostring(okc), okc and "" or (" " .. tostring(err)))
+    end
+end
+
 local function give_xp(pc, spec, popup)
     local comp = ue.prop(pc, "LevellingComponent")
     if not ue.valid(comp) then return end
     ensure_level_timer(comp)
+    pcall(xp_multiplier_check, comp)
     local gfl = ue.find_object(GFL_CDO)
     local lo, hi = spec.xp[1], spec.xp[2]
     -- every class: CurrentLevel * Random(lo, hi) * MultiplyValue = the game's XpMultiplierCalc
@@ -596,6 +843,15 @@ function M.host_tick(now)
     for k, t in pairs(seen_dead) do
         if now - t > 900 then seen_dead[k] = nil end
     end
+    -- vehicles: who drives which car now (a car rolling on after its driver
+    -- got out still counts for that driver for VEH_GRACE_S)
+    for a, r in pairs(last_driver) do
+        if now - r.t > VEH_GRACE_S then last_driver[a] = nil end
+    end
+    if core.host.active then
+        local ok, err = pcall(note_drivers, now)
+        if not ok then log.err_throttled("ai.kills.drivers", "ai: kills: vehicle drivers: %s", tostring(err)) end
+    end
 end
 
 function M.on_message(kind, f)
@@ -608,14 +864,16 @@ end
 
 function M.reset()
     scope, dying, hits, credited, seen_dead = {}, {}, {}, {}, {}
+    last_driver = {}
     last_day = -1000
     level_timer = {}
 end
 
 function M.status_line()
     local s = M.stats
-    return string.format("ai: kills marked=%d redirected=%d sent=%d host undone=%d host kept XP=%d got=%d skill points=%d days sent=%d got=%d",
-        s.marked, s.redirected, s.sent, s.undone, s.host_kept_xp, s.got, s.skill_points, s.days_sent, s.days_got)
+    return string.format("ai: kills marked=%d redirected=%d sent=%d host undone=%d host kept XP=%d got=%d skill points=%d days sent=%d got=%d vehicle hits: driver=%d host=%d",
+        s.marked, s.redirected, s.sent, s.undone, s.host_kept_xp, s.got, s.skill_points, s.days_sent, s.days_got,
+        s.veh_driver, s.veh_host)
 end
 
 return M

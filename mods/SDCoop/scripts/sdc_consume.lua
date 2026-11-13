@@ -1,7 +1,10 @@
 -- SDCoop: using items up in co-op - crafting and medical items.
 -- Driven by sdc_items (init / host_tick / host_player / client_tick / reset);
 -- its inventory walk (inventory / equipment_of) is shared with sdc_tools and
--- sdc_items in the host tick.
+-- sdc_items in the host tick (a big inventory: walked in slices over several
+-- frames, walk_of). Also the client's check of its inventory against the
+-- host's item list: items only the client shows are asked about (GHOSTQ) and
+-- ended by the host.
 --
 -- Crafting (JigSInventory). The crafting widgets (W_PlayerCraftingUI,
 -- W_CraftingWorkbenchUI, W_ConstructionWorkbenchUI, W_CookingUI) send
@@ -52,16 +55,24 @@
 -- item at all: a flickering item that exists only on the client.
 -- Fix: the client removes its placeholder the way the game drops a failed
 -- pending request (RemoveRequestByUID(uid, ClearWidget)) and asks the host
--- (IGAIN) for the item; the host adds it with the plugin's own server-side
--- add, AddNewItemSomewhere (stacks or a free slot, then CLIENT_UpdateCounts /
--- CLIENT_AddNewItem to the owner, or a drop at the player's feet when full;
--- the game uses it for animal loot). It is accepted only right after a use
--- request from that player. A pending slot the host never answers (20 s) is
--- removed the same way and logged.
+-- (IGAIN) for the item, with WHERE its screen put it (the grid its widgets
+-- reserved, the stack it would grow, or no room); the host adds it there
+-- (grant, see "Items a use gives: host"). It is accepted only right after a
+-- use request from that player. A pending slot the host never answers (20 s)
+-- is removed the same way and logged.
+-- (0.11.0 used the plugin's AddNewItemSomewhere, which picks the first grid
+-- of the SERVER data with room - a wallet, a med bag - whose widget on the
+-- client refuses the item: loot-box weapons never showed, and the client's
+-- next rebuild of that grid had the host delete them.) An item the host adds
+-- to a client's inventory that the widget of its grid still refuses goes to
+-- the player's feet (IGLOST, on_client_add).
 -- The same single-player add run by the HOST for a remote player (the water
 -- well filling empty containers, a caught fish) finds no inventory widget
--- there and drops the item at the player's feet; that drop goes into the
--- player's inventory (see on_host_add).
+-- there and drops the item at the player's feet; that client's screen is
+-- asked where it goes (sdc_place: WHERE, answered with client_spot) and the
+-- host puts it there (place), then removes the drop (see on_host_add).
+-- Items already sitting where the client's window can never show them (a
+-- wallet, a med bag) are dropped at the player's feet by sdc_place's rescue.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -69,15 +80,21 @@ local cfg = require("sdc_config")
 local ctx = require("sdc_ctx")
 local net = require("sdc_net")
 local containers = require("sdc_containers")
+local place = require("sdc_place")
 
+-- counters read by the log throttles below (ghosts_*: items shown only on a
+-- client, asked about / ended; walks_sliced / walk_slices: the host tick's
+-- inventory walks done in slices and their slices; walk_restarts: walks in
+-- slices started over because the inventory changed under them)
 local M = {
-    stats = { crafts_sent = 0, crafts_gated = 0, crafts_answered = 0, crafts_queued = 0, host_crafts = 0,
-              host_unpaid = 0, uses = 0, cures = 0, stop_timers = 0, desync_reports = 0,
-              gains_sent = 0, gains_added = 0, gains_refused = 0, stale_pending = 0,
-              host_adds = 0, host_adds_lost = 0 },
+    stats = { crafts_sent = 0, crafts_answered = 0, host_crafts = 0, uses = 0, desync_reports = 0,
+              ghosts_asked = 0, ghosts_ended = 0, walks_sliced = 0, walk_slices = 0, walk_restarts = 0 },
 }
 local S
-function M.init(state) S = state end
+function M.init(state)
+    S = state
+    place.init(state, M)
+end
 
 local addr = ctx.addr
 
@@ -114,6 +131,8 @@ local F_CONT_UID = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"
 local F_INDEX = "InContainerIndex_31_A61F5C3A47C8E761BA5CF0ADA1DF9FDE"
 local F_SUBS = "SubContainers_35_9B8F8C174A191BE2B5DAE19C1EB3FAAE"
 local F_SUB_ID = "UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7"
+local F_MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
+local F_SLOT = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
 
 local INFLIGHT_TIMEOUT = 8      -- s without the host's answer before the craft gate opens again
 local SAME_CLICK = 0.5          -- s: hook calls this close together belong to one click
@@ -124,13 +143,37 @@ local GAIN_WINDOW = 6           -- s around a use request in which the host acce
 local GAIN_MAX = 12             -- items one use may give (a loot box gives several)
 local STALE_PENDING = 20        -- s a pending slot may wait for the host before it is removed
 
+-- "A:B:C:D" of an FGuid (BP struct). Shared with sdc_items / sdc_damage /
+-- sdc_dialogue; raises on a value that is not a GUID.
 local function guid_str(g)
     return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D)
 end
+M.guid_str = guid_str
 
 local function guid_tbl(g)
     return { A = g.A, B = g.B, C = g.C, D = g.D }
 end
+
+-- "A:B:C:D" -> FGuid table (integers), nil when it is not one.
+local function guid_of(s)
+    local a, b, c, d = tostring(s or ""):match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
+    if not a then return nil end
+    return { A = math.tointeger(tonumber(a)), B = math.tointeger(tonumber(b)), C = math.tointeger(tonumber(c)),
+             D = math.tointeger(tonumber(d)) }
+end
+
+-- Items a use gives, where the client's screen put them (one table: the main
+-- chunk's locals). Client: the gains asked for (their CLIENT_AddNewItem is
+-- logged), refused items told to the host; host: refused items dropped.
+local GAIN = {
+    ZERO = { A = 0, B = 0, C = 0, D = 0 },
+    F_PENDING = "Pending?_31_C3AE39044666796C0FA128BA521590CB",
+    WAIT_S = 15,        -- client: a gain asked for is waited for this long (its log line)
+    AGAIN_S = 5,        -- one refused item is told / dropped at most once in this time
+    wait = {},          -- client: { { name, at, where } } gains asked for (IGAIN)
+    told = {},          -- client: [uid] = os.clock() refused items told to the host (IGLOST)
+    lost_at = {},       -- host: [character address|uid] = os.clock() refused items dropped
+}
 
 local function is_player_character(a)
     return ue.valid(a) and ue.class_name(a):find("PlayerCharacter", 1, true) ~= nil
@@ -157,12 +200,16 @@ local function item_name(da)
     return (ue.short(da):gsub("^DA_", ""))
 end
 
+-- A hook parameter's value, nil when it cannot be read (no closure per
+-- call). Shared with sdc_quests / sdc_dialogue / sdc_throw.
+local function p_get(p) return p:get() end
 local function param(p)
-    if not p then return nil end
-    local ok, v = pcall(function() return p:get() end)
+    if p == nil then return nil end
+    local ok, v = pcall(p_get, p)
     if ok then return v end
     return nil
 end
+M.param = param
 
 -- Array (param value or property) -> Lua list of element values.
 local function list_of(arr)
@@ -252,8 +299,9 @@ local function rd_item(it)
     local a, b, c, d = u.A, u.B, u.C, u.D
     local info = item[F_INFO]
     local w = W
+    local da = info[F_ITEMID]
     local e = { uid = string.format("%d:%d:%d:%d", a, b, c, d), g = { A = a, B = b, C = c, D = d },
-                n = info[F_COUNT], id = item_name_of(info[F_ITEMID]) }
+                n = info[F_COUNT], id = item_name_of(da) }
     w.list[#w.list + 1] = e
     w.by_uid[e.uid] = e
     if not w.full then return end
@@ -265,6 +313,9 @@ local function rd_item(it)
     pcall(rd_sub, item)
     e.sub = w.sub
     e.cuid = w.cuid
+    -- (an item with grids: its window class, once per item name - sdc_place's
+    -- check of hidden items needs no walk of its own for that)
+    if e.sub and place.widget[e.id] == nil then place.learn_widget(e.id, da) end
     if e.idx == 0 and w.cuid then w.at0[w.cuid] = e end
 end
 
@@ -354,11 +405,17 @@ end
 -- BP_MainSpecialContainer with AllContainers) or a plain inner container
 -- (SlotContainer) - the way JigTryAddGetPendingRef walks them. The host's
 -- MainJigContainers has all of these (flat), so the view must too.
-local function scan_container(w, out, depth, seen)
+-- `grids` (optional): [grid uid] = true for each container widget (its
+-- ContainerID: the server grid it shows).
+local function scan_container(w, out, depth, seen, grids)
     if depth > 4 or not ue.valid(w) then return end
     local k = addr(w)
     if not k or seen[k] then return end
     seen[k] = true
+    if grids then
+        local g = ue.try(function() return guid_str(ue.prop(w, "ContainerID")) end)
+        if g and g ~= "0:0:0:0" then grids[g] = true end
+    end
     for _, slot in ipairs(list_of(ue.prop(w, "ArrayOfItems"))) do
         if ue.valid(slot) then
             local ok, uid = pcall(function() return guid_str(slot.ItemUniqueID) end)
@@ -368,22 +425,24 @@ local function scan_container(w, out, depth, seen)
             end
             local special = ue.prop(slot, "SpecialContainerRef")
             if ue.valid(special) then
-                for _, c in ipairs(list_of(ue.prop(special, "AllContainers"))) do scan_container(c, out, depth + 1, seen) end
+                for _, c in ipairs(list_of(ue.prop(special, "AllContainers"))) do
+                    scan_container(c, out, depth + 1, seen, grids)
+                end
             end
-            scan_container(ue.prop(slot, "SlotContainer"), out, depth + 1, seen)
+            scan_container(ue.prop(slot, "SlotContainer"), out, depth + 1, seen, grids)
         end
     end
 end
 
 -- Client: { [uid] = { n = count, name = item name, where = slot_where() } } of
 -- what the own inventory widgets show (LocalJSIContainers -> JSI_Slot, and
--- the containers inside worn items).
-local function client_view(jig)
+-- the containers inside worn items); with `grids` also the grids they show.
+local function client_view(jig, grids)
     local out = {}
     if not ue.valid(jig) then return out end
     local seen = {}
     for _, w in ipairs(list_of(ue.prop(jig, "LocalJSIContainers"))) do
-        pcall(scan_container, w, out, 0, seen)
+        pcall(scan_container, w, out, 0, seen, grids)
     end
     return out
 end
@@ -464,7 +523,6 @@ local function continue_queue(q, refreshed)
         if not we then gate.queue = nil; return end
         q.left = q.left - 1
         if q.left <= 0 then gate.queue = nil end
-        M.stats.crafts_queued = M.stats.crafts_queued + 1
         local ok, err = pcall(function() we.w[CLICK_FN](we.w) end)
         if not ok then
             gate.queue = nil
@@ -504,7 +562,7 @@ end
 local placeholders = {}   -- [uid string] = os.clock(): slots reserved here (no item on the host yet)
 
 local function on_pending_ref(c, _, _, out_p, stack_p)
-    if S.role ~= "client" then return end
+    if S.role ~= "client" or gate.own_query then return end   -- (M.client_spot's own question)
     local now = os.clock()
     local a = gate.armed
     gate.armed = nil
@@ -579,7 +637,6 @@ local function on_check_ingredients(ui, c, proceed_p)
     local ghost = ghost_components(w)
     if ghost then
         if pcall(function() proceed_p:set(false) end) then
-            M.stats.crafts_held_unpaid = (M.stats.crafts_held_unpaid or 0) + 1
             if not ghost_logged[ghost] then
                 ghost_logged[ghost] = true
                 log.warn("consume: %s: craft held back - its components are not in the host's copy of this inventory: %s",
@@ -597,7 +654,6 @@ local function on_check_ingredients(ui, c, proceed_p)
         log.err_throttled("consume.gate", "consume: cannot hold the craft back (Proceed not writable)")
         return
     end
-    M.stats.crafts_gated = M.stats.crafts_gated + 1
     gate.touched[k] = true
     local same_click = gate.click ~= nil and gate.click.w == k and os.clock() - gate.click.at < SAME_CLICK
     if same_click and not gate.queue then
@@ -673,7 +729,6 @@ local function on_craft_answer(c, _, added_p, ok_p, uids_p, counts_p)
         if e and ue.valid(e.da) and ue.name(e.da) ~= ue.name(added_da) then
             local removed = ue.valid(e.slot) and pcall(function() e.slot:RemoveFromJSIParent({}) end)
             net.send_to_host("RESEND", added_u)
-            M.stats.crafts_mismatched = (M.stats.crafts_mismatched or 0) + 1
             log.warn("consume: craft answer: the host made %s (uid %s), this inventory showed %s there (%s); slot removed=%s, asked the host to send it again",
                 item_name(added_da), added_u, e.name, e.where, tostring(removed))
         end
@@ -706,9 +761,61 @@ local function remove_local_slot(comp, slot)
     return false, "NOT removed"
 end
 
+-- Where this screen put an item its single-player add reserved
+-- (JigTryAddGetPendingRef: each grid widget is asked with AddNewInventoryItem,
+-- so the grid it chose takes this item): kind "c" + the grid's server uid
+-- (the widget's ContainerID) + the slot index, "s" + the uid of the stack it
+-- would grow, "n" (no room on this screen), "?" (not known). Read before the
+-- placeholder goes.
+local function spot_of(ls)
+    if not ls then return "?", "", "" end
+    local slot = ls.slot
+    if ls.stack then
+        local u = slot and ue.try(function() return guid_str(slot.ItemUniqueID) end)
+        if u and u ~= "0:0:0:0" then return "s", u, "" end
+        return "?", "", ""
+    end
+    if not slot then return "n", "", "" end
+    local g = ue.try(function() return guid_str(ue.prop(ue.prop(slot, "ContainerMother"), "ContainerID")) end)
+    if not g or g == "0:0:0:0" then return "?", "", "" end
+    return "c", g, tostring(ue.prop(slot, "SlotIndex") or "")
+end
+
+-- Client (sdc_place, the host's WHERE): where this screen puts n of `da`,
+-- asked the way single player asks it (JigTryAddGetPendingRef(Info,
+-- CheckStacking = true): the slot its grid widgets reserve, the stack it
+-- would grow, or none) and given up at once (a reserved slot goes as the
+-- game drops a failed pending request). Returns kind, grid / stack uid,
+-- slot index (as spot_of) and what happened here.
+function M.client_spot(da, n)
+    local me = ue.local_pawn()
+    local comp = me and ue.prop(me, "BP_JigMultiplayer")
+    if not ue.valid(comp) or not ue.valid(da) then return "?", "", "", "no own inventory here" end
+    local o_slot, o_stack = {}, {}
+    gate.own_query = true
+    local ok, err = pcall(function()
+        comp:JigTryAddGetPendingRef({ [F_ITEMID] = da, [F_COUNT] = math.floor(tonumber(n) or 1) }, true, o_slot, o_stack)
+    end)
+    gate.own_query = false
+    if not ok then return "?", "", "", "asking its widgets FAILED: " .. tostring(err) end
+    local slot = o_slot.OutputPin
+    local ls = { slot = ue.valid(slot) and slot or nil, stack = o_stack["Stack?"] == true }
+    local kind, spot, slot_i = spot_of(ls)
+    local here = "nothing reserved"
+    if ls.slot and ls.stack then
+        here = "onto " .. (ue.try(slot_where, ls.slot) or "?")
+    elseif ls.slot then
+        local where = ue.try(slot_where, ls.slot) or "?"
+        local _, how = remove_local_slot(comp, ls.slot)
+        here = string.format("%s, its reservation %s", where, how)
+    end
+    return kind, spot, slot_i, here
+end
+
 -- BP_JigComponent.JigTryAddItemSomewhere(LocalComp, ItemID, Count, out Added?,
 -- out UID), post (client): single-player code adding an item on this machine
--- only. Its placeholder goes, and the host is asked for the item.
+-- only. Its placeholder goes, and the host is asked for the item, where this
+-- screen put it.
 local function on_local_add(c, _, item_p, count_p)
     if S.role ~= "client" then return end
     local now = os.clock()
@@ -733,11 +840,12 @@ local function on_local_add(c, _, item_p, count_p)
         return
     end
     if cfg.get("item_gains_from_host") == false then return end
+    local kind, spot, slot_i = spot_of(ls)
     local here
     if not ls then
         here = "no placeholder"
     elseif ls.stack then
-        here = "would stack, nothing changed here"
+        here = string.format("would stack onto %s, nothing changed here", ue.try(slot_where, ls.slot) or "?")
     elseif ls.slot then
         local where = ue.try(slot_where, ls.slot) or "?"
         local _, how = remove_local_slot(comp, ls.slot)
@@ -747,14 +855,81 @@ local function on_local_add(c, _, item_p, count_p)
     end
     -- wood, stone and scrap from world objects: sdc_world has the host grant
     -- them to the player who chopped / salvaged (an IGAIN would duplicate them)
-    local dn = ue.name(da) or ""
+    local dn = ue.short(da)
     if cfg.get("world_harvest") ~= false and (dn == "DA_WoodenLog" or dn == "DA_Rock" or dn == "DA_ScrapMetal") then
         log.info("consume: %s x%d from a world object: the host grants it (%s)", item_name(da), count, here)
         return
     end
-    M.stats.gains_sent = M.stats.gains_sent + 1
-    net.send_to_host("IGAIN", ue.path(da), count)
-    log.info("consume: %s x%d from using an item: asked the host to add it (%s)", item_name(da), count, here)
+    net.send_to_host("IGAIN", ue.path(da), count, kind, spot, slot_i)
+    for i = #GAIN.wait, 1, -1 do
+        if now - GAIN.wait[i].at > GAIN.WAIT_S then table.remove(GAIN.wait, i) end
+    end
+    GAIN.wait[#GAIN.wait + 1] = { name = item_name(da), at = now }
+    log.info("consume: %s x%d from using an item: asked the host to add it %s (%s)", item_name(da), count,
+        kind == "c" and ("into grid " .. spot .. ", where this screen put it") or kind == "s" and ("onto stack " .. spot)
+        or kind == "n" and "at this player's feet (no room on this screen)" or "(where this screen puts it is not known)",
+        here)
+end
+
+-- BP_JigComponent.CLIENT_AddNewItem(ItemInfo, Content, Comp, PendingUID),
+-- post (client): an item the host added to this inventory on its own (not
+-- the answer to a move: PendingUID 0; not a world container's: Comp is this
+-- component). HandleAddNewItem put it into the widget of its grid
+-- (MainDeepSearchContainer(ContainerMotherID) -> AddNewInventoryItem) -
+-- unless that widget does not take the item (a wallet: money and cards; a
+-- med bag: medical items). Then it is nowhere on this screen, and the next
+-- rebuild of that grid (the bag taken off and put on: BuildDataToContainer
+-- @1058-1228) asks the host to REMOVE it (SERVER_RequestRemoveItem, and
+-- ConsumeItem runs on it). Such an item is told to the host (IGLOST), which
+-- drops it at this player's feet. A grid with no widget here (inside a bag
+-- this screen never built) is not judged.
+local function on_client_add(c, info_p, _, comp_p, pending_p)
+    if S.role ~= "client" then return end
+    local comp = own_jig_comp(c)
+    if not comp or addr(param(comp_p)) ~= addr(comp) then return end
+    local pend = ue.try(function() return guid_str(param(pending_p)) end)
+    if pend and pend ~= "0:0:0:0" then return end
+    local it = param(info_p)
+    local u = it and ue.try(function() return guid_str(it[F_USID]) end)
+    if not u or u == "0:0:0:0" then return end
+    local name = ue.try(function() return item_name(it[F_INFO][F_ITEMID]) end) or "?"
+    local n = ue.try(function() return it[F_INFO][F_COUNT] end)
+    local mother = ue.try(function() return guid_str(it[F_MOTHER]) end) or "?"
+    local slot_i = ue.try(function() return it[F_SLOT] end)
+    local now = os.clock()
+    local asked = nil
+    for i, w in ipairs(GAIN.wait) do
+        if w.name == name and now - w.at <= GAIN.WAIT_S then
+            asked = table.remove(GAIN.wait, i)
+            break
+        end
+    end
+    local grids = {}
+    local e = client_view(comp, grids)[u]
+    if e then
+        if asked then
+            log.info("consume: the host added %s x%s (uid %s): shown here (%s)", name, tostring(n), u, e.where or "?")
+        end
+        return
+    end
+    if not grids[mother] then
+        log.info("consume: the host added %s x%s (uid %s) to grid %s slot %s, which this screen has not built: not shown yet",
+            name, tostring(n), u, mother, tostring(slot_i))
+        return
+    end
+    if cfg.get("refused_items_to_feet") == false then
+        log.warn("consume: the host added %s x%s (uid %s) to grid %s slot %s, whose widget here does not take it: NOT shown (refused_items_to_feet is off)",
+            name, tostring(n), u, mother, tostring(slot_i))
+        return
+    end
+    if now - (GAIN.told[u] or -100) < GAIN.AGAIN_S then return end
+    for k, t in pairs(GAIN.told) do
+        if now - t > 60 then GAIN.told[k] = nil end
+    end
+    GAIN.told[u] = now
+    net.send_to_host("IGLOST", u)
+    log.warn("consume: the host added %s x%s (uid %s) to grid %s slot %s, whose widget here does not take it (not shown): asked the host to drop it at this player's feet",
+        name, tostring(n), u, mother, tostring(slot_i))
 end
 
 -- BP_JigComponent.ServerFunc_UpdateDurabilityByUID(UID, NewDurability, out
@@ -776,9 +951,15 @@ local function on_client_set_dur(c, uid_p, dur_p, updated_p)
 end
 
 -- BP_PlayerCharacter.JigMP_OnRequestDropItem(ItemInfo, ContainerName, out
--- ActorRef), post (client): JigTryAddItemSomewhere found no room here and
+-- ActorRef), post. Client: JigTryAddItemSomewhere found no room here and
 -- dropped the item at this player's feet - a pickup only this machine has.
+-- Host: inside a drop of sdc_place / IGLOST (its mark up): the pickup that
+-- drop made - its only proof that the item lies on the ground.
 local function on_local_drop(c, _, _, actor_p)
+    if S.role == "host" then
+        if place.dropping then place.note_drop(param(actor_p)) end
+        return
+    end
     if S.role ~= "client" or os.clock() - gate.local_drop > SAME_CALL then return end
     gate.local_drop = -100
     local pawn = c and c:get()
@@ -825,7 +1006,6 @@ local function check_stale_pending(now)
                             or "a real item: NOT un-pended"
                     end
                     placeholders[u] = nil
-                    M.stats.stale_pending = M.stats.stale_pending + 1
                     log.warn("consume: %s (uid %s, %s) waited %.0f s for the host; %s", e.name, u, e.where,
                         now - e.first, how)
                     pending_seen[u] = nil
@@ -913,7 +1093,6 @@ local function on_craft_request(c, station_p, index_p, uids_p)
             back[#back + 1] = string.format("%s x%d%s", o.id, o.n, ok and "" or (" FAILED: " .. tostring(err)))
         end
         if k then ledger[k] = server_items(comp) end
-        M.stats.host_unpaid = M.stats.host_unpaid + 1
         log.warn("%s - wrong recipe, nothing consumed: taken back [%s]", line, table.concat(back, ", "))
     elseif unresolved then
         log.warn("%s - wrong recipe list (outputs kept: components were consumed)", line)
@@ -922,7 +1101,6 @@ local function on_craft_request(c, station_p, index_p, uids_p)
         -- refreshed after every inventory request): the game made the item for
         -- nothing. It is taken back with the server's own remove, which also
         -- tells the client.
-        M.stats.host_unpaid = M.stats.host_unpaid + 1
         if cfg.get("craft_needs_components") == false or #outputs == 0 then
             log.warn("%s - NOTHING consumed, none of them was here%s", line,
                 #outputs == 0 and " (no output in the inventory to take back: dropped or at a station)" or "")
@@ -1034,7 +1212,6 @@ local function on_consume_item(c, info_p)
             end
         end
     end
-    if #done > 0 then M.stats.cures = M.stats.cures + 1 end
     local skills = ue.prop(ue.prop(pawn, "Controller"), "PassiveSkillsComponent")
     local pk = addr(pawn) or -1
     local hp = tonumber(ue.prop(med, "Health"))
@@ -1046,90 +1223,292 @@ local function on_consume_item(c, info_p)
         tostring(ue.prop(skills, "FirstAidMultiplier")), med_flags(med), table.concat(effects, ","), table.concat(done, ","))
 end
 
--- Items a use gives (IGAIN from the client, see the header): added by the
--- plugin's server-side AddNewItemSomewhere(ItemID, Count, ItemInside,
--- ItemInsideCount, DropIfFailedToAdd?, SpecificContainer, out Added, out
--- Dropped?, out ItemUID, out AddedToUID) on the player's own JigComponent.
+-- ===========================================================================
+-- Items a use gives: host
+-- ===========================================================================
+-- IGAIN|<item path>|<count>|<kind>|<spot>|<slot> from the client (see the
+-- header), accepted right after a use request of that player. 2026-11-13
+-- (0.11.0, a client's loot boxes: "the box and the loot just vanish"): the
+-- host added the reward with the plugin's AddNewItemSomewhere, which takes
+-- the first grid of the SERVER data with room whose owner item lists the item
+-- type or lists none (BP_JigComponent @3601-5340) - a wallet, a med bag. The
+-- client's widget of that grid takes only its own kinds, so HandleAddNewItem
+-- refused the plugin's CLIENT_AddNewItem: nothing showed. Taking the backpack
+-- off and on rebuilt its grids (BuildDataToContainer), found no slot for it
+-- either and asked the host to remove it (SERVER_RequestRemoveItem, with
+-- ConsumeItem): gone for good. Seen in the host's data: a Katana and cans in
+-- the wallet; a SteyrAug and a gun locker deleted together when the backpack
+-- went back on. Junk (an empty bottle) showed when the plugin happened to
+-- pick a grid the client shows.
+-- The client's own single-player add asks its grid widgets (each one's
+-- AddNewInventoryItem), so the host adds where THAT screen put it:
+--   c <grid>   Generate_AddNewItemToContainer(grid, item, count) (the plugin's
+--              add into one grid, first free slot; no message to the client),
+--              the item's default attachments into its own slots the same way
+--              (single player: ContextOpenLootBox @3585-4781 fits them after
+--              an add), then ONE CLIENT_AddNewItem(the item as the host has it,
+--              what is inside it, the component, no pending UID): what the
+--              plugin sends for an item with contents (HandleAddNewItem ->
+--              SetupNewAddedItem fills the item's slots). 0.11.0 told the
+--              client about each attachment with CLIENT_NewItemAdded built
+--              from the add's out-struct, which UE4SS refused (ToContainerUID).
+--   s <stack>  ServerUpdateCountByUID(stack, count + n) (the game's server
+--              count change) and the plugin's CLIENT_UpdateCount; that stack
+--              full here, or another item's here (the views differ): a new
+--              one in its grid (as c) - never onto another item's count
+--   n          no room on that screen: at the player's feet, the way single
+--              player drops it (the plugin's JigMP_OnRequestDropItem +
+--              SetPickupCount; a weapon dropped so gets no attachments there
+--              either)
+-- What the host's data cannot take (that grid full or unknown here, no word):
+-- at the player's feet too - never into a grid that screen may not show.
+-- The drop itself failed (no pickup came): the plugin's AddNewItemSomewhere
+-- as the last way (a grid that screen refuses is then dropped by IGLOST /
+-- sdc_place's rescue); that failing too, the player is told (IFAIL) - the box
+-- is used up either way.
+-- (GAIN.put is that placement; sdc_place uses it for the host's other grants
+-- through M.place.)
 local uses = {}     -- [character address] = { at = os.clock(), gains = n } of the last use request
-local queued = {}   -- { pc, key, path, count, at }: IGAIN that came before its use request
+local queued = {}   -- { pc, key, path, count, at, spot }: IGAIN that came before its use request
 
--- Default attachments of an item that came out of a loot box. Single player
--- (ContextOpenLootBox @3585-4781), for each ItemID.DefaultAttachments entry:
---   GetItemByUID(new UID) -> GetPickupInfoFromDT(ID, MinCount) ->
---   AddNewItemToSlot(info, Item.SubContainers[AddToContainerIndex].UniqueID, 0)
---   -> CLIENT_NewItemAdded(...) to the owner.
--- On the host: the same sub-container, Generate_AddNewItemToContainer(sub UID,
--- ID, MinCount) (the plugin's server-side add into one container), then the
--- same CLIENT_NewItemAdded to the owner. Only gains carry it: no consumable or
--- cloth has DefaultAttachments, so in practice these are loot-box weapons.
--- (F_SUBS / F_SUB_ID: at the top)
-local F_MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
-local F_SLOT = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
-local F_ROT = "Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56"
+-- DefaultAttachments entries of an item data asset (S_DefaultAttachment)
 local A_ID = "ID_21_A45B60654D588805C5D52BA4BC5CD4FD"
 local A_MIN = "MinCount_31_E62F0FA548FC7DB0BDB860B4C0D695B6"
 local A_INDEX = "AddToContainerIndex_11_3CB23949434BAB8C7EEBE09362324A4C"
-local U_UID = "UID_2_DC6DBB72457305316FAC19A4399A1CB5"
-local U_COUNT = "NewCount_5_31E28E124BF695AFBB001A87164F9121"
 
-local function sub_containers_of(comp, u)
-    local subs = nil
-    pcall(function()
+-- Host: the player's server data, one pass: items { item = the live struct
+-- (until the data changes), uid, grid, slot, n, name } and grids [uid] =
+-- true. `only`: [grid uid] = true - only those grids' items are read.
+-- ok = false: not read in full.
+function GAIN.walk(comp, only)
+    local items, grids = {}, {}
+    local ok, err = pcall(function()
         comp.MainJigContainers:ForEach(function(_, c)
-            if subs then return end
-            c:get()[F_ITEMS]:ForEach(function(_, it)
-                local item = it:get()
-                if not subs and guid_str(item[F_USID]) == u then
-                    subs = {}
-                    item[F_SUBS]:ForEach(function(_, s) subs[#subs + 1] = guid_tbl(s:get()[F_SUB_ID]) end)
-                end
+            local cont = c:get()
+            local gu = guid_str(cont[F_CONT_UID])
+            grids[gu] = true
+            if only and not only[gu] then return end
+            cont[F_ITEMS]:ForEach(function(_, e)
+                local item = e:get()
+                local info = item[F_INFO]
+                items[#items + 1] = { item = item, uid = guid_str(item[F_USID]), grid = gu, slot = item[F_SLOT],
+                                      n = math.floor(tonumber(info[F_COUNT]) or 0), name = item_name(info[F_ITEMID]) }
             end)
         end)
     end)
-    return subs
+    return items, grids, ok, err
 end
 
-local function add_default_attachments(pawn, comp, da, u)
-    local atts = list_of(ue.prop(da, "DefaultAttachments"))
-    if #atts == 0 or cfg.get("loot_box_attachments") == false then return end
-    local subs = sub_containers_of(comp, u)
-    if not subs then
-        log.warn("consume: %s of %s has default attachments, but the item %s is not in its inventory here",
-            item_name(da), ue.short(pawn), u)
-        return
+-- Host: the grids of an item (its SubContainers, in index order) as uid strings.
+function GAIN.subs(item)
+    local out = {}
+    pcall(function()
+        item[F_SUBS]:ForEach(function(_, s) out[#out + 1] = guid_str(s:get()[F_SUB_ID]) end)
+    end)
+    return out
+end
+
+-- Host: n of `da` at `pawn`'s feet, as single player drops what has no room
+-- (JigTryAddItemSomewhere @1180-1614: JigMP_OnRequestDropItem, then
+-- SetPickupCount). true (nil, the pickup) when the pickup is there, else
+-- false and why.
+function GAIN.drop_at(pawn, da, n)
+    local out = {}
+    -- (marked: sdc_world's grant hook on this function leaves it alone)
+    local ok, err = place.own_drop(function()
+        pawn:JigMP_OnRequestDropItem({ [F_ITEMID] = da, [F_COUNT] = n, [GAIN.F_PENDING] = -1 }, FName("None"), out)
+    end)
+    local a = out.ActorRef
+    if not ok or not ue.valid(a) then return false, ok and "no pickup came" or tostring(err) end
+    pcall(function() a:SetPickupCount(n, {}) end)
+    return true, nil, a
+end
+
+-- Host: n of `da` onto stack `u` (uid string) of `comp`. Returns true and
+-- what, or nil, why not and (the stack known) its grid.
+function GAIN.onto_stack(comp, da, n, u)
+    local items, _, read = GAIN.walk(comp)
+    local st = nil
+    for _, e in ipairs(items) do
+        if e.uid == u then st = e break end
     end
-    local zero = { A = 0, B = 0, C = 0, D = 0 }
-    local parts = {}
-    for _, a in ipairs(atts) do
-        local id = ue.try(function() return a[A_ID] end)
-        local n = math.max(1, math.floor(tonumber(ue.try(function() return a[A_MIN] end)) or 1))
-        local idx = math.floor(tonumber(ue.try(function() return a[A_INDEX] end)) or 0)
-        local sub = subs[idx + 1]
-        local what
-        if not ue.valid(id) then
-            what = "?: no item"
-        elseif not sub then
-            what = string.format("%s: no sub-container %d (of %d)", item_name(id), idx, #subs)
-        else
-            local info, added = {}, {}
-            local ok, err = pcall(function() comp:Generate_AddNewItemToContainer(sub, id, n, info, added) end)
-            if not ok or added["Added?"] ~= true then
-                what = string.format("%s: NOT added%s", item_name(id), ok and "" or (" (" .. tostring(err) .. ")"))
-            else
-                local okc, errc = pcall(function()
-                    comp:CLIENT_NewItemAdded(info[F_INFO], info[F_USID], info[F_MOTHER], info[F_SLOT], info[F_ROT] == true,
-                        { [U_UID] = zero, [U_COUNT] = 1 }, zero, info[F_SUBS] or {}, false)
-                end)
-                what = string.format("%s x%d%s", item_name(id), n,
-                    okc and "" or (" (added on the host, the client was NOT told: " .. tostring(errc) .. ")"))
-            end
+    local name = item_name(da)
+    if not st then
+        return nil, string.format("the stack its screen chose (%s) is not in its inventory here%s", tostring(u),
+            read and "" or " (not read in full)")
+    end
+    if st.name ~= name then
+        -- (the views differ; that screen shows this item in that grid: a new
+        -- stack there, never onto another item's count)
+        return nil, string.format("the stack its screen chose (%s) holds %s here", u, st.name), st.grid
+    end
+    local want = st.n + n
+    local max = math.floor(tonumber(ue.prop(da, "MaxStack")) or 0)
+    if want > max then
+        return nil, string.format("its stack %s is full here (%d + %d > %d)", u, st.n, n, max), st.grid
+    end
+    local g = guid_of(u)
+    -- (ItemUID, NewCount: OldCount is a local of the function)
+    local ok, err = pcall(function() comp:ServerUpdateCountByUID(g, want) end)
+    local now_n = nil
+    local after, _, read2 = GAIN.walk(comp, { [st.grid] = true })
+    for _, e in ipairs(after) do
+        if e.uid == u then now_n = e.n break end
+    end
+    if not read2 and ok then now_n = want end   -- (unread: taken as done - never a second add)
+    if not now_n or now_n == st.n then
+        return nil, string.format("counting its stack %s up FAILED (%s)", u, ok and "unchanged" or tostring(err)), st.grid
+    end
+    local okc, errc = pcall(function() comp:CLIENT_UpdateCount(comp, g, now_n, GAIN.ZERO) end)
+    return true, string.format("onto its stack %s in grid %s (%d -> %d)%s", u, st.grid, st.n, now_n,
+        okc and ", the client was told (CLIENT_UpdateCount)" or (", telling the client FAILED: " .. tostring(errc)))
+end
+
+-- Host: the items in grids `inside` (a set, grown with the grids of what is
+-- found: a magazine's rounds), from the data as it is now.
+function GAIN.inside(comp, inside)
+    local found, seen = {}, {}
+    for _ = 1, 3 do
+        local want, any = {}, false
+        for s in pairs(inside) do
+            if not seen[s] then want[s] = true; seen[s] = true; any = true end
         end
-        parts[#parts + 1] = what
+        if not any then break end
+        for _, e in ipairs((GAIN.walk(comp, want))) do
+            found[#found + 1] = e
+            for _, s in ipairs(GAIN.subs(e.item)) do inside[s] = true end
+        end
     end
-    log.info("consume: default attachments of %s for %s: %s", item_name(da), ue.short(pawn), table.concat(parts, "; "))
+    return found
 end
 
-local function grant(pawn, path, count)
+-- Host: n of `da` into grid `grid` (uid string) of `comp`, with the default
+-- attachments `atts` in the new item's slots; the client gets the item and
+-- what is inside it in one CLIENT_AddNewItem. Returns true and what (also
+-- when it was added but could not be told: never a second copy), or nil and
+-- why not.
+function GAIN.into_grid(comp, da, n, grid, atts)
+    local g = guid_of(grid)
+    if not g then return nil, "no grid in its word" end
+    local want = { [grid] = true }
+    local before, grids, read = GAIN.walk(comp, want)
+    if not read then return nil, "its inventory here could not be read" end
+    if not grids[grid] then return nil, string.format("grid %s is not in its inventory here", grid) end
+    local had = {}
+    for _, e in ipairs(before) do had[e.uid] = true end
+    local res = {}
+    local ok, err = pcall(function() comp:Generate_AddNewItemToContainer(g, da, n, {}, res) end)
+    local name = item_name(da)
+    local new = nil
+    for _, e in ipairs((GAIN.walk(comp, want))) do
+        if not had[e.uid] and e.name == name then new = e break end
+    end
+    if not new then
+        if ok and res["Added?"] == true then
+            return true, string.format("added to grid %s, but the new item was not found here: the client was NOT told", grid)
+        end
+        return nil, string.format("grid %s has no room for it here (%s)", grid,
+            ok and ("added=" .. tostring(res["Added?"])) or ("add FAILED: " .. tostring(err)))
+    end
+    local subs = GAIN.subs(new.item)
+    local parts = {}
+    for _, a in ipairs(atts or {}) do
+        local id = ue.try(function() return a[A_ID] end)
+        local an = math.max(1, math.floor(tonumber(ue.try(function() return a[A_MIN] end)) or 1))
+        local idx = math.floor(tonumber(ue.try(function() return a[A_INDEX] end)) or 0)
+        local sg = guid_of(subs[idx + 1])
+        if not ue.valid(id) then
+            parts[#parts + 1] = "?: no item"
+        elseif not sg then
+            parts[#parts + 1] = string.format("%s: no slot %d (of %d)", item_name(id), idx, #subs)
+        else
+            local r = {}
+            local oka, erra = pcall(function() comp:Generate_AddNewItemToContainer(sg, id, an, {}, r) end)
+            parts[#parts + 1] = string.format("%s x%d%s", item_name(id), an, (oka and r["Added?"] == true) and ""
+                or (" NOT added" .. (oka and "" or (" (" .. tostring(erra) .. ")"))))
+        end
+    end
+    -- the item as the host has it now, and what is inside it (read last: the
+    -- adds above move the data, so earlier structs are not sent)
+    local inside = {}
+    for _, s in ipairs(subs) do inside[s] = true end
+    local content = GAIN.inside(comp, inside)
+    local item = nil
+    for _, e in ipairs((GAIN.walk(comp, { [grid] = true }))) do
+        if e.uid == new.uid then item = e.item break end
+    end
+    local att_text = #parts > 0 and (", attachments: " .. table.concat(parts, "; ")) or ""
+    if not item then
+        return true, string.format("new item %s in grid %s%s, but it was not found again: the client was NOT told",
+            new.uid, grid, att_text)
+    end
+    local structs = {}
+    for _, e in ipairs(content) do structs[#structs + 1] = e.item end
+    local okc, errc = pcall(function() comp:CLIENT_AddNewItem(item, structs, comp, GAIN.ZERO) end)
+    return true, string.format("new item %s in grid %s slot %s%s%s", new.uid, grid, tostring(new.slot), att_text,
+        okc and string.format(", the client was told (CLIENT_AddNewItem, %d inside)", #structs)
+        or (", telling the client FAILED: " .. tostring(errc)))
+end
+
+-- Host: n of `da` into `comp` where the client's screen put it. spot: { kind
+-- = "c" | "s" | "n" | "?", uid = grid or stack uid, slot = the client's slot
+-- index } (IGAIN, WHEREIS); `atts`: default attachments for a new item.
+-- Returns true and what, or nil and why not (nothing added).
+function GAIN.put(comp, da, count, spot, atts)
+    local kind, u = spot.kind, spot.uid
+    local done, what, why = nil, nil, nil
+    if kind == "s" then
+        local grid
+        done, what, grid = GAIN.onto_stack(comp, da, count, u)
+        if not done then
+            why = what
+            if grid then kind, u = "c", grid end   -- that stack is full here: a new one in its grid
+        end
+    end
+    if not done and kind == "c" then
+        -- (a grid only a UID mix-up could name - a stack of another item in a
+        -- wallet: the window of that grid would refuse it)
+        if place.grid_refuses(comp, u, da) then
+            what = string.format("the window of grid %s on its screen does not take %s", tostring(u), item_name(da))
+        else
+            done, what = GAIN.into_grid(comp, da, count, u, atts)
+        end
+        if not done then why = why and (why .. "; " .. what) or what end
+    end
+    if done then return true, why and string.format("%s (%s)", what, why) or what end
+    return nil, why or (spot.kind == "n" and "its screen has no room for it" or "no word where its screen put it")
+end
+
+-- Host: the drop at the feet failed too (no pickup came): the plugin's add
+-- into any grid, else the player is told the item is lost. Returns what
+-- happened. No rescue here: in a grid that screen refuses the item would go
+-- by the same failing drop - and SERVER_RequestDropItem takes it out of the
+-- data even without a pickup; items of this kind are not dropped for a
+-- while (sdc_place.drop_failed).
+function GAIN.last_way(pawn, comp, da, count)
+    local added, dropped, uid, to = {}, {}, {}, {}
+    local ok, err = pcall(function()
+        comp:AddNewItemSomewhere(da, count, nil, 1, true, FName("None"), added, dropped, uid, to)
+    end)
+    place.drop_failed(da)
+    if ok and added.Added == true then
+        local grid = ue.try(function() return guid_str(to.AddedToUID or to) end) or "?"
+        -- in a grid its window refuses: hidden there, and its kind cannot be
+        -- dropped now (the drop just failed) - the player is told so
+        if place.grid_refuses(comp, grid, da) then
+            place.tell(ue.prop(pawn, "Controller"), ue.path(da), count, place.owner_path(comp, grid), "stuck",
+                ue.try(function() return guid_str(uid.ItemUID or uid) end))
+            return "added by the plugin's add into grid " .. grid .. ", whose window does not show it; the player was told"
+        end
+        return "added by the plugin's add into grid " .. grid
+    end
+    if ok and dropped["Dropped?"] == true then return "dropped by the plugin's add" end
+    place.tell_lost(ue.prop(pawn, "Controller"), da, count)
+    return "LOST: the plugin's add " .. (ok and "found no room and no drop" or ("FAILED: " .. tostring(err)))
+        .. "; the player was told"
+end
+
+local function grant(pawn, path, count, spot)
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
     if not ue.valid(comp) then return end
     local da = ue.find_object(path)
@@ -1138,25 +1517,110 @@ local function grant(pawn, path, count)
         da = ue.find_object(path)
     end
     if not da or not ue.class_name(da):find("DataAsset", 1, true) then
-        M.stats.gains_refused = M.stats.gains_refused + 1
         log.warn("consume: %s asked for %s, which is not an item here; not added", ue.short(pawn), tostring(path))
         return
     end
     count = math.max(1, math.min(50, math.floor(count)))
-    local added, dropped, uid, to = {}, {}, {}, {}
-    local ok, err = pcall(function()
-        comp:AddNewItemSomewhere(da, count, nil, 1, true, FName("None"), added, dropped, uid, to)
-    end)
-    if ok then M.stats.gains_added = M.stats.gains_added + 1 end
-    local line = string.format("consume: %s gets %s x%d from using an item: added=%s dropped=%s uid %s%s", ue.short(pawn),
-        item_name(da), count, tostring(added.Added), tostring(dropped["Dropped?"]),
-        ue.try(guid_str, uid) or "?", ok and "" or (" - FAILED: " .. tostring(err)))
-    if ok and (added.Added == true or dropped["Dropped?"] == true) then log.info("%s", line) else log.warn("%s", line) end
-    -- (a dropped one has none either: the single-player code only fits them
-    -- after an add)
-    local u = ue.try(guid_str, uid)
-    if ok and added.Added == true and u and u ~= "0:0:0:0" then add_default_attachments(pawn, comp, da, u) end
+    spot = spot or {}
+    local atts = {}
+    if cfg.get("loot_box_attachments") ~= false then atts = list_of(ue.prop(da, "DefaultAttachments")) end
+    local done, what = GAIN.put(comp, da, count, spot, atts)
+    local who = ue.short(pawn)
+    if done then
+        log.info("consume: %s gets %s x%d from using an item, where its screen put it (its slot %s): %s", who,
+            item_name(da), count, (spot.slot and spot.slot ~= "") and spot.slot or "-", what)
+    else
+        local ok, err, pk = GAIN.drop_at(pawn, da, count)
+        -- not where its screen said (that grid full here: several items of
+        -- one box all name the same grid) or no word: its screen is asked
+        -- (sdc_place, WHERE) a moment later, when the others show there; its
+        -- default attachments go with it
+        local asked = ok and spot.kind ~= "n"
+            and place.ask(pawn, da, count, pk, what, { later = true, atts = cfg.get("loot_box_attachments") ~= false })
+        local line = string.format("consume: %s gets %s x%d from using an item at their feet (%s)%s", who, item_name(da),
+            count, what, ok and (asked and "; its screen is asked again" or "")
+            or (" - the drop FAILED: " .. tostring(err) .. "; " .. GAIN.last_way(pawn, comp, da, count)))
+        if ok and (spot.kind == "n" or asked) then log.info("%s", line) else log.warn("%s", line) end
+    end
     renew_ledger(comp)
+end
+
+-- Host (sdc_place): n of `da` for remote player `pawn` where its screen put
+-- it (spot as above; default attachments only with `with_atts` - a loot
+-- box's item asked again: the game's own grants fit none). true, what | nil,
+-- why (nothing added).
+function M.place(pawn, da, n, spot, with_atts)
+    local comp = ue.prop(pawn, "BP_JigMultiplayer")
+    if not ue.valid(comp) or not ue.valid(da) then return nil, "no inventory here" end
+    local atts = with_atts and list_of(ue.prop(da, "DefaultAttachments")) or {}
+    -- (the whole count: the pickup that holds it goes once this is in)
+    local done, what = GAIN.put(comp, da, math.max(1, math.floor(tonumber(n) or 1)), spot or {}, atts)
+    if done then renew_ledger(comp) end
+    return done, what
+end
+M.renew_ledger = renew_ledger
+
+-- net IGLOST|<uid>, client -> host: an item the host added to the client's
+-- inventory that the widget of its grid there does not take (on_client_add):
+-- the plugin's own drop of it, as the client's drop request runs
+-- (SERVER_RequestDropItem(uid, count, comp) -> HandleServerDropRequest: the
+-- pickup at the player's feet keeps the item and what is inside it; the
+-- client is told it is gone). Only the player's own inventory.
+local function on_lost_msg(f, pc)
+    if S.role ~= "host" or cfg.get("refused_items_to_feet") == false then return end
+    local pawn = ue.pawn_of(pc)
+    if not is_remote_character(pawn) then return end
+    local comp = ue.prop(pawn, "BP_JigMultiplayer")
+    local u = f[1] or ""
+    local g = guid_of(u)
+    if not ue.valid(comp) or not g or u == "0:0:0:0" then return end
+    local key = tostring(addr(pawn)) .. "|" .. u
+    local now = os.clock()
+    if now - (GAIN.lost_at[key] or -100) < GAIN.AGAIN_S then return end
+    for k, t in pairs(GAIN.lost_at) do
+        if now - t > 60 then GAIN.lost_at[k] = nil end
+    end
+    GAIN.lost_at[key] = now
+    local it = nil
+    for _, e in ipairs((GAIN.walk(comp))) do
+        if e.uid == u then it = e break end
+    end
+    if not it then
+        log.info("consume: %s's screen does not show item %s, which is not in their inventory here either: nothing done",
+            ue.short(pawn), u)
+        return
+    end
+    local name, n, grid = it.name, it.n, it.grid
+    local head = string.format("consume: %s's screen does not show %s x%d (uid %s, grid %s: its widget there does not take it)",
+        ue.short(pawn), name, n, u, grid)
+    -- (the drop takes the item out of the data even when no pickup comes:
+    -- never for an item that cannot have one - sdc_place.can_drop)
+    local da = ue.try(function() return it.item[F_INFO][F_ITEMID] end)
+    local item_path, owner = ue.path(da), place.owner_path(comp, grid)
+    local can, why_not = place.can_drop(da)
+    if not can then
+        -- (hidden there, and the client's next build of that window removes
+        -- it: the player is told)
+        place.tell(pc, item_path, n, owner, "stuck", u)
+        log.warn("%s: NOT dropped (%s); the player was told", head, tostring(why_not))
+        return
+    end
+    local ok, err = place.own_drop(function() comp:SERVER_RequestDropItem(g, n, comp) end)
+    local came = place.came()
+    local still = false
+    for _, e in ipairs((GAIN.walk(comp, { [grid] = true }))) do
+        if e.uid == u then still = true break end
+    end
+    renew_ledger(comp)
+    if not still and came == false then
+        place.drop_failed(da)
+        place.tell(pc, item_path, n, owner, "lost", u)
+        log.err("%s: LOST - out of their inventory, but no pickup of it came; the player was told", head)
+        return
+    end
+    if still then place.tell(pc, item_path, n, owner, "stuck", u) end
+    log.warn("%s: %s", head, (ok and not still) and "dropped at their feet"
+        or ("NOT dropped" .. (ok and " (still in their inventory; the player was told)" or (": " .. tostring(err)))))
 end
 
 -- net RESEND|<uid>, client -> host: one item of the client's own inventory
@@ -1225,12 +1689,14 @@ function M.host_drop_report(c, uid_p, count_p, target_p)
     if drops_logged <= 30 then log.info("%s", line) else log.debug("%s", line) end
 end
 
--- net IGAIN|<item data asset path>|<count>, client -> host.
+-- net IGAIN|<item data asset path>|<count>|<kind>|<grid or stack uid>|<slot>,
+-- client -> host (kind: where its screen put it, see spot_of / grant).
 local function on_gain_msg(f, pc)
     if S.role ~= "host" then return end
     local pawn = ue.pawn_of(pc)
     if not is_remote_character(pawn) then return end
     local path, count = f[1] or "", tonumber(f[2]) or 1
+    local spot = { kind = f[3] or "?", uid = f[4] or "", slot = f[5] or "" }
     if cfg.get("item_gains_from_host") == false then
         log.info("consume: %s asked for %s x%d (item_gains_from_host is off; not added)", ue.short(pawn), path, count)
         return
@@ -1239,10 +1705,10 @@ local function on_gain_msg(f, pc)
     local u = k and uses[k]
     if u and os.clock() - u.at <= GAIN_WINDOW and u.gains < GAIN_MAX then
         u.gains = u.gains + 1
-        grant(pawn, path, count)
+        grant(pawn, path, count, spot)
     else
         -- its use request may still be on the way
-        queued[#queued + 1] = { pc = pc, key = k, path = path, count = count, at = os.clock() }
+        queued[#queued + 1] = { pc = pc, key = k, path = path, count = count, at = os.clock(), spot = spot }
     end
 end
 
@@ -1258,10 +1724,14 @@ end
 -- branch: GetPlayerPawn(self, 0) (sdc_ctx: that player).JigMP_OnRequestDropItem,
 -- a pickup at the player's feet, Added? = false. The client's empty containers
 -- were gone and the filled ones lay on the ground. In single player the item
--- goes into the inventory; here the pickup this call just dropped goes into
--- the player's inventory with the server's add (AddNewItemSomewhere: stacks or
--- a free slot -> CLIENT_UpdateCounts / CLIENT_AddNewItem; no room: dropped at
--- the player again, as in single player). sdc_world turns the drops of its
+-- goes into the inventory where that player's windows put it; here the
+-- pickup this call just dropped waits at the feet while that client's screen
+-- is asked where the item goes (sdc_place.ask: WHERE, answered by
+-- client_spot); the host puts it there (place) and only then removes the
+-- pickup; no room on that screen or no answer: the pickup stays at the feet,
+-- as in single player. (0.11.0 put it with the server's AddNewItemSomewhere,
+-- which takes any grid of the data, a wallet or a med bag too, whose window
+-- refuses it: never shown, later deleted.) sdc_world turns the drops of its
 -- world resources (trees, rocks, scrap, picked-up buildings) into inventory
 -- adds itself, inside the same call (its on_player_drop): its counters tell,
 -- and those are left to it.
@@ -1316,27 +1786,16 @@ local function on_host_add(c, comp_p, item_p, count_p, added_p)
     end
     local drop = claim_drop(da)
     if not drop then
-        M.stats.host_adds_lost = M.stats.host_adds_lost + 1
         log.warn("consume: %s x%d for %s: the game's add found no inventory slot on the host and its drop was not found; nothing changed",
             item_name(da), n, ue.short(pawn))
         return
     end
-    local added, dropped, uid, to = {}, {}, {}, {}
-    local t0 = os.clock()
-    local ok, err = pcall(function()
-        comp:AddNewItemSomewhere(da, n, nil, 1, true, FName("None"), added, dropped, uid, to)
-    end)
-    local into = ok and added.Added == true
-    if into or (ok and dropped["Dropped?"] == true) then pcall(function() drop:K2_DestroyActor() end) end
-    -- (the server add's own drop, when full, is not the drop of a later call)
-    while claim_drop(da, t0) do end
+    local asked = place.ask(pawn, da, n, drop, "the host's code dropped it at the player")
     host_add.world_seen = world_drops()
-    renew_ledger(comp)
-    M.stats.host_adds = M.stats.host_adds + 1
-    local line = string.format("consume: %s x%d for %s (the host's code dropped it at the player): %s", item_name(da), n,
-        ue.short(pawn), into and "into its inventory" or (ok and dropped["Dropped?"] == true) and "no room, dropped at its feet"
-        or ("left on the ground" .. (ok and "" or (" - FAILED: " .. tostring(err)))))
-    if ok then log.info("%s", line) else log.warn("%s", line) end
+    if not asked then
+        log.warn("consume: %s x%d for %s (the host's code dropped it at the player): its screen could not be asked; it stays at its feet",
+            item_name(da), n, ue.short(pawn))
+    end
 end
 
 -- Durability set by the client's single-player code. Repairs (repair kits on
@@ -1451,7 +1910,7 @@ local function note_use(owner)
     for _, q in ipairs(queued) do
         if q.key == k and now - q.at <= GAIN_WINDOW and u.gains < GAIN_MAX then
             u.gains = u.gains + 1
-            grant(owner, q.path, q.count)
+            grant(owner, q.path, q.count, q.spot)
         else
             keep[#keep + 1] = q
         end
@@ -1491,7 +1950,6 @@ local function expire_gains(now)
     local keep = {}
     for _, q in ipairs(queued) do
         if now - q.at > GAIN_WINDOW then
-            M.stats.gains_refused = M.stats.gains_refused + 1
             log.warn("consume: %s asked for %s x%d with no item use around it; not added",
                 ue.short(ue.pawn_of(q.pc)), q.path, q.count)
         else
@@ -1542,7 +2000,6 @@ local function on_consume_request(c, target_p, uid_p, amount_p)
         local g = ue.try(function() return guid_tbl(param(uid_p)) end)
         local ok, err = false, "no uid"
         if g then ok, err = pcall(function() comp:CLIENT_UpdateCount(comp, g, 0, { A = 0, B = 0, C = 0, D = 0 }) end) end
-        M.stats.ghost_uses = (M.stats.ghost_uses or 0) + 1
         log.warn("consume: %s used uid %s x%s, which is not in their inventory here (a slot left on their screen): nothing used; %s",
             ue.short(owner), u, tostring(param(amount_p)),
             ok and "the client was told it is gone (CLIENT_UpdateCount 0)" or ("telling the client FAILED: " .. tostring(err)))
@@ -1578,7 +2035,6 @@ local function on_med_onrep(c, onrep)
         if ue.try(function() return ksl:K2_IsTimerActive(med, e.timer) end) == true then return end
         local t = e.lo + math.random() * (e.hi - e.lo)
         local ok = pcall(function() ksl:K2_SetTimer(med, e.timer, t, false, false, 0, 0) end)
-        M.stats.stop_timers = M.stats.stop_timers + 1
         log.info("consume: %s of %s ends on the host in %.0f s (%s%s)", e.flag, ue.short(pawn), t, e.timer,
             ok and "" or ", timer FAILED")
     else
@@ -1587,7 +2043,8 @@ local function on_med_onrep(c, onrep)
 end
 
 -- ===========================================================================
--- Using items: client (log only)
+-- Using items: client (log only, hooked with config debug_probes only:
+-- Client_UpdateHealthUI runs on every health update)
 -- ===========================================================================
 
 local function own_pawn_of(c)
@@ -1600,7 +2057,7 @@ end
 
 -- BP_PlayerCharacter.HotBarConsume(ItemRef), post (client): the request went out.
 local function on_hotbar_consume(c, slot_p)
-    if S.role ~= "client" or not own_pawn_of(c) then return end
+    if S.role ~= "client" or not log.probes_enabled or not own_pawn_of(c) then return end
     local slot = param(slot_p)
     if not ue.valid(slot) then return end
     local u = ue.try(function() return guid_str(slot.ItemUniqueID) end) or "?"
@@ -1612,7 +2069,7 @@ local function on_hotbar_consume(c, slot_p)
 end
 
 local function on_remove_effect_client(c, effects_p)
-    if S.role ~= "client" or not own_pawn_of(c) then return end
+    if S.role ~= "client" or not log.probes_enabled or not own_pawn_of(c) then return end
     local names = {}
     for _, n in ipairs(list_of(param(effects_p))) do names[#names + 1] = ue.str(n) end
     if #names == 0 then return end
@@ -1622,7 +2079,7 @@ end
 
 local last_health, health_logged = nil, -100
 local function on_health_ui(c, health_p)
-    if S.role ~= "client" or not own_pawn_of(c) then return end
+    if S.role ~= "client" or not log.probes_enabled or not own_pawn_of(c) then return end
     local h = tonumber(param(health_p))
     if not h then return end
     local now = os.clock()
@@ -1634,10 +2091,36 @@ local function on_health_ui(c, health_p)
 end
 
 -- ===========================================================================
--- Client: inventory shown here vs. the host's copy (log only)
+-- Client: inventory shown here vs. the host's copy
 -- ===========================================================================
+-- An item this inventory shows twice in a row (DESYNC_EVERY apart) that the
+-- host's item list (ITEMS) lacks: the host is asked about it (GHOSTQ). The
+-- host ends each one its copy does not have either (CLIENT_UpdateCount 0
+-- removes the slot); this machine never removes one on its own (its copy of
+-- the host's list may be old). 0.8.1: Rags x2 the restore had replaced were
+-- reported here 14 times in 16 minutes and stayed.
+-- GHOST: AGAIN s between two questions about one item, MAX items per
+-- question; host: one answer per player in HOST_EVERY s (at: [character
+-- address] = os.clock()).
+local GHOST = { AGAIN = 30, MAX = 16, HOST_EVERY = 3, at = {} }
 
-local desync = { at = -100, last = nil }
+local desync = { at = -100, last = nil, asked = {} }
+
+local function ask_ghosts(uids, now)
+    local ask = {}
+    table.sort(uids)
+    for _, u in ipairs(uids) do
+        if #ask >= GHOST.MAX then break end
+        if now - (desync.asked[u] or -1000) >= GHOST.AGAIN then
+            desync.asked[u] = now
+            ask[#ask + 1] = u
+        end
+    end
+    if #ask == 0 then return end
+    M.stats.ghosts_asked = M.stats.ghosts_asked + #ask
+    net.send_to_host("GHOSTQ", table.concat(ask, ";"))
+    log.info("consume: asked the host about %d item(s) shown only in this inventory: %s", #ask, table.concat(ask, ", "))
+end
 
 local function check_desync(now)
     if now - desync.at < DESYNC_EVERY then return end
@@ -1648,10 +2131,11 @@ local function check_desync(now)
     local me = ue.local_pawn()
     local jig = me and ue.prop(me, "BP_JigMultiplayer")
     if not ue.valid(jig) then return end
-    local only_here = {}
+    local only_here, uids = {}, {}
     for u, e in pairs(client_view(jig)) do
         if host[u] == nil then
             only_here[#only_here + 1] = string.format("%s x%s (uid %s, %s)", e.name, tostring(e.n), u, e.where or "?")
+            uids[#uids + 1] = u
         end
     end
     table.sort(only_here)
@@ -1660,11 +2144,63 @@ local function check_desync(now)
     if #only_here > 0 and key == desync.last then
         M.stats.desync_reports = M.stats.desync_reports + 1
         if M.stats.desync_reports <= 5 or M.stats.desync_reports % 20 == 0 then
-            log.warn("consume: %d item(s) shown in this inventory are not in the host's copy (they cannot be used or moved): %s",
+            log.warn("consume: %d item(s) shown in this inventory are not in the host's copy (they cannot be used or moved; the host is asked about them): %s",
                 #only_here, key)
         end
+        ask_ghosts(uids, now)
     end
     desync.last = key
+    for u, t in pairs(desync.asked) do
+        if now - t > 2 * GHOST.AGAIN then desync.asked[u] = nil end
+    end
+end
+
+-- net GHOSTQ|<uid>;<uid>;..., client -> host: items the client's inventory
+-- shows that the host's item list lacks (see above). Each one the player's
+-- inventory here does not have either is ended on the client the way the
+-- game ends a stack (CLIENT_UpdateCount 0: ClientUpdateCount removes the
+-- slot); one it has: the client's list was old, ITEMS goes again. Nothing
+-- when the walk here had a read error (a missing item could be a real one).
+local function on_ghost_msg(f, pc)
+    if S.role ~= "host" then return end
+    local pawn = ue.pawn_of(pc)
+    if not is_remote_character(pawn) then return end
+    local comp = ue.prop(pawn, "BP_JigMultiplayer")
+    local pk = addr(pawn)
+    local now = os.clock()
+    if not ue.valid(comp) or not pk or now - (GHOST.at[pk] or -100) < GHOST.HOST_EVERY then return end
+    GHOST.at[pk] = now
+    local here = M.inventory(comp, false)
+    if here.bad then
+        log.warn("consume: %s asked about item(s) shown only on their screen; their inventory here could not be read in full (%s): nothing done",
+            ue.short(pawn), tostring(here.bad))
+        return
+    end
+    local ended, held = {}, {}
+    for u in tostring(f[1] or ""):gmatch("[^;]+") do
+        if #ended + #held >= GHOST.MAX then break end
+        local a, b, c, d = u:match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
+        if a and here.by_uid[u] then
+            held[#held + 1] = u
+        elseif a then
+            local g = { A = tonumber(a), B = tonumber(b), C = tonumber(c), D = tonumber(d) }
+            local ok, err = pcall(function() comp:CLIENT_UpdateCount(comp, g, 0, { A = 0, B = 0, C = 0, D = 0 }) end)
+            ended[#ended + 1] = ok and u or string.format("%s (FAILED: %s)", u, tostring(err))
+        end
+    end
+    local k = addr(comp)
+    if k and ledger[k] then ledger[k] = here.by_uid end
+    if #ended > 0 then
+        M.stats.ghosts_ended = M.stats.ghosts_ended + #ended
+        log.warn("consume: %s's screen showed %d item(s) their inventory here does not have: the client was told they are gone (CLIENT_UpdateCount 0): %s",
+            ue.short(pawn), #ended, table.concat(ended, ", "))
+    end
+    if #held > 0 then
+        local items = package.loaded["sdc_items"]
+        if type(items) == "table" and items.resend_items then items.resend_items(pc) end
+        log.info("consume: %s asked about %d item(s) that their inventory here has: the item list goes to them again (%s)",
+            ue.short(pawn), #held, table.concat(held, ", "))
+    end
 end
 
 -- ===========================================================================
@@ -1673,9 +2209,10 @@ end
 
 local hook_at = -100
 
--- JigTryAddItemSomewhere: one hook for both roles (one RegisterHook per
--- function): the client's single-player add of what a use gave, the host's
--- add for a remote player that dropped the item.
+-- JigTryAddItemSomewhere: one callback for both roles (try_hook registers a
+-- path once; a second RegisterHook on it would add a second callback, not
+-- replace the first): the client's single-player add of what a use gave, the
+-- host's add for a remote player that dropped the item.
 local function on_try_add(c, comp_p, item_p, count_p, added_p)
     if S.role == "client" then
         on_local_add(c, comp_p, item_p, count_p)
@@ -1691,25 +2228,56 @@ local function try_hooks_client()
         try_hook(ui.path .. ":CheckIngredientsAvailability", "craft-check-" .. ui.name,
             function(c, p) on_check_ingredients(ui, c, p) end)
     end
-    try_hook(PLAYER_FN .. "HotBarConsume", "use-hotbar", on_hotbar_consume)
     try_hook(JIG_FN .. "JigTryAddItemSomewhere", "use-add", on_try_add)
     try_hook(PLAYER_FN .. "JigMP_OnRequestDropItem", "use-local-drop", on_local_drop)
     try_hook(JIG_FN .. "ServerFunc_UpdateDurabilityByUID", "dur-client", on_client_set_dur)
-    try_hook(MEDICAL_FN .. "CLIENT_RemoveMedicalEffect", "med-cure-client", on_remove_effect_client)
-    try_hook(PLAYER_FN .. "Client_UpdateHealthUI", "med-health-client", on_health_ui)
+    try_hook(JIG_FN .. "CLIENT_AddNewItem", "host-add-shown", on_client_add)
+    -- log only: with config debug_probes
+    if log.probes_enabled then
+        try_hook(PLAYER_FN .. "HotBarConsume", "use-hotbar", on_hotbar_consume)
+        try_hook(MEDICAL_FN .. "CLIENT_RemoveMedicalEffect", "med-cure-client", on_remove_effect_client)
+        try_hook(PLAYER_FN .. "Client_UpdateHealthUI", "med-health-client", on_health_ui)
+    end
+end
+
+-- BP_JigComponent.SERVER_RequestDataFromSave(JigMpCompRef), post (host): a
+-- remote player's own game asked for its inventory (BP_PlayerCharacter
+-- Event_LoadPlayer @13945-14017: ClearJSIItems, ClearContainers, this RPC);
+-- the host loaded it (InitNoStartingItems, LoadJigComponent, else
+-- SERVER_RequestData) and queued CLIENT_ContainerDataResponse (@15841-16341):
+-- that client's windows are built from it now. Items it holds where its
+-- window never shows them go to its feet (sdc_place.on_load: not inside
+-- sdc_persist's own load, which runs the rescue after its count check).
+function GAIN.on_load(c, comp_p)
+    if S.role ~= "host" then return end
+    local comp = param(comp_p)
+    if not ue.valid(comp) then comp = c and c:get() end
+    if not ue.valid(comp) then return end
+    local owner = owner_of(comp)
+    if is_remote_character(owner) then place.on_load(owner) end
 end
 
 local function try_hooks_host()
+    try_hook(JIG_FN .. "SERVER_RequestDataFromSave", "load-host", GAIN.on_load)
+    try_hook(PLAYER_FN .. "JigMP_OnRequestDropItem", "use-local-drop", on_local_drop)
+    place.drop_hook = hooked[PLAYER_FN .. "JigMP_OnRequestDropItem"] == true
     try_hook(JIG_FN .. "SERVER_RequestCraftItem", "craft-host", on_craft_request)
     try_hook(JIG_FN .. "SERVER_RequestCraftItemDrop", "craft-drop-host", on_craft_request)
     try_hook(JIG_FN .. "SERVER_RequestConsumeItem", "use-host", on_consume_request)
     try_hook(JIG_FN .. "SERVER_RequestRemoveItem", "remove-host", on_remove_request)
     try_hook(JIG_FN .. "JigTryAddItemSomewhere", "use-add", on_try_add)
     for _, rpc in ipairs(LEDGER_RPCS) do
-        -- (sdc_containers: the outcome of a move, the world containers involved)
+        -- (sdc_containers: the outcome of a move, the world containers
+        -- involved; with the mover's snapshot from before the request, which
+        -- on_inventory_rpc renews: a stack with fewer items moved in part -
+        -- ammo loaded into a magazine -, one the host never had is a slot
+        -- only the client shows)
         try_hook(JIG_FN .. rpc, "ledger-" .. rpc, function(c, ...)
+            local mcomp = S.role == "host" and c and c:get()
+            local k = mcomp and addr(mcomp)
+            local before = k and ledger[k] or nil
             on_inventory_rpc(c, ...)
-            local ok, err = pcall(containers.host_rpc, rpc, c, ...)
+            local ok, err = pcall(containers.host_rpc, rpc, c, before, ...)
             if not ok then log.err_throttled("consume.containers", "consume: containers (%s): %s", rpc, tostring(err)) end
         end)
     end
@@ -1719,19 +2287,164 @@ local function try_hooks_host()
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Host: the tick's walk of a remote player's inventory, in slices
+-- ---------------------------------------------------------------------------
+-- 0.8.1, a client with 80 containers / 200+ items: the 1 s walk was one frame
+-- of 20-46 ms ([PERF] h:items.inv) - the host stuttered every second. An
+-- inventory whose last walk took more than SYNC_MS is now walked in slices
+-- of SLICE_MS (whole containers), GAP_MS apart (timed as h:items.inv); until
+-- that walk is done the tick's readers (sdc_tools, sdc_items: UIDS / ITEMS)
+-- get the last finished one. A small inventory is walked at once, as before.
+-- The use / craft snapshot (ledger) takes a finished sliced walk (it began
+-- after the last inventory request: see rd_slice).
+-- by: [JigComponent address] = { pk = character address, inv = last finished
+-- walk, ms = its engine time, job = the walk in slices }; gen: bumped by
+-- reset() (slices of an older session do nothing); J: the job being stepped;
+-- MAX_RESTARTS: see rd_slice; fresh(): an empty full walk.
+local walking = { SYNC_MS = 4, SLICE_MS = 3, GAP_MS = 30, MAX_SLICES = 400, MAX_RESTARTS = 3, by = {}, gen = 0, J = nil,
+                  fresh = function() return { list = {}, by_uid = {}, at0 = {}, full = true } end }
+
+-- (module-level callback: no closure per container) the containers before
+-- `done` were read by earlier slices; stops after SLICE_MS (a walk read
+-- whole, j.whole: at the end).
+local function slice_cb(_, c)
+    local j = walking.J
+    j.pos = j.pos + 1
+    if j.pos <= j.done then return end
+    cont_cb(nil, c)
+    j.done = j.pos
+    if not j.whole and (os.clock() - j.t0) * 1000 >= walking.SLICE_MS then
+        j.more = true
+        return true   -- (UE4SS stops a ForEach on true)
+    end
+end
+
+-- A slice goes on by position in MainJigContainers, so the inventory must
+-- not change between two slices: a container gone before `done` (a backpack
+-- put into a chest, a rifle with its magazine dropped or sold) shifts the
+-- rest - the next slice would skip one container and the walk keep the gone
+-- one (no battery / durability for its items on the client: a light or the
+-- night vision switching off); an item moved from an unread container into a
+-- read one would be missing. So each slice first compares the number of
+-- containers and the use / craft snapshot (renewed by every inventory
+-- request of the player) with the walk's; changed: the walk starts over.
+-- After MAX_RESTARTS (the player keeps moving things) it is read whole in
+-- this frame, as every walk was before the slices: the tick's readers do
+-- not wait long for a finished walk.
+local function rd_slice(j, k)
+    local a = j.jig.MainJigContainers
+    local n = a:GetArrayNum()
+    if j.done > 0 and (n ~= j.cnt or ledger[k] ~= j.ledger) then
+        j.w, j.done, j.restarts = walking.fresh(), 0, j.restarts + 1
+        j.whole = j.restarts > walking.MAX_RESTARTS
+        M.stats.walk_restarts = M.stats.walk_restarts + 1
+    end
+    j.cnt, j.ledger = n, ledger[k]
+    W = j.w
+    a:ForEach(slice_cb)
+end
+
+-- One slice of a walk in slices; true when the walk is finished.
+local function walk_slice(j, k)
+    local prev_w, prev_j = W, walking.J
+    walking.J = j
+    j.pos, j.more, j.t0 = 0, false, os.clock()
+    local ok, err = pcall(rd_slice, j, k)
+    W, walking.J = prev_w, prev_j
+    j.ms = j.ms + (os.clock() - j.t0) * 1000
+    j.n = j.n + 1
+    if not ok and not j.w.bad then j.w.bad = err end
+    return not ok or not j.more
+end
+
+local walk_step   -- (below: a slice schedules the next one)
+
+-- The next slice in a later frame (one chain per walk: seq); without
+-- ue.delay the next host tick goes on with it (stalled).
+local function walk_next(k, e, j)
+    local gen = walking.gen
+    j.seq = (j.seq or 0) + 1
+    local seq = j.seq
+    local function go()
+        if gen ~= walking.gen or walking.by[k] ~= e or e.job ~= j or j.seq ~= seq then return end
+        if ue.sub_time then ue.sub_time("h:items.inv", walk_step, k, e, j) else walk_step(k, e, j) end
+    end
+    local ok, h = pcall(ue.delay, "consume-walk", walking.GAP_MS, go)
+    j.stalled = not ok or h == false
+end
+
+walk_step = function(k, e, j)
+    if S.role ~= "host" or not ue.valid(j.jig) then
+        e.job = nil
+        return
+    end
+    j.step_at = os.clock()
+    local finished = walk_slice(j, k)
+    if not finished and j.n < walking.MAX_SLICES then
+        walk_next(k, e, j)
+        return
+    end
+    e.job = nil
+    if not finished then
+        log.err_throttled("consume.walk", "consume: an inventory walk did not end after %d slices; the last finished one stays", j.n)
+        return
+    end
+    local w = j.w
+    w.full, w.cuid, w.sub = nil, nil, nil
+    e.inv, e.ms = w, j.ms
+    if ledger[k] == j.ledger then ledger[k] = w.by_uid end
+    M.stats.walks_sliced = M.stats.walks_sliced + 1
+    M.stats.walk_slices = M.stats.walk_slices + j.n
+    if j.restarts > 0 then
+        log.debug("consume: an inventory walk started over %d time(s) (the inventory changed under it)%s, %d slice(s)",
+            j.restarts, j.whole and "; its last pass read whole in one frame" or "", j.n)
+    end
+end
+
+-- The walk the tick shares: the last finished one (a new one goes on in
+-- slices), or one now (a small inventory, or the first walk of it).
+local function walk_of(k, jig, pk)
+    local e = walking.by[k]
+    if not e or e.pk ~= pk then
+        e = { pk = pk }
+        walking.by[k] = e
+    end
+    local j = e.job
+    if j then
+        -- a walk whose next slice never came (ue.delay failed): on from here
+        if j.stalled or os.clock() - j.step_at > 1 then walk_step(k, e, j) end
+        return e.inv
+    end
+    if not e.inv or (e.ms or 0) <= walking.SYNC_MS then
+        local t0 = os.clock()
+        local inv = M.inventory(jig, true)
+        e.inv, e.ms = inv, (os.clock() - t0) * 1000
+        ledger[k] = inv.by_uid
+        return inv
+    end
+    j = { jig = jig, w = walking.fresh(), done = 0, n = 0, ms = 0, restarts = 0,
+          ledger = ledger[k], step_at = os.clock() }
+    e.job = j
+    -- the first slice in a frame of its own (not on top of this tick)
+    walk_next(k, e, j)
+    return e.inv
+end
+
 -- Host, one remote player (1 s; sdc_items spreads the players over the
 -- second): snapshots of its inventory and health, which the craft / use
--- reports compare against. The walk is the tick's one full walk of that
--- inventory: left in `pass.inv` for sdc_tools and sdc_items.
+-- reports compare against. The walk is the tick's one walk of that
+-- inventory (walk_of): left in `pass.inv` for sdc_tools and sdc_items.
 function M.host_player(pc, pass)
     local pawn
     if pass then pawn = pass.pawn else pawn = ue.pawn_of(pc) end
     local jig = pawn and ue.prop(pawn, "BP_JigMultiplayer")
     local k = ue.valid(jig) and addr(jig)
     if k then
-        local inv = M.inventory(jig, true)
+        local inv = walk_of(k, jig, addr(pawn))
         if pass then pass.inv = inv end
-        ledger[k] = inv.by_uid
+        -- items in a wallet / med bag that player's window refuses (sdc_place)
+        place.scan(pawn, jig, inv)
     end
     local pk = pawn and addr(pawn)
     if pk then health[pk] = tonumber(ue.prop(ue.prop(pawn, "MedicalComponent"), "Health")) end
@@ -1746,21 +2459,25 @@ function M.host_tick(remote_pcs, split)
         hook_at = now
         try_hooks_host()
     end
-    local inv, hp = {}, {}
+    local inv, hp, wb = {}, {}, {}
     for _, pc in ipairs(remote_pcs or {}) do
         local pawn = ue.pawn_of(pc)
         local jig = pawn and ue.prop(pawn, "BP_JigMultiplayer")
         local k = ue.valid(jig) and addr(jig)
-        if k then inv[k] = ledger[k] end
+        if k then inv[k], wb[k] = ledger[k], walking.by[k] end
         local pk = pawn and addr(pawn)
         if pk then hp[pk] = health[pk] end
     end
-    ledger, health = inv, hp
+    ledger, health, walking.by = inv, hp, wb
+    for pk, t in pairs(GHOST.at) do
+        if now - t > 60 then GHOST.at[pk] = nil end
+    end
     if not split then
         for _, pc in ipairs(remote_pcs or {}) do M.host_player(pc) end
     end
     expire_gains(now)
     expire_dur(now)
+    place.host_tick(now)
     for k, u in pairs(uses) do
         if now - u.at > 2 * GAIN_WINDOW then uses[k] = nil end
     end
@@ -1800,19 +2517,34 @@ function M.reset()
     uses, queued, pending_seen, resend_at, placeholders = {}, {}, {}, {}, {}
     dur_wait, dur_paid = {}, {}
     host_add = { claimed = {}, world_seen = world_drops() }
-    desync = { at = -100, last = nil }
+    desync = { at = -100, last = nil, asked = {} }
+    GHOST.at = {}
+    walking.by, walking.gen = {}, walking.gen + 1
     last_health = nil
     hook_at = -100   -- a new role: its hooks right away
     names, names_n = {}, 0
+    GAIN.wait, GAIN.told, GAIN.lost_at = {}, {}, {}
+    place.reset()
 end
 
 function M.register_handlers()
-    -- client -> host: IGAIN|<item data asset path>|<count>   (an item a use gave)
+    -- client -> host: IGAIN|<item data asset path>|<count>|<c|s|n|?>|<grid / stack uid>|<slot>
+    -- (an item a use gave, and where the client's screen put it)
     net.on("IGAIN", on_gain_msg)
+    -- client -> host: IGLOST|<uid>   (an item the host added that the client's grid widget refuses)
+    net.on("IGLOST", on_lost_msg)
     -- client -> host: RESEND|<uid>   (an item of the own inventory again)
     net.on("RESEND", on_resend_msg)
     -- client -> host: SETDUR|<uid>|<durability>   (a repair / refill in the own inventory)
     net.on("SETDUR", on_dur_msg)
+    -- client -> host: GHOSTQ|<uid>;<uid>;...   (items its inventory shows that the host's ITEMS lacks)
+    net.on("GHOSTQ", on_ghost_msg)
+    -- WHERE / WHEREIS / IHID / IFAIL (sdc_place: the host's grants where the
+    -- client's screen puts them; hidden items dropped at the feet)
+    place.register_handlers()
 end
+
+-- (tests: the sliced walks and the use / craft snapshot; the gains' state)
+M._t = { walking = walking, ledger = function() return ledger end, gain = GAIN, gate = function() return gate end }
 
 return M

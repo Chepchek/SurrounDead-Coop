@@ -113,7 +113,7 @@ local st = {
     role = nil,
     hooked = false, hook_logged = false, hook_at = -100,
     majors = nil,        -- [id] = { path =, name =, loc =, crate = } this machine's major places
-    nmajors = 0, nplaces = 0,
+    nmajors = 0,
     majors_at = -100,
     -- host
     sent = {},           -- [id] = "bosses,looted" the clients were last told (the poll's baseline)
@@ -194,7 +194,7 @@ local function place_of(a)
     local loc = ue.location(a)
     local crate = nil
     local tf = ue.prop(a, "ContainerLocation")
-    local off = tf ~= nil and v3(ue.try(function() return tf.Translation end)) or nil
+    local off = not ue.missing(tf) and v3(ue.try(function() return tf.Translation end)) or nil
     if loc and off then crate = { X = loc.X + off.X, Y = loc.Y + off.Y, Z = loc.Z + off.Z } end
     local name = ue.fstring(field(s, F_NAME)):gsub("[%c|;,]", " ")
     if name == "" then name = ue.short(a) end
@@ -220,7 +220,7 @@ local function majors(now, force)
     end
     if total == 0 then return st.majors end
     local first = st.majors == nil
-    st.majors, st.nmajors, st.nplaces = out, n, total
+    st.majors, st.nmajors = out, n
     if first then
         log.info("poiclear: %d major place(s) (a boss and a special container) among the %d places of this world", n, total)
     end
@@ -359,7 +359,7 @@ local function cl_msg(f, pc)
             who, id)
         return
     end
-    local bd, l = state_of(a)
+    local _, l = state_of(a)
     if l then
         M.stats.cl_known = M.stats.cl_known + 1
         log.info("poiclear: host: %s searched the special container of %s (%s): already counted in the host's world", who,
@@ -370,9 +370,9 @@ local function cl_msg(f, pc)
     local lim = e.crate and REACH or POI_MATCH
     local pl = ue.location(ue.pawn_of(pc))
     if not (pl and at and d2(pl, at) <= lim * lim) then
+        -- (nothing goes back: a client's values only ever go up, its own search stays on its screen)
         M.stats.cl_refused = M.stats.cl_refused + 1
-        net.send_to(pc, "POIST", "j", entry(id, bd, l))
-        log.warn("poiclear: host: %s searched the special container of %s (%s) but is not near it here (%s, container at %s): not counted; the host's state goes back to it",
+        log.warn("poiclear: host: %s searched the special container of %s (%s) but is not near it here (%s, container at %s): not counted in the host's world (that player's own copy keeps its search)",
             who, e.name, id, fmt_loc(pl), fmt_loc(at))
         return
     end
@@ -652,7 +652,7 @@ end
 
 -- World change / role change: every place and state belonged to the old world.
 function M.reset(why)
-    st.majors, st.nmajors, st.nplaces, st.majors_at = nil, 0, 0, -100
+    st.majors, st.nmajors, st.majors_at = nil, 0, -100
     st.sent, st.poll_at = {}, -100
     st.want, st.dirty, st.shown, st.told = {}, {}, {}, {}
     st.pass_at, st.asked, st.since = -100, nil, nil

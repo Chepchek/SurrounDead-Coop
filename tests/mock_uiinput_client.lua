@@ -166,10 +166,8 @@ local function game_toggle(c, reach)
 end
 
 -- BP_CustomNarrativeDefaultUI.On Dialogue Finished (@185-275), reached through
--- the host's ClientExitDialogue
+-- the host's ClientExitDialogue (not hooked: it only fed a log line)
 local function dialogue_end()
-    local h = hooks[DLG_EXIT]
-    if h and h.pre then h.pre(param(new_obj("NarrativeComponent", "NC", {}, {})), param(0)) end
     wbl:SetInputMode_GameOnly(pc, false)
     pc._p.bShowMouseCursor = false
 end
@@ -183,8 +181,9 @@ players.init(S, { remote_record = function() return {} end })
 uiinput.install(S)
 check(loops.uiinput ~= nil, "1 s tick scheduled")
 loops.uiinput()
-check(hooks[GAMEONLY] ~= nil and hooks[DLG_EXIT] ~= nil, "native hooks (SetInputMode_GameOnly, ClientExitDialogue)")
-check(hooks[TOGGLE] ~= nil and hooks[DBLCLICK] ~= nil and hooks[LOOTBOX] ~= nil, "Blueprint hooks (ToggleInventory, On_MouseDoubleClick, ContextOpenLootBox)")
+check(hooks[GAMEONLY] ~= nil and hooks[DLG_EXIT] == nil, "native hook SetInputMode_GameOnly only (no ClientExitDialogue)")
+check(hooks[TOGGLE] ~= nil and hooks[DBLCLICK] == nil and hooks[LOOTBOX] == nil,
+    "Blueprint hook ToggleInventory only (no log-only On_MouseDoubleClick / ContextOpenLootBox)")
 local nreg = #registered
 loops.uiinput()
 check(#registered == nreg, "hooks registered once")
@@ -232,7 +231,7 @@ m = mark()
 T = T + 0.25
 dialogue_end()
 check(pc._p.__mode == "game" and pc._p.bShowMouseCursor == false, "dialogue end: the game's switch happened")
-check(logged("a switch to game control came while the inventory window is open %(the NPC dialogue's end", m) ~= nil
+check(logged("a switch to game control came while the inventory window is open %(another window's close or a late game event %(an NPC dialogue's end%)", m) ~= nil
     and logged("250 ms after it opened", m) ~= nil, "dialogue end: source and time in the log")
 run_delayed()
 check(pc._p.__mode == "gameui" and pc._p.__focus == window and pc._p.bShowMouseCursor == true and calls.gameui == gu + 1,
@@ -318,41 +317,8 @@ check(pc._p.__mode == "game" and logged("uiinput:", m) == nil, "off: no restore,
 cfg.values.game_ui_input = nil
 game_toggle(comp, true)      -- close
 
--- 11. container items in the inventory
-local function slot(da_props, props)
-    local da = new_obj("JigsawItem_DataAsset_C", da_props.__name or "DA_Box", da_props, {})
-    props.JigDataAsset = da
-    return new_obj("JSI_Slot_C", "JSI_Slot_C_" .. tostring(next_addr), props, {})
-end
-local mother = new_obj("JSIContainer_C", "JSIContainer_C_1", { AllowOpeningContainers = true }, {})
-local canvas = new_obj("BP_InspectorCanvas_C", "BP_InspectorCanvas_C_1", { __inv = true }, {})
-local win2 = new_obj("ContainerWindowWidget_C", "ContainerWindowWidget_C_1", { __parent = canvas }, {})
-local s1 = slot({ __name = "DA_AmmoCase", ["IsContainer?"] = true, ["OpenContainerOnDoubleClick?"] = true },
-    { ContainerMother = mother, SlotContainer = new_obj("JSIContainer_C", "Sub_1", {}, {}), WindowContainer = win2 })
-m = mark()
-hooks[DBLCLICK].pre(param(s1), param({}), param({}), param({}))
-check(logged("uiinput: open request for DA_AmmoCase in JSIContainer_C_1 %(double click / context menu Open%): container=true", m) ~= nil
-    and logged("allowed%-here=true", m) ~= nil and logged("%-> container window shown", m) ~= nil, "container opened: info line")
-local s2 = slot({ __name = "DA_Toolbox", ["IsContainer?"] = true, ["OpenContainerOnDoubleClick?"] = true },
-    { ContainerMother = mother })
-m = mark()
-hooks[DBLCLICK].pre(param(s2), param({}), param({}), param({}))
-check(logged("%[WARN%] uiinput: open request for DA_Toolbox", m) ~= nil and logged("contents%-widget=MISSING", m) ~= nil
-    and logged("no contents widget for this item on this machine", m) ~= nil, "container not opened: warning with the reason")
-local s4 = slot({ __name = "DA_Crate", ["IsContainer?"] = true, ["OpenContainerOnDoubleClick?"] = true },
-    { ContainerMother = mother, SlotContainer = new_obj("JSIContainer_C", "Sub_4", {}, {}), IsPending = true })
-m = mark()
-hooks[DBLCLICK].pre(param(s4), param({}), param({}), param({}))
-check(logged("pending=true", m) ~= nil and logged("the item is still pending: waiting for the host", m) ~= nil,
-    "pending container item: warning names it")
-local s3 = slot({ __name = "DA_Bandage" }, { ContainerMother = mother })
-m = mark()
-hooks[DBLCLICK].pre(param(s3), param({}), param({}), param({}))
-check(logged("open request", m) == nil, "not a container: no line")
-local menu = new_obj("JigContextMenuComp_C", "JigContextMenuComp", { CurrentItemRef = s1 }, {})
-m = mark()
-hooks[LOOTBOX].pre(param(menu))
-check(logged("uiinput: loot box DA_AmmoCase opened from the context menu here", m) ~= nil, "loot box line")
+-- 11. container items: no log-only hooks any more
+check(uiinput.stats.open_requests == nil and uiinput.stats.loot_boxes == nil, "no container-item counters")
 
 -- 12. a callback that throws never reaches the game
 local bad = setmetatable({}, { __index = function() error("boom") end })

@@ -47,10 +47,19 @@
 --   Copies still without a look 2.5 s after their roll ask the host (AIAPPQ).
 -- Client applies never load: only assets already in memory are used (a sync
 --   LoadAsset in the RPC hook froze a client while it streamed a new area);
---   a missing mesh / material / blendspace is retried every 2 s for 2 min.
+--   a missing mesh / material / blendspace is looked for again (find_object,
+--   2 s backing off to 30 s) for 10 min, then given up with the asset named
+--   (13.11 client: 156 waits, 101 came within 100 s - another copy's own
+--   async load brought them in - 26 gave up at 2 min; the assets that never
+--   came are listed in the status line). A load of our own is not done here:
+--   KismetSystemLibrary.LoadAsset (the async one the zombies use) needs a
+--   soft pointer and a latent action from Lua - untested in UE4SS 3.0.1.
 --   At most 2 full applies per 100 ms from events; over that only the cheap
---   body now, the rest from the client pass (1 s while work waits, 4 per pass).
---   An apply longer than 50 ms is logged with its assets.
+--   body now, the rest from the client pass (1 s while work is due, 4 per pass,
+--   none after the first once the pass ran 25 ms: slow mesh swaps go one per
+--   tick instead of stacking up to 300 ms in one). An apply longer than 50 ms
+--   is logged with its assets. Per-zombie lines: the first few at info, then
+--   debug only.
 -- Cost: per zombie only strings are kept. UE4SS never frees an out-array's
 --   buffer: ~8 bytes per zombie per pass (host every 2 s, client every 3 s).
 
@@ -62,7 +71,7 @@ local zi = require("sdc_ai_zombie")
 local M = {
     stats = { snapshots = 0, sent = 0, pass_sent = 0, answered = 0, resend = 0, applied = 0, bodies = 0,
               waited = 0, zeroed = 0, reloaded = 0, asked = 0, armour = 0, leftovers = 0, emerge = 0,
-              deferred = 0, missing = 0, retried = 0, gave_up = 0, slow = 0, effects = 0 },
+              deferred = 0, missing = 0, retried = 0, gave_up = 0, slow = 0, effects = 0, spread = 0 },
 }
 local core
 
@@ -116,11 +125,20 @@ local NO_ROLL_S = 5             -- client: a copy this old that never rolled is 
 local APPLY_WINDOW_S = 0.1      -- event path: at most APPLY_PER_WINDOW full applies per 100 ms
 local APPLY_PER_WINDOW = 2
 local PASS_APPLY_MAX = 4        -- deferred / retried applies per client pass
+local PASS_BUDGET_S = 0.025     -- ... and no further one once the pass ran this long (the rest: next pass)
 local CPASS_BUSY_S = 1.0        -- client pass interval while applies wait
 local RETRY_S = 2.0             -- a part whose asset is not in memory here is looked for again after this
-local RETRY_FOR_S = 120         -- ... for this long
+local RETRY_FOR_S = 600         -- ... for this long (0.8.1: 120 s)
 local DEFER_TTL = 30
 local SLOW_APPLY_S = 0.05       -- an apply longer than this is logged
+-- client: mesh / material paths applied in this game process (the slow-apply
+-- line tells a first use - render resources, shaders built on that PC - from
+-- a repeat; the friend's 65-89 ms per zombie, cause unknown); strings only
+local used_assets = { n = 0, t = {} }
+local USED_MAX = 2000
+-- client: assets that never came into memory for a copy (short names, the status line)
+local never = { t = {}, list = {}, more = 0 }
+local NEVER_MAX = 12
 
 local known = {}       -- host: [zombie full name] = { seen, born?, sent = { [pc full name] = true } }
 local letters = {}     -- host: [zombie full name] = "cs" (Archetype_* seen)
@@ -144,11 +162,7 @@ local cpass = { cursor = 0, last = -1000, broken = false }
 -- ---------------------------------------------------------------------------
 
 -- out-array elements come as params (read with :get())
-local function elem(e)
-    local ok, o = pcall(function() return e:get() end)
-    if ok then return o end
-    return e
-end
+local elem = ue.elem
 
 local function each(arr, fn)
     if type(arr) == "table" then
@@ -160,16 +174,7 @@ end
 
 -- live actors of a class in this world (engine iterator: pending-kill ones
 -- excluded); nil = not ready, false + error = the call failed
-local function actors_of(class_path)
-    local cls = ue.find_object(class_path)
-    local gps = ue.gameplay_statics()
-    local wc = ue.local_pc()
-    if not cls or not gps or not wc then return nil end
-    local out = {}
-    local ok, err = pcall(function() gps:GetAllActorsOfClass(wc, cls, out) end)
-    if not ok then return false, err end
-    return out
-end
+local actors_of = ue.actors_of
 
 -- ---------------------------------------------------------------------------
 -- Host
@@ -182,7 +187,9 @@ local function snapshot(z, key)
     local anim = zi.anim_of(mesh)
     local k = known[key]
     local s = {
-        arch = letters[key] or zi.arch_from_name(name),
+        arch = letters[key] or zi.arch_of(z, name),
+        -- the name's form: each client builds the name in its own language
+        nf = zi.name_form(z, name),
         mesh = zi.obj_path(zi.mesh_asset(mesh)),
         mat = zi.obj_path(zi.base_material(mesh)),
         bones = zi.hidden_bones(mesh),
@@ -198,7 +205,7 @@ end
 
 local function send_look(pc, z, snap)
     return core.send_with_obj(pc, z, "AIAPP", snap.arch, snap.mesh, snap.mat, snap.bones, snap.name, snap.bs,
-        snap.body, snap.age)
+        snap.body, snap.age, snap.nf or "?")
 end
 
 -- BP_MasterZombie.Archetype_*, post (host)
@@ -231,8 +238,9 @@ local function on_select_host(z)
             if send_look(v.pc, z, snap) then
                 k.sent[v.key] = true
                 M.stats.sent = M.stats.sent + 1
-                if core.first("looks.sent", 3) then
-                    log.info("ai: looks: %s -> %s: arch=%s mesh=%s bones=%s body=%s name=%s", ue.short(z),
+                local say = core.line("looks.sent", 3)
+                if say then
+                    say("ai: looks: %s -> %s: arch=%s mesh=%s bones=%s body=%s name=%s", ue.short(z),
                         ue.short(v.pc), snap.arch, zi.short_asset(snap.mesh), snap.bones, snap.body, snap.name)
                 end
             end
@@ -259,7 +267,7 @@ local function visit(z, now)
     local k = known[key]
     if not k then
         -- rolled before this feature saw it (feature switched on, host joined late)
-        if not zi.rolled_name(ue.str(ue.prop(z, "Name"))) then return end
+        if not zi.rolled(z, ue.str(ue.prop(z, "Name"))) then return end
         k = { sent = {} }
         known[key] = k
     end
@@ -342,7 +350,7 @@ local function on_question(f, pc)
     each(out, function(o)
         if n >= ANSWER_MAX or not ue.valid(o) or ue.role(o) ~= ue.ROLE_AUTHORITY or not core.is_zombie(o) then return end
         local key = ue.name(o)
-        if not known[key] and not zi.rolled_name(ue.str(ue.prop(o, "Name"))) then return end
+        if not known[key] and not zi.rolled(o, ue.str(ue.prop(o, "Name"))) then return end
         local k = known[key] or { sent = {} }
         known[key] = k
         k.seen = now
@@ -394,6 +402,29 @@ local function missing_ready(snap, parts)
     return false
 end
 
+-- The assets of the missing parts, short names ("SK_Zombie_Punk_Male_01,
+-- MI_Zombie_04"): the lines and the status name what never came.
+local function missing_names(snap, parts)
+    local out = {}
+    for p in tostring(parts):gmatch("[^,]+") do
+        local path = (p == "mesh" and snap and snap.mesh) or (p == "material" and snap and snap.mat)
+            or (p == "blendspace" and snap and snap.bs) or nil
+        out[#out + 1] = (path and path ~= "") and zi.short_asset(path) or p
+    end
+    return table.concat(out, ", ")
+end
+
+-- One entry per comma-separated name ("spit fx" stays one, not "spit", "fx").
+local function note_never(names)
+    for part in tostring(names):gmatch("[^,]+") do
+        local n = part:match("^%s*(.-)%s*$")
+        if n ~= "" and not never.t[n] then
+            never.t[n] = true
+            if #never.list < NEVER_MAX then never.list[#never.list + 1] = n else never.more = never.more + 1 end
+        end
+    end
+end
+
 local function set_mesh(mesh, a)
     -- what Event_SetMeshAndMaterial / the archetypes call (@7470, @25493)
     if pcall(function() mesh:SetSkinnedAssetAndUpdate(a, false) end) then return true end
@@ -411,7 +442,8 @@ local function zero_chances(z)
     zeroed[key] = true
     if n > 0 then
         M.stats.zeroed = M.stats.zeroed + 1
-        if core.first("looks.zeroed", 2) then log.info("ai: looks: %s will not roll a type (the host decides)", ue.short(z)) end
+        local say = core.line("looks.zeroed", 2)
+        if say then say("ai: looks: %s will not roll a type (the host decides)", ue.short(z)) end
     end
 end
 
@@ -444,10 +476,12 @@ local function apply_body(z, mesh, b)
     return did
 end
 
--- The hound's armour as on the host.
-local function fix_armour(z, mesh, own_name, host_name, changed)
+-- The hound's armour as on the host (by the name's form; an older host:
+-- its English name).
+local function fix_armour(z, mesh, own_name, snap, changed)
     if not ue.class_name(z):find("Zombie_Dog", 1, true) then return end
-    local want, have = zi.armored(host_name), zi.armored(own_name)
+    local want = snap.nf and snap.nf == "A" or (not snap.nf and zi.armored(snap.name))
+    local have = zi.is_armored(z, own_name)
     if want == have then return end
     if want then
         -- the dog's own armour branch: Name, health, two armour meshes on the leader pose
@@ -557,6 +591,13 @@ local function apply(z, snap, why)
     local d = deferred[dkey]
     if d and (d.snap.seq or 0) <= (snap.seq or 0) then deferred[dkey] = nil end
     local t0 = clock()
+    -- step times for the slow-apply line (which part of it is slow on a PC)
+    local tl, steps = t0, {}
+    local function step(n)
+        local t = clock()
+        steps[#steps + 1] = string.format("%s %.0f", n, (t - tl) * 1000)
+        tl = t
+    end
     local changed, miss = {}, {}
     local own_name = ue.str(ue.prop(z, "Name"))
     if snap.mesh ~= "" and zi.obj_path(zi.mesh_asset(mesh)) ~= snap.mesh then
@@ -575,6 +616,7 @@ local function apply(z, snap, why)
             end
         end
     end
+    step("mesh")
     if snap.mat ~= "" and zi.obj_path(zi.base_material(mesh)) ~= snap.mat then
         local m = asset(snap.mat, "Material")
         if not m then miss[#miss + 1] = "material" end
@@ -584,6 +626,7 @@ local function apply(z, snap, why)
             ue.call(z, "Event_EyesCallback", core.cvar_bool("Game.DisableZombieEyes", false))
         end
     end
+    step("mat")
     if snap.bones ~= "?" then
         local want = {}
         for b in snap.bones:gmatch("[^,]+") do want[b] = true end
@@ -597,6 +640,7 @@ local function apply(z, snap, why)
             end
         end
     end
+    step("bones")
     if snap.bs ~= "" then
         local bs = asset(snap.bs, "BlendSpace")
         local anim = zi.anim_of(mesh)
@@ -609,15 +653,32 @@ local function apply(z, snap, why)
             end
         end
     end
+    step("bs")
     local body = apply_body(z, mesh, snap.b)
     if body then changed[#changed + 1] = "body hh=" .. tostring(snap.b.hh) end
-    fix_armour(z, mesh, own_name, snap.name, changed)
-    remove_leftovers(z, zi.arch_from_name(own_name), snap.arch, changed)
+    step("body")
+    fix_armour(z, mesh, own_name, snap, changed)
+    remove_leftovers(z, zi.arch_of(z, own_name), snap.arch, changed)
     add_effects(z, mesh, snap.arch, changed, miss)
     stop_emerge(z, mesh, snap, changed)
-    if FText and snap.name ~= "" and ue.str(ue.prop(z, "Name")) ~= snap.name then
-        if pcall(function() z:SetPropertyValue("Name", FText(snap.name)) end) then changed[#changed + 1] = "name" end
+    step("fx")
+    -- the name in this game's language: the host's form built from this
+    -- game's texts (the host's own text only when that cannot be done)
+    local want_name = snap.name
+    if snap.nf then
+        local built = zi.build_name(z, snap.nf)
+        if built and built ~= "" then
+            want_name = built
+            if built ~= snap.name and core.first("looks.name_local", 3) then
+                log.info("ai: looks: %s named in this game's language: '%s' (the host's '%s', form %s)", ue.short(z),
+                    log.ascii(built), log.ascii(snap.name), snap.nf == "" and "base" or snap.nf)
+            end
+        end
     end
+    if FText and want_name ~= "" and ue.str(ue.prop(z, "Name")) ~= want_name then
+        if pcall(function() z:SetPropertyValue("Name", FText(want_name)) end) then changed[#changed + 1] = "name" end
+    end
+    step("name")
     local key = ue.name(z)
     applied[key] = snap
     M.stats.applied = M.stats.applied + 1
@@ -629,24 +690,35 @@ local function apply(z, snap, why)
                          till = same and w.till or now + RETRY_FOR_S }
         if not same then
             M.stats.missing = M.stats.missing + 1
-            if core.first("looks.missing", 5) then
-                log.info("ai: looks: %s: %s of the host's look not in memory here yet (%s); the rest applied, retried",
-                    ue.short(z), table.concat(miss, ","), zi.short_asset(snap.mesh))
+            local say = core.line("looks.missing", 5)
+            if say then
+                say("ai: looks: %s: %s of the host's look not in memory here yet (%s); the rest applied, retried",
+                    ue.short(z), table.concat(miss, ","), missing_names(snap, table.concat(miss, ",")))
             end
         end
     else
         waiting[key] = nil
     end
-    if core.first("looks.applied", 5) or (body and core.first("looks.body", 10)) then
-        log.info("ai: looks: %s looks like the host's (%s, arch=%s, changed: %s)", ue.short(z), why, snap.arch,
+    local say = core.line(body and "looks.body" or "looks.applied", body and 10 or 5)
+    if say then
+        say("ai: looks: %s looks like the host's (%s, arch=%s, changed: %s)", ue.short(z), why, snap.arch,
             #changed > 0 and table.concat(changed, " ") or "nothing")
     end
     local dt = now - t0
+    local fresh = {}
+    for _, p in ipairs({ snap.mesh or "", snap.mat or "" }) do
+        if p ~= "" and not used_assets.t[p] then
+            fresh[#fresh + 1] = zi.short_asset(p)
+            if used_assets.n >= USED_MAX then used_assets.t, used_assets.n = {}, 0 end
+            used_assets.t[p], used_assets.n = true, used_assets.n + 1
+        end
+    end
     if dt > SLOW_APPLY_S then
         M.stats.slow = M.stats.slow + 1
-        log.warn("ai: looks: applying the host's look to %s took %.0f ms (%s; mesh=%s mat=%s; changed: %s)", ue.short(z),
-            dt * 1000, why, zi.short_asset(snap.mesh), zi.short_asset(snap.mat),
-            #changed > 0 and table.concat(changed, " ") or "nothing")
+        log.warn("ai: looks: applying the host's look to %s took %.0f ms (%s; mesh=%s mat=%s; changed: %s; ms: %s;"
+            .. " first use here: %s)", ue.short(z), dt * 1000, why, zi.short_asset(snap.mesh), zi.short_asset(snap.mat),
+            #changed > 0 and table.concat(changed, " ") or "nothing", table.concat(steps, ", "),
+            #fresh > 0 and table.concat(fresh, " ") or "none")
     end
 end
 
@@ -715,13 +787,16 @@ local function on_loaded_client(c)
     apply_or_defer(z, snap, "after its late load")
 end
 
--- AIAPP|arch|mesh|material|bones|name|blendspace|body|age: waits for its zombie
+-- AIAPP|arch|mesh|material|bones|name|blendspace|body|age|name form: waits
+-- for its zombie. The name form ("?" unknown; absent from an older host).
 local function on_aiapp(f)
     if core.S.role ~= "client" then return end
     local snap = { arch = f[1] or "-", mesh = f[2] or "", mat = f[3] or "", bones = f[4] or "?", name = f[5] or "",
                    bs = f[6] or "", body = f[7] or "", age = f[8] or "" }
+    if f[9] ~= nil and f[9] ~= "?" then snap.nf = f[9] end
     snap.b = zi.parse_body(snap.body)
-    snap.text = table.concat({ snap.arch, snap.mesh, snap.mat, snap.bones, snap.name, snap.bs, snap.body }, "|")
+    snap.text = table.concat({ snap.arch, snap.mesh, snap.mat, snap.bones, snap.name, snap.bs, snap.body,
+                               snap.nf or "?" }, "|")
     seq_n = seq_n + 1
     snap.seq = seq_n
     core.expect_obj("look", snap)
@@ -733,7 +808,7 @@ local function on_look_obj(z, snap)
     local prev = applied[key]
     if prev and prev.text == snap.text then return end
     local b = born[key]
-    if rolled[key] or zi.rolled_name(ue.str(ue.prop(z, "Name"))) or (b and clock() - b > NO_ROLL_S) then
+    if rolled[key] or zi.rolled(z, ue.str(ue.prop(z, "Name"))) or (b and clock() - b > NO_ROLL_S) then
         apply_or_defer(z, snap, prev and "update" or "look")
     else
         -- the body now (no more floating / sinking); the rest after its own roll renamed it
@@ -744,15 +819,29 @@ local function on_look_obj(z, snap)
     end
 end
 
+-- One more apply in this pass: within PASS_APPLY_MAX, and after the first one
+-- only while the pass has run less than PASS_BUDGET_S (a slow apply leaves
+-- the rest to the next pass, 1 s later while work waits).
+local function take_apply(left)
+    if left.applies <= 0 then return false end
+    if left.done > 0 and clock() - left.t0 >= PASS_BUDGET_S then
+        left.applies = 0
+        M.stats.spread = M.stats.spread + 1
+        return false
+    end
+    left.applies = left.applies - 1
+    left.done = left.done + 1
+    return true
+end
+
 -- One copy of the client pass: a deferred apply, a retry of parts whose assets
--- were not in memory, the zeroing, or a question. `left` = { asks, applies }.
+-- were not in memory, the zeroing, or a question. `left` = { asks, applies, t0, done }.
 local function client_visit(z, now, left)
     local key = ue.name(z)
     if not born[key] then born[key] = now end
     local d = deferred[key]
     if d then
-        if left.applies > 0 then
-            left.applies = left.applies - 1
+        if take_apply(left) then
             deferred[key] = nil
             apply(z, d.snap, d.why .. ", deferred")
         end
@@ -763,21 +852,25 @@ local function client_visit(z, now, left)
         if now > w.till then
             waiting[key] = nil
             M.stats.gave_up = M.stats.gave_up + 1
-            if core.first("looks.gave_up", 3) then
-                log.info("ai: looks: %s: %s never came into memory here; left as it is", ue.short(z), w.parts)
+            local names = missing_names(applied[key], w.parts)
+            note_never(names)
+            local say = core.line("looks.gave_up", 3)
+            if say then
+                say("ai: looks: %s: %s (%s) never came into memory here in %d s; left as it is", ue.short(z), w.parts, names,
+                    RETRY_FOR_S)
             end
         elseif not missing_ready(applied[key], w.parts) then
             w.tries = (w.tries or 0) + 1
-            w.next = now + math.min(30, RETRY_S * 2 ^ math.min(w.tries, 4))
-        elseif left.applies > 0 then
-            left.applies = left.applies - 1
+            -- (not past its end: the give-up line comes from the visit at w.till)
+            w.next = math.min(w.till, now + math.min(30, RETRY_S * 2 ^ math.min(w.tries, 4)))
+        elseif take_apply(left) then
             M.stats.retried = M.stats.retried + 1
             apply(z, applied[key], "retry: " .. w.parts)
         end
         return
     end
     if applied[key] or pend[key] then return end
-    if not rolled[key] and not zi.rolled_name(ue.str(ue.prop(z, "Name"))) then
+    if not rolled[key] and not zi.rolled(z, ue.str(ue.prop(z, "Name"))) then
         zero_chances(z)    -- began play before the BeginPlay hook was in
         if now - born[key] < NO_ROLL_S then return end
     end
@@ -793,11 +886,22 @@ local function client_visit(z, now, left)
     asks[key] = { n = (a and a.n or 0) + 1, t = now }
     left.asks = left.asks - 1
     M.stats.asked = M.stats.asked + 1
-    if core.first("looks.ask", 3) then log.info("ai: looks: %s has no look from the host yet; asked", ue.short(z)) end
+    local say = core.line("looks.ask", 3)
+    if say then say("ai: looks: %s has no look from the host yet; asked", ue.short(z)) end
+end
+
+-- A missing asset is looked for again only when its time has come (backing
+-- off to 30 s, for 10 min): copies merely waiting do not make the pass (an
+-- engine GetAllActorsOfClass) run every second.
+local function waiting_due(now)
+    for _, w in pairs(waiting) do
+        if now >= w.next then return true end
+    end
+    return false
 end
 
 local function client_pass(now)
-    local busy = next(deferred) ~= nil or next(waiting) ~= nil
+    local busy = next(deferred) ~= nil or waiting_due(now)
     if cpass.broken or now - cpass.last < (busy and CPASS_BUSY_S or CPASS_S) then return end
     cpass.last = now
     local out, err = actors_of(core.ZOMBIE_CLASS)
@@ -809,7 +913,7 @@ local function client_pass(now)
     if not out then return end
     local n = #out
     if n == 0 then return end
-    local left = { asks = ASK_PER_PASS, applies = PASS_APPLY_MAX }
+    local left = { asks = ASK_PER_PASS, applies = PASS_APPLY_MAX, t0 = clock(), done = 0 }
     for _ = 1, math.min(CSLICE, n) do
         cpass.cursor = cpass.cursor % n + 1
         local z = elem(out[cpass.cursor])
@@ -877,8 +981,10 @@ function M.client_tick(now)
     for k, d in pairs(deferred) do
         if now - d.t > DEFER_TTL then deferred[k] = nil end
     end
+    -- (left past its end only when its copy was not visited: the pass gives
+    -- a visited one up with its line first)
     for k, w in pairs(waiting) do
-        if now > w.till + 5 then waiting[k] = nil end
+        if now > w.till + 60 then waiting[k] = nil end
     end
     local n = 0
     for _ in pairs(applied) do n = n + 1 end
@@ -907,9 +1013,11 @@ function M.status_line()
     local s = M.stats
     return string.format("ai: looks snapshots=%d sent at roll=%d by pass=%d answered=%d resend=%d | client applied=%d "
         .. "bodies=%d waited=%d deferred=%d missing assets=%d retried=%d gave up=%d slow=%d zeroed=%d asked=%d "
-        .. "reloaded=%d armour=%d leftovers=%d effects=%d emerge=%d",
+        .. "reloaded=%d armour=%d leftovers=%d effects=%d emerge=%d passes cut short=%d",
         s.snapshots, s.sent, s.pass_sent, s.answered, s.resend, s.applied, s.bodies, s.waited, s.deferred, s.missing,
-        s.retried, s.gave_up, s.slow, s.zeroed, s.asked, s.reloaded, s.armour, s.leftovers, s.effects, s.emerge)
+        s.retried, s.gave_up, s.slow, s.zeroed, s.asked, s.reloaded, s.armour, s.leftovers, s.effects, s.emerge,
+        s.spread) .. (#never.list > 0 and string.format(" | never came into memory here: %s%s", table.concat(never.list, ", "),
+        never.more > 0 and string.format(" +%d more", never.more) or "") or "")
 end
 
 return M

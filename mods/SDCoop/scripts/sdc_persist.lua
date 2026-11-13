@@ -57,14 +57,19 @@
 -- once and keeps in its config) without Steam.
 --
 -- When (host): the game's save (BP_PlayerController.SaveGameToSlot: quick
--- save, sleep, auto save, save menu, pause menu - all of them go through it;
--- also EMSAsyncSaveGame.AsyncSaveActors inside it, one write for both; a
--- save to another slot takes the records of players who are not here
--- along), a player's inventory change (10 s), a level / skill / kill change
--- (15 s), death, leaving, every persist_period seconds, and before a world
+-- save, sleep, auto save, save menu, pause menu - all of them go through it
+-- and start EMSAsyncSaveGame.AsyncSaveActors, hooked here; a save to
+-- another slot takes the records of players who are not here along), a
+-- player's inventory change (10 s), a level / skill / kill change (15 s),
+-- death, leaving, every persist_period seconds, and before a world
 -- change. The game destroys the character of a player who disconnects
--- before any mod code runs, so leaving writes what was gathered while the
--- player was here (5 s / 10 s old at most). sdc_session's throwaway slot
+-- before any mod tick; leaving writes the snapshot taken as the engine
+-- removed it (its BP_JigHelperComp's EndPlay, section LV), else what was
+-- gathered while the player was here (5 s / 10 s old at most). In a
+-- vehicle the record keeps which one and the seat (pos.veh; the character
+-- comes back at its door, M.saved_vehicle for the vehicle code). The
+-- client's PSPROG skill list also answers the host's skill checks
+-- (sdc_skilltree.report; then the client sends no SKTREE). sdc_session's throwaway slot
 -- SDCoop_ClientTemp never holds records (sdc_savecheck keeps the host's
 -- saves out of it).
 -- Those records are LIVE; what the host's SAVES hold of them is a second
@@ -73,7 +78,9 @@
 -- host's saves" below): <slot>_SDCoop_commit.json + _<key>_c<gen>.sav /
 -- _<key>_q<gen>.sav (inventory / quest save of that commit).
 -- Restore (host): the first character of a returning player waits for the
--- player's id (sdc_players.persist_gate), spawns at the saved spot
+-- player's id (sdc_players.persist_gate; the client sends it as soon as it
+-- is in the host's world, before it has a character: the early id in
+-- client_tick), spawns at the saved spot
 -- (join_point) without the starting kit (starting_items); the host's copy of
 -- the controller gets the saved progression and respawn point, the client is
 -- sent the record (PSSET) and applies it, and once its HUD is up (PSRDY) the
@@ -147,7 +154,6 @@ local NOSLOT = "SDCoop_NoSlot"     -- a world that was never saved (new game): t
 local TAG = "_SDCoop"
 local JIG_SAVE_CLASS = "/Game/JigSInventory/Jigsaw/Components/Save/BP_JigMPComponentSave.BP_JigMPComponentSave_C"
 local PC_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:"
-local SAVE_FN = PC_FN .. "SaveGameToSlot"
 local SAVED_FN = PC_FN .. "OnCompleted_9CDBA9034C950D925C1539BE037C23EF"
 local SAVE_FAILED_FN = PC_FN .. "OnFailed_9CDBA9034C950D925C1539BE037C23EF"
 local DELETE_FN = "/Script/EasyMultiSave.EMSFunctionLibrary:DeleteAllSaveDataForSlot"
@@ -453,7 +459,6 @@ local function safe_slot(slot)
     for i = 1, #slot do h = (h * 33 + slot:byte(i)) % 4294967296 end
     return (slot:gsub("[^%w_%-]", "_")) .. string.format("_%08x", h)
 end
-M.safe_slot = safe_slot
 
 local function doc_paths(slot)
     local dir = savegames_dir()
@@ -466,7 +471,6 @@ end
 local function blob_slot(slot, key, suffix)
     return safe_slot(slot) .. TAG .. "_" .. key .. (suffix or "")
 end
-M.blob_slot = blob_slot
 
 local function blob_path(name)
     local dir = savegames_dir()
@@ -511,7 +515,6 @@ local function load_doc(slot, fresh)
     docs[slot] = doc
     return doc
 end
-M.load_doc = load_doc
 
 local function save_doc(slot, doc, why)
     local main, bak, tmp = doc_paths(slot)
@@ -612,7 +615,6 @@ local function inv_walk(conts, want_list)
     table.sort(sig)
     return table.concat(sig, ";"), nc, ni, list
 end
-M.inv_walk = inv_walk
 
 local function clear_pickups(conts)
     local n = 0
@@ -666,7 +668,6 @@ local function load_blob(slot, key, expect)
     end
     return nil
 end
-M.load_blob = load_blob
 
 -- Writes an inventory (src = { conts, uids, weights } arrays) as the
 -- player's file in `slot`: temp slot, read back and counted, then renamed.
@@ -738,6 +739,13 @@ local function delete_blobs(slot, key)
         if p then os.remove(p) end
     end
 end
+
+-- The same files for another module (sdc_deathbox: the death boxes saved
+-- with the host's world): a Jig inventory as <slot>_SDCoop_<key>.sav and
+-- text files beside the slot.
+M.files = { blob_write = write_blob, blob_load = load_blob_raw, blob_name = blob_slot, blob_path = blob_path,
+            blob_delete = delete_blobs, inv_walk = inv_walk, read = read_file, write = write_file, rotate = rotate,
+            exists = file_exists, remove = os.remove, safe_slot = safe_slot, TAG = TAG, TEMP_SLOT = TEMP_SLOT }
 
 local push_lib = nil
 local function mark_dirty(obj, index, name)
@@ -1174,8 +1182,8 @@ M.flush = flush
 -- crash, Continue, an older save) the host and the world are back at that
 -- save while a live record is not: the client stood where it left and kept
 -- items whose containers the load refilled. So:
---   commit  every save of the game (on_host_save: the SaveGameToSlot / EMS
---           AsyncSaveActors hooks - quick save, pause / save menu, sleep, the
+--   commit  every save of the game (on_host_save: the EMS AsyncSaveActors
+--           hook - quick save, pause / save menu, sleep, the
 --           game's autosave and the co-op autosave sdc_savecheck starts with
 --           GameMode.EventSave(true), the savecheck repair save) first writes
 --           the live records as before; once the game reports the actors
@@ -1801,6 +1809,46 @@ M._CM = CM
 -- Host: reading the live character
 -- ---------------------------------------------------------------------------
 
+-- LV: the moment a player leaves (snapshot of its character as the engine
+-- removes it, below inv_check) and the vehicle it sat in. One table: this
+-- file is near Lua's 200-locals limit.
+local LV = { FN = "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:ReceiveEndPlay",
+             KEEP_S = 15, SUFFIX = "_leave" }
+
+-- The vehicle a seated player is in: the vehicle actor and what the record
+-- keeps of it (record pos.veh): { name, cls, x, y, z (the vehicle), seat =
+-- "driver" | "passenger" (the host's seat of this player,
+-- sdc_vehicles.seat_of) }; nil when not seated. Kept for the vehicle code
+-- (a seat after a rejoin: M.saved_vehicle); persist seats nobody. Seated =
+-- the game's InVehicle? or a seat sdc_vehicles gave (its passenger seat is an
+-- attachment, maybe without the flag); the vehicle = the game's
+-- VehicleDrivingComponent.Vehicle, else the actor the character is attached to.
+function LV.seated(r, pawn)
+    local seat = nil
+    local vm = package.loaded["sdc_vehicles"]
+    if r and type(vm) == "table" and type(vm.seat_of) == "function" then
+        local ok, s = pcall(vm.seat_of, r.key)
+        if ok and type(s) == "string" then seat = s end
+    end
+    if ue.prop(pawn, "InVehicle?") ~= true and not seat then return nil end
+    local veh = ue.prop(ue.prop(pawn, "VehicleDrivingComponent"), "Vehicle")
+    if not ue.valid(veh) then
+        local okp, par = pcall(function() return pawn:GetAttachParentActor() end)
+        veh = (okp and ue.valid(par)) and par or nil
+    end
+    if not veh then return nil end   -- the flag without a vehicle (sdc_vehicles @608): not seated
+    local v = { name = ue.short(veh), cls = ue.class_name(veh), seat = seat }
+    local l = ue.location(veh)
+    if l then v.x, v.y, v.z = num(l.X, 1), num(l.Y, 1), num(l.Z, 1) end
+    return veh, v
+end
+
+function LV.veh_str(v)
+    if type(v) ~= "table" then return "which one was not recorded (an older record)" end
+    return string.format("%s %s, seat %s, at %.0f,%.0f,%.0f", tostring(v.cls or "?"), tostring(v.name or "?"),
+        tostring(v.seat or "?"), tonumber(v.x) or 0, tonumber(v.y) or 0, tonumber(v.z) or 0)
+end
+
 local function read_vitals(pawn)
     local v = {}
     for _, d in ipairs(VITALS) do
@@ -1815,6 +1863,13 @@ local function read_vitals(pawn)
     end
     v.MaxHealth = num(ue.prop(med, "MaxHealth"), 3)
     v["DeathbringerSkillUsed?"] = ue.prop(pawn, "DeathbringerSkillUsed?")
+    -- down (sdc_down): the seconds left and the health before the hit; it
+    -- comes back down on its return (restore_character)
+    local dn = package.loaded["sdc_down"]
+    if type(dn) == "table" and type(dn.down_left) == "function" then
+        local ok, left, h0 = pcall(dn.down_left, pawn)
+        if ok and type(left) == "number" then v.down_left, v.down_h0 = left, tonumber(h0) end
+    end
     return v
 end
 
@@ -1828,12 +1883,16 @@ local function read_pos(r, pawn)
         if type(y) == "number" then yaw = y end
     end
     local pos = { x = num(loc.X, 1), y = num(loc.Y, 1), z = num(loc.Z, 1), yaw = num(yaw, 1) }
-    -- in a vehicle: the game saves the driver side door (ActorPreSave @149888)
-    if ue.prop(pawn, "InVehicle?") == true then
-        pos.vehicle = true
-        local veh = ue.prop(ue.prop(pawn, "VehicleDrivingComponent"), "Vehicle")
+    -- in a vehicle: the game saves the driver side door (ActorPreSave @149888);
+    -- a passenger (sdc_vehicles' second seat): the passenger side door. Which
+    -- vehicle and seat is kept too (pos.veh; the vehicle code may seat the
+    -- player there again after a rejoin - persist does not)
+    local okv, veh, v = pcall(LV.seated, r, pawn)
+    if okv and veh then
+        pos.vehicle, pos.veh = true, v
         local mesh = ue.prop(veh, "Mesh")
-        local okd, door = pcall(function() return mesh:GetSocketLocation(FName("DriverSide")) end)
+        local sock = v.seat == "passenger" and "PassengerSide" or "DriverSide"
+        local okd, door = pcall(function() return mesh:GetSocketLocation(FName(sock)) end)
         if okd and door then
             local x, y, z = ue.try(function() return door.X end), ue.try(function() return door.Y end), ue.try(function() return door.Z end)
             if type(x) == "number" and type(y) == "number" and type(z) == "number" and (x ~= 0 or y ~= 0) then
@@ -1873,6 +1932,9 @@ end
 -- world's slot. Returns true when a file was written.
 local function inv_check(r, p, pawn, now, force, why)
     p.inv_at = now
+    -- no character for a moment while alive (respawn / possession in
+    -- progress, or gone with the leave): the last written inventory stays
+    if not pawn and p.snap and p.snap.alive then return false end
     local slot = cur_world_slot()
     local src, source = nil, nil
     if p.snap and p.snap.alive and pawn then
@@ -1920,6 +1982,115 @@ local function inv_check(r, p, pawn, now, force, why)
 end
 
 -- ---------------------------------------------------------------------------
+-- Host: the moment of leaving (LV, declared above)
+-- ---------------------------------------------------------------------------
+-- The engine destroys a leaving player's character in its connection
+-- cleanup, before any mod tick, so leaving wrote what had been gathered: up
+-- to 10 s of inventory changes (and 5 s of position / health) were lost - an
+-- item picked up just before was gone, one dropped just before was in the
+-- world AND back in the record. The character's BP_JigHelperComp has a
+-- Blueprint ReceiveEndPlay (BP_JigHelperComp.txt: it only calls the
+-- parent's); it runs while the character is destroyed (AActor::Destroyed ->
+-- RouteEndPlay, before the actor is marked for removal), and its
+-- BP_JigMultiplayer still holds the inventory then. Its hook (Blueprint:
+-- after the function; EndPlayReason Destroyed only) takes a snapshot of a
+-- remote player's living character: the inventory as that player's file
+-- <slot>_SDCoop_<key>_leave.sav (the game's own SaveGame, as inv_check),
+-- position and health in memory (p.leave). A character is also destroyed
+-- without a leave (sdc_respawn removes an old living body; a failed
+-- possess): the snapshot counts only when that player leaves within
+-- LV.KEEP_S and the destroyed character was its current one (on_left ->
+-- LV.promote); otherwise LV.tick throws it away.
+
+-- Hook: (Context = the BP_JigHelperComp, EndPlayReason).
+function LV.on_end_play(ctx_p, reason_p)
+    if not S or S.role ~= "host" or not enabled() then return end
+    local okr, reason = pcall(function() return reason_p:get() end)
+    if okr and type(reason) == "number" and reason ~= 0 then return end   -- EEndPlayReason::Destroyed = 0
+    local comp = ctx_p:get()
+    local okc, owner = pcall(function() return comp:GetOwner() end)
+    if not okc or not ue.valid(owner) then return end
+    local name = ue.name(owner)
+    for skey, p in pairs(P) do
+        if p.key and p.restored and not p.off and p.pawn_name == name then
+            LV.take(skey, p, owner)
+            return
+        end
+    end
+end
+
+function LV.take(skey, p, pawn)
+    if ue.prop(pawn, "PlayerDead?") == true then return end   -- a dead body: death wrote it (items in the loot box)
+    local jig = ue.prop(pawn, "BP_JigMultiplayer")
+    local src = ue.valid(jig) and { conts = ue.prop(jig, "MainJigContainers"), uids = ue.prop(jig, "MainContainersIDs"),
+                                    weights = ue.prop(jig, "InventoryWeight") } or {}
+    local age = clock() - (p.inv_at or 0)
+    if src.conts == nil or src.uids == nil or src.weights == nil then
+        log.warn("persist: %s's character is being removed: its inventory could not be read; the one gathered %d s ago stays",
+            p.name, age)
+        return
+    end
+    local r = (S.remote or {})[skey] or { key = skey }
+    local okp, pos = pcall(read_pos, r, pawn)
+    local okv, vitals = pcall(read_vitals, pawn)
+    local slot = cur_world_slot()
+    local info, sig = write_blob(slot, p.key .. LV.SUFFIX, src, p.hot or (p.base and p.base.hotbar), okp and pos or nil)
+    if not info then
+        M.stats.write_errors = M.stats.write_errors + 1
+        log.warn("persist: %s's character is being removed: the inventory snapshot failed (%s); the one gathered %d s ago stays",
+            p.name, tostring(sig), age)
+        return
+    end
+    p.leave = { at = clock(), pawn = ue.name(pawn), slot = slot, info = info, sig = sig,
+                pos = okp and pos or nil, vitals = okv and vitals or nil }
+    log.info("persist: %s's character is being removed (EndPlay): snapshot of %d container(s), %d item(s) taken"
+        .. " (the last inventory check was %d s ago); it counts if the player is leaving", p.name, info.containers, info.items, age)
+end
+
+-- on_left: the snapshot becomes the record's inventory / position / health.
+-- Returns what was used, for the log line.
+function LV.promote(p)
+    local lv = p.leave
+    p.leave = nil
+    if not lv then return "as last gathered (no snapshot of the character)" end
+    local lk = p.key .. LV.SUFFIX
+    local why = nil
+    if clock() - lv.at > LV.KEEP_S then
+        why = "the snapshot is too old"
+    elseif lv.pawn ~= p.pawn_name then
+        why = "the snapshot is of another character"
+    elseif not file_exists(blob_path(blob_slot(lv.slot, lk)) or "") then
+        why = "the snapshot file is missing"
+    end
+    if not why then
+        local ok, err = copy_blob(lv.slot, lv.slot, lk, p.key)
+        if not ok then why = "the snapshot could not be taken over: " .. tostring(err) end
+    end
+    delete_blobs(lv.slot, lk)
+    if why then return "as last gathered (" .. why .. ")" end
+    local info = lv.info
+    info.file, info.slot, info.source = blob_slot(lv.slot, p.key), lv.slot, "character"
+    p.inv, p.inv_sig = info, lv.sig
+    p.snap = p.snap or {}
+    p.snap.alive = true
+    if lv.pos then p.snap.pos = lv.pos end
+    if lv.vitals then p.snap.vitals = lv.vitals end
+    M.stats.leave_snaps = (M.stats.leave_snaps or 0) + 1
+    return string.format("as at the moment of leaving (%d item(s); snapshot of the character as it was removed)", info.items or 0)
+end
+
+-- host_player: a snapshot of a character that went while its player stayed
+-- (a respawn) is thrown away.
+function LV.tick(p, now)
+    local lv = p.leave
+    if not lv or (now - lv.at <= LV.KEEP_S and lv.pawn == p.pawn_name) then return end
+    p.leave = nil
+    delete_blobs(lv.slot, p.key .. LV.SUFFIX)
+    log.info("persist: %s stayed after its character %s was removed: that snapshot is not used", p.name,
+        tostring(lv.pawn):match("([^%.]+)$") or "?")
+end
+
+-- ---------------------------------------------------------------------------
 -- Host: restore
 -- ---------------------------------------------------------------------------
 
@@ -1953,7 +2124,6 @@ local function parse_respawn(s)
     if #parts ~= 8 or parts[1] ~= 1 then return nil end
     return { en = true, t = { x = parts[2], y = parts[3], z = parts[4] }, q = { x = parts[5], y = parts[6], z = parts[7], w = parts[8] } }
 end
-M.parse_respawn = parse_respawn
 
 local function tree_str(list)
     if type(list) ~= "table" or #list == 0 then return "-" end
@@ -2040,7 +2210,11 @@ local function apply_vitals(pawn, v, name)
 end
 
 -- Last resort (both inventory files unusable): the record's item list added
--- one by one by the plugin's own server-side add (sdc_consume IGAIN path).
+-- one by one by the plugin's own server-side add. (Its saved grids are gone
+-- with the files - the character's grids are new - and the client's windows
+-- are rebuilt by these very adds, so its screen cannot be asked first; what
+-- lands where that player's window refuses it is dropped where the character
+-- stands right after: sdc_place.rescue in restore_character.)
 local function restore_from_list(pawn, list, name)
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
     if not ue.valid(comp) or type(list) ~= "table" then return 0, 0 end
@@ -2077,15 +2251,22 @@ local function restore_character(r, p, pawn, why)
         local ok, err = pcall(apply_vitals, pawn, rs.vitals, p.name)
         if not ok then log.err("persist: %s's health & co.: %s", p.name, tostring(err)) end
     end
-    local items = nil
+    local items, loaded = nil, false
     if rs.inv then
         local obj, file = load_blob(rs.inv.slot or cur_world_slot(), p.key, rs.inv)
         local comp = ue.prop(pawn, "BP_JigMultiplayer")
         if obj and ue.valid(comp) then
+            loaded = true
+            -- (marked: no load hook may take items out before the counts
+            -- below are compared - a "failed" restore would add the record's
+            -- whole item list on top; sdc_place.rescue runs after them)
+            local place_load = package.loaded["sdc_place"]
+            if type(place_load) == "table" then place_load.loading = true end
             local ok, err = pcall(function()
                 comp:SERVER_LoadSaveDataFromClientSide(ue.prop(obj, "JigContainers"), ue.prop(obj, "MainUIDs"),
                     ue.prop(obj, "Weights"), ue.prop(obj, "ActionbarUIDs"))
             end)
+            if type(place_load) == "table" then place_load.loading = false end
             local _, nc, ni = inv_walk(ue.prop(comp, "MainJigContainers"), false)
             if ok and nc == rs.inv.containers and ni == rs.inv.items then
                 items = ni
@@ -2104,18 +2285,46 @@ local function restore_character(r, p, pawn, why)
         end
         if not items then
             M.stats.inv_fallback = M.stats.inv_fallback + 1
+            -- the verdict told the client to clear its screen for the file
+            -- (send_verdict: flag clear), which was there then and is not
+            -- now: what the character holds here from before is not on that
+            -- screen (the client asks only about items it shows that the
+            -- host lacks) until the player joins again
+            if not loaded and (tonumber(rs.inv.containers) or 0) >= 0 then
+                local _, _, held = inv_walk(ue.prop(ue.prop(pawn, "BP_JigMultiplayer"), "MainJigContainers"), false)
+                if (held or 0) > 0 then
+                    log.warn("persist: %s's client cleared its inventory screen for this restore: %d item(s) the character had here before may not show there until they rejoin",
+                        p.name, held)
+                end
+            end
             if rs.inv.list then
                 local added = restore_from_list(pawn, rs.inv.list, p.name)
                 items = added
             end
             if ue.valid(r.pc) then log.say("persist_inv_failed", "err", 8, p.name) end
         end
+        -- items the restored data holds where that player's window can never
+        -- show them (a wallet, a med bag) are dropped where the character
+        -- stands now (sdc_place.rescue; the slots of everything else stay).
+        -- The load has already queued CLIENT_ContainerDataResponse with them
+        -- (ubergraph @57 -> 319), after the counts were compared above; the
+        -- drops' notices follow on the same reliable channel, and the remove
+        -- request the client's window build sends for each refused item finds
+        -- that UID gone. Also after the item-list rebuild (no load call).
+        local place_mod = package.loaded["sdc_place"]
+        if type(place_mod) == "table" and type(place_mod.rescue) == "function" then
+            pcall(place_mod.rescue, pawn, "restore")
+        end
     end
     -- The id came after the first character spawned (the gate gave up,
     -- PID_WAIT_S): it stands at the join point next to the host, not where
     -- the player left. Move it there now, the way "unstuck" moves a client
     -- (UNSTUCKTO: the client owns its movement), and watch it for a fall.
-    if p.late and rs.pos and not rs.dead and cfg.get("persist_restore_position") ~= false then
+    -- Not when the host moved it since (a pull or unstuck: M.note_moved).
+    if p.late and p.moved_by_host and rs.pos and not rs.dead then
+        log.info("persist: %s's id came after its character spawned, but the host has moved the character since: it stays where it is",
+            p.name)
+    elseif p.late and rs.pos and not rs.dead and cfg.get("persist_restore_position") ~= false then
         local spot = { X = rs.pos.x, Y = rs.pos.y, Z = rs.pos.z + 30 }
         local cur = ue.location(pawn)
         local dx, dy = cur and (cur.X - spot.X) or 1e9, cur and (cur.Y - spot.Y) or 1e9
@@ -2136,6 +2345,14 @@ local function restore_character(r, p, pawn, why)
     local lvl = p.base and p.base.prog and p.base.prog.L and p.base.prog.L.CurrentLevel
     if ue.valid(r.pc) then net.send_to(r.pc, "PSDONE", p.gen, tostring(lvl or "?"), tostring(items or 0)) end
     log.say("persist_restored_host", "ok", 6, p.name)
+    -- it left (or the world was saved) while down: sdc_down puts it down
+    -- again once it is ready - after its inventory is back
+    local dn = package.loaded["sdc_down"]
+    local dl = rs.vitals and tonumber(rs.vitals.down_left)
+    if dl and type(dn) == "table" and type(dn.restore_later) == "function" then
+        local ok, err = pcall(dn.restore_later, r.key, pawn, dl, rs.vitals.down_h0, p.name)
+        if not ok then log.err("persist: %s's knockdown: %s", p.name, tostring(err)) end
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -2152,9 +2369,22 @@ local function send_verdict(r, p)
         local flags = {}
         if p.restore.inv then flags[#flags + 1] = "inv" end
         if p.restore.dead then flags[#flags + 1] = "dead" end
-        -- the character has (or gets) the starting kit: the client clears its
-        -- inventory UI first, as the game's own load does
-        if p.late or not (players_mod() or {}).PERSIST_HOOKS then flags[#flags + 1] = "clear" end
+        -- the saved inventory FILE replaces the character's (the starting kit
+        -- of a late id or without sdc_players' hooks, or an item the game gave
+        -- anyway: in 0.8.1 Rags x2 although the kit was off, which the
+        -- client kept showing for 16 minutes, an item it could neither use
+        -- nor move): the client clears its inventory UI first, as the game's
+        -- own load does; the load then sends it the whole inventory
+        -- (CLIENT_ContainerDataResponse). Not when only the record's item
+        -- list is left (both files missing / damaged: containers -1, the
+        -- items are added to what the character has, no whole inventory
+        -- follows) or nothing is restored (a dead record): a cleared screen
+        -- would hide what the character keeps here.
+        local rinv = p.restore.inv
+        if rinv and (tonumber(rinv.containers) or 0) >= 0 then flags[#flags + 1] = "clear" end
+        -- the skill list of PSPROG answers the host's skill checks (on_prog):
+        -- the client need not send SKTREE as well
+        if (skilltree_mod() or {}).report then flags[#flags + 1] = "tree" end
         net.send_to(r.pc, "PSSET", p.gen, vals, tree_str(p.base.tree), respawn_str(p.base.respawn), table.concat(flags, ","))
         -- the places this player had discovered: right behind the record (the
         -- client sets them once the record is applied); older clients ignore it
@@ -2169,7 +2399,8 @@ local function send_verdict(r, p)
             end
         end
     else
-        net.send_to(r.pc, "PSFRESH", p.gen, enabled() and "1" or "0")
+        -- third field "tree": as the PSSET flag above (older clients read two)
+        net.send_to(r.pc, "PSFRESH", p.gen, enabled() and "1" or "0", (skilltree_mod() or {}).report and "tree" or "-")
     end
 end
 
@@ -2216,6 +2447,10 @@ local function decide(r, p)
     quests_bind(r.pc, cur_world_slot(), p.key, true)
     log.info("persist: %s is %s: record from %s%s: %s -> restoring", p.name, p.key, tostring(src), CM.origin(p.key, src),
         describe_rec(rec))
+    if p.restore.pos and p.restore.pos.vehicle then
+        log.info("persist: %s sat in a vehicle when the record was written (%s): the character comes at its door;"
+            .. " the seat is the vehicle code's (persist.saved_vehicle)", p.name, LV.veh_str(p.restore.pos.veh))
+    end
 end
 
 local function on_pid(f, pc)
@@ -2223,11 +2458,23 @@ local function on_pid(f, pc)
     local pl = players_mod()
     local r = pl and pl.record_for and pl.record_for(pc)
     if not r then return end   -- the session record comes with the next tick; the client repeats
+    -- a banned or refused player goes now, before it gets a character, and
+    -- one waiting for the host's answer gets no verdict yet: its client
+    -- repeats the id (sdc_admin: bans, max_players, join_access)
+    local adm = package.loaded["sdc_admin"]
+    if type(adm) == "table" and type(adm.on_early_id) == "function" then
+        local okb, out = pcall(adm.on_early_id, r, (f[3] and f[3] ~= "") and f[3] or r.name, clean_sid(f[1]))
+        if okb and out then return end
+    end
     local p = P[r.key]
     if p and p.gen then
         send_verdict(r, p)   -- answer lost or late: the same verdict again
         return
     end
+    -- the host's own world is not up yet (its main menu, listening): the
+    -- verdict needs the world's slot; the client repeats (an early id comes
+    -- before the client has a character: client_tick)
+    if not hs.world_seen then return end
     -- the game is loading a save (CM.load_started): after it (the client repeats)
     if hs.load_wait and clock() - hs.load_wait < 10 then return end
     -- the save's records still being put back (world just loaded): done now
@@ -2252,13 +2499,16 @@ local function on_pid(f, pc)
         end
     end
     -- an id that comes after the first character spawned (the gate gave up):
-    -- the restore still runs, on the character as it is
-    p = { key = key, sid = sid, guid = guid, name = name, joined = clock(), late = r.spawned_once == true }
+    -- the restore still runs, on the character as it is (a move by the host
+    -- since then, noted on the placeholder record, is kept: M.note_moved)
+    local moved = p and p.moved_by_host or nil
+    p = { key = key, sid = sid, guid = guid, name = name, joined = clock(), late = r.spawned_once == true,
+          moved_by_host = r.spawned_once == true and moved or nil }
     P[r.key] = p
     decide(r, p)
 end
 
-local function on_prog(f, pc, final)
+local function on_prog(f, pc)
     if not S or S.role ~= "host" then return end
     local pl = players_mod()
     local r = pl and pl.record_for and pl.record_for(pc)
@@ -2269,7 +2519,16 @@ local function on_prog(f, pc, final)
         local vals = prog.decode_values(f[2])
         if vals and next(vals) then p.prog = vals end
     end
-    if f[3] and f[3] ~= "" and f[3] ~= "?" then p.tree = parse_list(f[3]) end
+    if f[3] and f[3] ~= "" and f[3] ~= "?" then
+        p.tree = parse_list(f[3])
+        -- the same list answers the host's skill checks for this player
+        -- (sdc_skilltree; the client sends no SKTREE of its own then)
+        local tree = skilltree_mod()
+        if tree and tree.report then
+            local okt, terr = pcall(tree.report, pc, f[3], "PSPROG")
+            if not okt then log.err_throttled("persist-tree", "persist: skill list to sdc_skilltree: %s", tostring(terr)) end
+        end
+    end
     if f[4] and f[4] ~= "" and f[4] ~= "?" then p.hot = parse_list(f[4]) end
     -- a level, skill point, kill or skill-tree change is written soon
     -- (host_player), trickling XP with the next write
@@ -2279,7 +2538,6 @@ local function on_prog(f, pc, final)
     p.prog_at = clock()
     p.acked = true
     M.stats.prog_reports = M.stats.prog_reports + 1
-    if final then log.info("persist: %s's last progression report received", p.name) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -2517,9 +2775,13 @@ end
 -- May the player's first character spawn now? Waits for the id (PSID).
 function M.gate(r, now)
     if not S or S.role ~= "host" then return true end
+    -- the host has not let the player in yet (sdc_admin, join_access
+    -- approve: its answer; password: the player's): held, no give-up; the
+    -- wait for its id counts from the moment it is let in (r.access_ok_at)
+    if r.access == "wait" or r.access == "pw" then return false end
     local p = P[r.key]
     if p and (p.gen or p.nokey) then return true end
-    if (now or clock()) - (r.joined_at or clock()) >= PID_WAIT_S then
+    if (now or clock()) - (r.access_ok_at or r.joined_at or clock()) >= PID_WAIT_S then
         if not p then
             P[r.key] = { name = r.name, nokey = true }
             -- not a loss: a later PSID still restores and saves (on_id "late");
@@ -2530,6 +2792,27 @@ function M.gate(r, now)
         return true
     end
     return false
+end
+
+-- sdc_players (the host's pull): is this player's saved character still
+-- being put back, or may its id still come (no record yet, within PID_WAIT_S
+-- of the join)? Its restore would then move it to the saved spot again.
+function M.restoring(key)
+    if not S or S.role ~= "host" then return false end
+    local p = P[key]
+    if p then return p.restore ~= nil and not p.restored end
+    local r = S.remote and S.remote[key]
+    if not r then return false end
+    return clock() - (r.access_ok_at or r.joined_at or clock()) < PID_WAIT_S
+end
+
+-- sdc_players: the host moved this player's character (pull, unstuck, the
+-- fall check below): no fall check of the old spot any more, and a late id
+-- leaves the character where it is.
+function M.note_moved(key)
+    local p = P[key]
+    if not p then return end
+    p.fall, p.moved_by_host = nil, clock()
 end
 
 -- Spot of the first character: where the player left (alive), or a dead
@@ -2568,6 +2851,19 @@ end
 function M.steam_of(session_key)
     local p = P[session_key]
     return p and p.sid or nil
+end
+
+-- Vehicle code (a seat after a rejoin): the vehicle a returning player (host,
+-- session key) sat in when its record was written - { name, cls, x, y, z,
+-- seat } (name: the vehicle actor then; a vehicle spawned during play gets
+-- another name in a reloaded world: class + place) - or nil (not seated,
+-- dead, no record, an older record). persist itself seats nobody: the
+-- character comes at the vehicle's door.
+function M.saved_vehicle(session_key)
+    local p = P[session_key]
+    local pos = p and p.verdict == "restore" and p.restore and p.restore.pos
+    if type(pos) == "table" and pos.vehicle and type(pos.veh) == "table" then return pos.veh end
+    return nil
 end
 
 local function install_player_hooks()
@@ -2659,9 +2955,9 @@ local function on_delete_slot(name_p)
         nc > 0 and string.format(" (with %d committed record(s) and their files)", nc) or "")
 end
 
--- Both hooks of one save (the controller's SaveGameToSlot and EMS's
--- AsyncSaveActors inside it) give one write, 50 ms later (out of the
--- game's own call; sdc_savecheck's pre-save slot fix has run by then).
+-- One write per save, 50 ms after EMS's AsyncSaveActors started (out of the
+-- game's own call; sdc_savecheck's pre-save slot fix has run by then); a
+-- second call within that time adds nothing.
 local function schedule_save(why)
     if not S or S.role ~= "host" or hs.save_pending then return end
     hs.save_pending = true
@@ -2670,29 +2966,16 @@ end
 
 local function install_game_hooks()
     local h = hs.hooks
-    if not h.save and ue.find_object(SAVE_FN) then
-        h.save = true
-        -- Blueprint function: one callback, after the body (the async EMS
-        -- save has started; the slot name is set). Every save of the game
-        -- ends here (autosave, quick save key, pause menu, save menu, sleep).
-        local ok, err = pcall(RegisterHook, SAVE_FN, function(ctx_p)
-            local okc, e = pcall(function()
-                if not S or S.role ~= "host" then return end
-                schedule_save("(" .. ue.short(ctx_p and ctx_p:get()) .. ")")
-            end)
-            if not okc then log.err_throttled("persist-savehook", "persist: save hook: %s", tostring(e)) end
-        end)
-        log.info("persist: game save hook (SaveGameToSlot, post) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
-    end
     if not h.ems_save and ue.find_object(EMS_SAVE_FN) then
         h.ems_save = true
-        -- native static function (any EMS actor save, whoever starts it):
-        -- post (Context, ReturnValue, WorldContextObject, Data)
-        local ok, err = pcall(RegisterHook, EMS_SAVE_FN, function() end, function()
-            local okc, e = pcall(schedule_save, "(EMS AsyncSaveActors)")
-            if not okc then log.err_throttled("persist-emssave", "persist: EMS save hook: %s", tostring(e)) end
+        -- native static function: every save of the game runs it inside the
+        -- controller's SaveGameToSlot (autosave, quick save key, pause menu,
+        -- save menu, sleep). Pre only (Context, WorldContextObject, Data),
+        -- one engine hook shared with sdc_savecheck's (sdc_ue.hook_native)
+        local ok, err = ue.hook_native(EMS_SAVE_FN, "persist", function()
+            schedule_save("(EMS AsyncSaveActors)")
         end)
-        log.info("persist: EMS save hook (AsyncSaveActors, post) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+        log.info("persist: EMS save hook (AsyncSaveActors, pre) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     end
     -- The game's "actors saved" / "could not save" of the host's own save
     -- (Blueprint, post): the clients' records of that save are committed /
@@ -2727,25 +3010,33 @@ local function install_game_hooks()
             if not okc then log.err_throttled("persist-failhook", "persist: save failed hook: %s", tostring(e)) end
         end)
     end
+    -- the native pre-only hooks below go through sdc_ue.hook_native (one
+    -- engine hook per function, each subscriber in its own pcall)
     if not h.load and ue.find_object(CM.LOAD_FN) then
         h.load = true
         -- native static: pre (Context, WorldContextObject, ...): a load of
         -- the game, also during the session (CM.load_started)
-        local ok, err = pcall(RegisterHook, CM.LOAD_FN, function(_, wco_p)
-            local okc, e = pcall(CM.load_started, wco_p)
-            if not okc then log.err_throttled("persist-loadhook", "persist: load hook: %s", tostring(e)) end
-        end, function() end)
+        local ok, err = ue.hook_native(CM.LOAD_FN, "persist", function(_, wco_p) CM.load_started(wco_p) end)
         log.info("persist: game load hook (EMS AsyncLoadActors, pre) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     end
     if not h.delete and ue.find_object(DELETE_FN) then
         h.delete = true
         -- native: pre (Context, WorldContextObject, SaveGameName, UserIndex)
-        local ok, err = pcall(RegisterHook, DELETE_FN, function(_, _, name_p)
-            local okc, e = pcall(on_delete_slot, name_p)
-            if not okc then log.err_throttled("persist-delete", "persist: slot delete hook: %s", tostring(e)) end
-        end, function() end)
+        local ok, err = ue.hook_native(DELETE_FN, "persist", function(_, _, name_p) on_delete_slot(name_p) end)
         log.info("persist: slot delete hook (EMS DeleteAllSaveDataForSlot, pre) %s%s", ok and "ok" or "FAILED",
             ok and "" or (" " .. tostring(err)))
+    end
+    -- a remote player's character as the engine removes it (LV: leaving);
+    -- the class is in memory once a character exists
+    if not h.endplay and ue.find_object(LV.FN) then
+        h.endplay = true
+        local ok, err = pcall(RegisterHook, LV.FN, function(ctx_p, reason_p)
+            local okc, e = pcall(LV.on_end_play, ctx_p, reason_p)
+            if not okc then log.err_throttled("persist-endplay", "persist: character removal hook: %s", tostring(e)) end
+        end)
+        h.endplay_ok = ok == true
+        log.info("persist: character removal hook (BP_JigHelperComp ReceiveEndPlay: the moment a player leaves) %s%s",
+            ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     end
 end
 
@@ -2760,18 +3051,25 @@ on_left = function(skey, p)
     if not p.restored then
         -- left before the character was restored / ever played: whatever was
         -- saved stays as it was
+        if p.leave then delete_blobs(p.leave.slot, p.key .. LV.SUFFIX) end
         if p.base then live[p.key] = p.base end
         log.info("persist: %s left before the character was ready: %s", p.name,
             p.base and "the saved record is kept unchanged" or "nothing to save")
         return
     end
+    -- the character as the engine removed it (LV), when that was taken
+    local okl, used = pcall(LV.promote, p)
+    if not okl then used = "as last gathered (snapshot: " .. tostring(used) .. ")" end
     live[p.key] = make_record(p, "left")
     if enabled() then flush(cur_world_slot(), p.name .. " left") end
-    log.info("persist: %s left: %s", p.name, describe_rec(live[p.key]))
+    log.info("persist: %s left: %s - inventory / position / health %s", p.name, describe_rec(live[p.key]), tostring(used))
 end
 
 local function host_player(r, p, now)
     local pawn = ue.pawn_of(r.pc)
+    -- the current character, by name (LV: the snapshot of a removed one)
+    if pawn then p.pawn_name = ue.name(pawn) end
+    if p.leave then LV.tick(p, now) end
     -- restore steps
     local rs = p.restore
     if rs and not rs.host_done and pawn and r.spawned_once then
@@ -2800,7 +3098,19 @@ local function host_player(r, p, now)
         local loc = pawn and ue.location(pawn)
         if loc and loc.Z < z0 - 1500 then
             local pl = players_mod()
-            local spot, yaw = pl and pl.helpers and pl.helpers.near_host_spot(r.index or 1, 1)
+            -- sdc_players' host move: a clear spot, and the host's copy kept
+            -- from landing at the speed of its fall (its landing guard)
+            if pl and type(pl.host_move) == "function" then
+                local okm, moved = pcall(pl.host_move, r, "host")
+                if not okm then log.err("persist: %s's move next to the host: %s", p.name, tostring(moved)) end
+                if okm and moved then
+                    log.warn("persist: %s fell from the saved spot (z %.0f -> %.0f): moved next to the host", p.name, z0, loc.Z)
+                end
+            end
+            local spot, yaw = nil, nil
+            if not (pl and type(pl.host_move) == "function") then
+                spot, yaw = pl and pl.helpers and pl.helpers.near_host_spot(r.index or 1, 1)
+            end
             if spot then
                 net.send_to(r.pc, "UNSTUCKTO", string.format("%.0f", spot.X), string.format("%.0f", spot.Y),
                     string.format("%.0f", spot.Z), string.format("%.0f", yaw or 0), "host")
@@ -3116,25 +3426,58 @@ local function client_map()
             full > 0 and string.format("; %d undimmed by this pass", full) or "") or "")
 end
 
+-- Early id (config persist_early_id, on unless false): this game is in the
+-- host's world - its controller came from the host (Role AutonomousProxy;
+-- the menu world's own controller is Authority) - but has no character yet,
+-- when ue.in_main_menu() is true as well. The id goes out then, so the
+-- host's id gate (M.gate, PID_WAIT_S) has it before the first character
+-- spawns, and that character spawns at its saved spot (M.join_point). With
+-- the id sent only once the character existed, the gate always timed out:
+-- the character came at the join point and was moved afterwards (UNSTUCKTO).
+local function early_id_ok(pc)
+    if cfg.get("persist_early_id") == false then return false end
+    local ok, role = pcall(ue.role, pc)
+    return ok and role == (ue.ROLE_AUTONOMOUS or 2)
+end
+
 local function client_tick(now)
     if S.client ~= C.conn then
         C = { conn = S.client, pid_n = 0 }
     end
-    if ue.in_main_menu() then return end
     local pc = ue.local_pc()
     if not pc then return end
-    if not C.gen and C.pid_n < CLIENT_PID_MAX and (not C.pid_at or now - C.pid_at >= CLIENT_PID_EVERY) then
+    -- no own character (yet): the menu world before the host's, or the
+    -- host's world before the host spawned it (early id only there)
+    local pawnless = ue.in_main_menu()
+    if pawnless and not early_id_ok(pc) then return end
+    -- early sends do not count against CLIENT_PID_MAX: the host answers
+    -- only once its own world is up (on_pid), the client repeats until then
+    if not C.gen and (pawnless or C.pid_n < CLIENT_PID_MAX) and (not C.pid_at or now - C.pid_at >= CLIENT_PID_EVERY) then
         C.first_try = C.first_try or now
         local steam = package.loaded["sdc_steam"]
         local sid = steam and steam.own_id and steam.own_id() or nil
         if sid or now - C.first_try >= 3 then
             if net.send_to_host("PSID", sid or "-", own_guid(), cfg.player_name()) then
-                C.pid_n, C.pid_at = C.pid_n + 1, now
-                C.first_pid = C.first_pid or now
-                if C.pid_n == 1 then log.info("persist: own id sent to the host (%s)", sid and ("Steam " .. sid) or "no Steam") end
+                C.pid_at = now
+                local who = sid and ("Steam " .. sid) or "no Steam"
+                if pawnless then
+                    C.early_n = (C.early_n or 0) + 1
+                    if C.early_n == 1 then
+                        log.info("persist: own id sent to the host early (%s): in the host's world, no character yet;"
+                            .. " the host can spawn the saved character at its saved spot", who)
+                    end
+                else
+                    C.pid_n = C.pid_n + 1
+                    C.first_pid = C.first_pid or now
+                    if C.pid_n == 1 then
+                        log.info("persist: own id sent to the host (%s)%s", who, C.early_n
+                            and string.format("; %d early send(s) were not answered", C.early_n) or "")
+                    end
+                end
             end
         end
     end
+    if pawnless then return end   -- everything below needs the character
     if not C.gen or C.applied ~= C.gen then return end
     local pawn = ue.pawn_of(pc)
     if not C.acked then
@@ -3151,13 +3494,21 @@ local function client_tick(now)
     -- the host restores health / inventory once this character's HUD is up
     if C.want_ready and not C.done and (C.ready_n or 0) < 12 and now - (C.ready_at or 0) >= CLIENT_READY_EVERY then
         if pawn and ue.valid(ue.prop(pawn, "InGameUI")) and ue.prop(pawn, "PlayerDead?") ~= true then
-            if C.clear_ui and not C.cleared then
-                -- the character came with the starting kit (older host): the
+            if C.clear_ui and not C.cleared and now - (C.verdict_at or now) < READY_WAIT_S - 10 then
+                -- the saved inventory replaces what the character came with
+                -- (the starting kit, an item the game gave anyway): the
                 -- game's own load clears the inventory UI first (Event_LoadPlayer)
                 C.cleared = true
                 pcall(function() pawn.BP_JigMultiplayer:ClearJSIItems() end)
                 pcall(function() pawn.InGameUI:ClearContainers() end)
                 log.info("persist: inventory UI cleared for the host's restore (the game's load order)")
+            elseif C.clear_ui and not C.cleared then
+                -- the host restores on its own READY_WAIT_S after the spawn: a
+                -- clear this late could empty the restored screen. Not done;
+                -- an item left from before is asked about (sdc_consume, GHOSTQ).
+                C.cleared = true
+                log.warn("persist: the HUD came %d s after the host's verdict: inventory UI NOT cleared (the host may have restored it already)",
+                    now - (C.verdict_at or now))
             end
             net.send_to_host("PSRDY", C.gen)
             C.ready_n, C.ready_at = (C.ready_n or 0) + 1, now
@@ -3179,7 +3530,22 @@ local function client_tick(now)
     elseif now - (C.prog_at or 0) >= CLIENT_PROG_RESEND_S then send = true end
     if send and net.send_to_host("PSPROG", C.gen, vals, tlist, hot) then
         C.last_major, C.last_full, C.prog_at = major, full, now
+        if tlist ~= "?" then C.tree_sent = C.gen end
     end
+end
+
+-- sdc_skilltree (client): the host takes this player's skills from PSPROG
+-- now - its answer said so (C.tree_ok) and a report with the skill list
+-- went out for the current record; SKTREE is not needed meanwhile.
+function M.carries_tree()
+    return S ~= nil and S.role == "client" and C.conn ~= nil and C.conn == S.client and C.tree_ok == true
+        and C.gen ~= nil and C.applied == C.gen and C.tree_sent == C.gen
+end
+
+-- sdc_skilltree: the tree changed here (relock / unlock): the next tick
+-- checks the progression line (a skill change goes out at once).
+function M.prog_soon()
+    if type(C) == "table" then C.prog_check = nil end
 end
 
 local function on_set(f)
@@ -3191,6 +3557,7 @@ local function on_set(f)
     for x in tostring(f[5] or ""):gmatch("[^,]+") do flags[x] = true end
     C.gen, C.verdict_at = f[1], clock()
     C.want_ready, C.clear_ui = true, flags.clear == true
+    C.tree_ok = flags.tree == true   -- the host reads the skills from PSPROG (sdc_skilltree: no SKTREE then)
     C.done, C.ready_n, C.ready_at, C.cleared = nil, nil, nil, nil   -- a 2nd verdict (the host loaded a save): its own restore
     C.map_want, C.map_known, C.map_miss, C.map_toast = nil, {}, {}, nil   -- PSMAPSET follows (if any)
     C.share, C.share_miss, C.share_full_n = nil, nil, nil                 -- MAPSHARE follows (map_shared)
@@ -3205,6 +3572,7 @@ local function on_fresh(f)
     if not S or S.role ~= "client" then return end
     if C.gen and C.gen == f[1] then return end
     C.gen, C.verdict_at, C.want_ready = f[1], clock(), false
+    C.tree_ok = f[3] == "tree"
     C.done, C.ready_n, C.ready_at, C.cleared = nil, nil, nil, nil
     C.map_want, C.map_known, C.map_miss, C.map_toast = nil, {}, {}, nil
     C.share, C.share_miss, C.share_full_n = nil, nil, nil
@@ -3288,11 +3656,30 @@ local function on_mapshare(f)
     if #ids > 0 then C.map_at = 0 end   -- shown at the next tick
 end
 
+-- sdc_admin (ACCESS|ok: the host let this player in): the id goes again on
+-- the next tick, not up to CLIENT_PID_EVERY later (the host held its verdict).
+function M.id_soon()
+    if type(C) == "table" then C.pid_at = nil end
+end
+
 -- sdc_progress: has the host answered (a record or a new character)?
 function M.client_verdict_pending(now)
     if C.gen then return false end
     if not C.first_pid then return true end
     return (now or clock()) - C.first_pid < 15
+end
+
+-- sdc_ui (the join cover): how far this connection's character is on this
+-- client: { verdict = nil | "restore" | "fresh", applied = the record (or
+-- the new character) is applied here (sdc_progress), done = the host
+-- finished the restore (PSDONE; a move to the saved spot comes before it) }.
+function M.client_join_state()
+    if not S or S.role ~= "client" or C.conn == nil or C.conn ~= S.client then return {} end
+    return {
+        verdict = C.gen and (C.want_ready and "restore" or "fresh") or nil,
+        applied = C.gen ~= nil and C.applied == C.gen,
+        done = C.done == true,
+    }
 end
 
 -- ---------------------------------------------------------------------------
@@ -3327,8 +3714,13 @@ function M.reset(why)
         for _, p in pairs(P) do
             if p.key and p.restored then
                 p.last_why, any = "world closed", true
+                -- a character the engine removed just now (LV): as it was then
+                if p.leave then pcall(LV.promote, p) end
             end
         end
+    end
+    for _, p in pairs(P) do
+        if p.key and p.leave then delete_blobs(p.leave.slot, p.key .. LV.SUFFIX) end
     end
     if any then
         local ok, err = pcall(flush, cur_world_slot(), "world closed (" .. tostring(why) .. ")")
@@ -3390,14 +3782,15 @@ function M.status_line()
     for _ in pairs(live) do n = n + 1 end
     for _, p in pairs(P) do if p.key then c = c + 1 end end
     local s = M.stats
-    return string.format("persist: slot=%s records=%d connected=%d restores=%d (inv %d, fallback %d) fresh=%d | writes: docs=%d inv=%d copies=%d errors=%d | game saves=%d last=%s periodic=%d leaves=%d | hooks save=%s ems=%s saved=%s delete=%s | %s | map: recorded=%d sent=%d restored=%d (persist_map=%s) | share: places=%d sent=%d got=%d shown=%d explored_after=%d (map_shared=%s)",
+    return string.format("persist: slot=%s records=%d connected=%d restores=%d (inv %d, fallback %d) fresh=%d | writes: docs=%d inv=%d copies=%d errors=%d | game saves=%d last=%s periodic=%d leaves=%d | hooks ems=%s saved=%s delete=%s | %s | map: recorded=%d sent=%d restored=%d (persist_map=%s) | share: places=%d sent=%d got=%d shown=%d explored_after=%d (map_shared=%s)",
         cur_world_slot(), n, c, s.restores, s.inv_restored, s.inv_fallback, s.fresh, s.docs_written, s.blobs_written,
         s.blobs_copied, s.write_errors, s.host_saves, tostring(hs.last_save), s.periodic, s.leaves,
-        tostring(hs.hooks.save == true), tostring(hs.hooks.ems_save == true), tostring(hs.hooks.saved_ok == true),
+        tostring(hs.hooks.ems_save == true), tostring(hs.hooks.saved_ok == true),
         tostring(hs.hooks.delete == true), CM.status(),
         s.map_new, s.map_sent, s.map_restored, tostring(map_on()),
         map_count(hs.share and hs.share.union or C.share), s.share_sent, s.share_got, s.share_shown, s.share_found,
-        tostring(SHARE.on())) .. " | " .. poimarks.status()
+        tostring(SHARE.on())) .. string.format(" | leave: snapshots used=%d hook=%s", s.leave_snaps or 0,
+        tostring(hs.hooks.endplay_ok == true)) .. " | " .. poimarks.status()
 end
 
 local installed = false
@@ -3409,7 +3802,7 @@ function M.install(state)
     if installed then return end
     installed = true
     net.on("PSID", on_pid)
-    net.on("PSPROG", function(f, pc) on_prog(f, pc, false) end)
+    net.on("PSPROG", on_prog)
     net.on("PSRDY", on_ready)
     net.on("PSSET", on_set)
     net.on("PSFRESH", on_fresh)
@@ -3427,6 +3820,5 @@ end
 -- tests
 M._P, M._live, M._hs, M._C, M._docs = function() return P end, function() return live end, hs, function() return C end,
     function() return docs end
-M.NOSLOT = NOSLOT
 
 return M

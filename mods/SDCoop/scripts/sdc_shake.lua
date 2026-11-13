@@ -21,7 +21,8 @@
 --     of a recent explosion; no known explosion -> it plays as the game asked;
 --   * a player inside the zone whose own game started no shake gets one: the
 --     game's CameraShake_Explosion at the game's CameraShakeIntensity.
--- One shake per explosion and player. Config: explosion_shake_zone.
+-- One shake per explosion and player. Config: explosion_shake_zone (off: no
+-- hook is subscribed).
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -138,7 +139,10 @@ end
 -- every PlaySoundAtLocation. Dropped with the world (shake.reset).
 local explosive = {}
 
-local function on_sound(wco, sound, loc)
+-- PlaySoundAtLocation / SpawnSoundAtLocation(WorldContextObject, Sound,
+-- Location, ...), pre (subscribers of sdc_ue.hook_native: each runs in its
+-- own pcall there)
+local function on_sound(_, wco, sound, loc)
     if not enabled() or not coop() then return end
     local s = sound and sound:get()
     if not ue.valid(s) then return end
@@ -184,20 +188,15 @@ local function on_shake(ctx, shake, scale)
     if scale then pcall(function() scale:set(0.0) end) end
 end
 
+-- Only with explosion_shake_zone on (subscribed when it is on in co-op;
+-- sdc_ue.hook_native keeps a subscriber, so turned off later they return at once).
 local function install_hooks()
     st.hooks = true
-    local ok, err = ue.hook_native(SHAKE_FN, "shake", function(ctx, shake, scale)
-        local okc, e = pcall(on_shake, ctx, shake, scale)
-        if not okc then log.err_throttled("shake.hook", "shake: shake hook: %s", tostring(e)) end
-    end)
+    local ok, err = ue.hook_native(SHAKE_FN, "shake", on_shake)
     log.info("shake: ClientStartCameraShake hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     for _, path in ipairs(SOUND_FNS) do
         local fn = path:match(":([%w_]+)$")
-        local oks, errs = ue.hook_native(path, "shake", function(_, wco, sound, loc)
-            if not coop() then return end
-            local okc, e = pcall(on_sound, wco, sound, loc)
-            if not okc then log.err_throttled("shake.snd", "shake: sound hook: %s", tostring(e)) end
-        end)
+        local oks, errs = ue.hook_native(path, "shake", on_sound)
         log.info("shake: %s hook %s%s", fn, oks and "ok" or "FAILED", oks and "" or (" " .. tostring(errs)))
     end
 end
@@ -211,7 +210,7 @@ function M.tick()
         st.pending, st.give_at = nil, nil
         return
     end
-    if not st.hooks then install_hooks() end
+    if not st.hooks and enabled() then install_hooks() end
     local t = clock()
     local p = st.pending
     if p and t - p.t >= DECIDE_AFTER then

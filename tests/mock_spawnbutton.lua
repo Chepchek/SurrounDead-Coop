@@ -1,5 +1,5 @@
--- Mock harness for sdc_respawn / sdc_players (unstuck, respawn screen, skip-save)
--- / sdc_localinit (Event_LoadLevel block). usage: lua mock_respawn.lua <scripts dir>
+-- Mock harness for sdc_respawn: the respawn screen's spawn-point button (one hook,
+-- respawn at the own point, point changes logged). usage: lua mock_spawnbutton.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
 

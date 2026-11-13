@@ -122,6 +122,10 @@ local SLEEP_EXIT_FN = "/Game/UI/Widgets/Buildable/SleepingUI.SleepingUI_C:Exit"
 local SLEEP_ANIM_S = 2.5        -- SleepingUI: Delay(2.5) after the button, then Exit
 local LEGACY_SLEEP_S = 20       -- an older client's SLEEP (no waiting window) counts this long
 local ANSWER_WAIT_S = 6         -- a client with no answer from the host stops waiting
+local HURT_HP = 3               -- a sleeper's health fell more than this within a tick: hurt, it gets up
+-- (2b "hurt": a hit, but also the game's own health drains: Bleed 2-4 every
+-- 1-2 s, HeavyBleed 4-6, thirst at 0 2-4 every 4-6 s, InfectionDamage,
+-- radiation; hunger alone, 2-3 every 6-8 s, never does)
 
 local TEXT = {
     -- co-op sleep (coop_sleep_all); counts are passed as strings ("?" possible)
@@ -132,6 +136,8 @@ local TEXT = {
                           "%s спит (%s/%s): ночь пройдёт, когда уснут все." },
     sleep_all         = { "Everyone is asleep: the night passes.", "Все уснули — ночь проходит." },
     sleep_late        = { "Morning has come: you get up.", "Наступило утро — вы встаёте." },
+    -- any fall > HURT_HP: a hit, bleeding, thirst, infection, radiation
+    sleep_hurt        = { "You are losing health: you wake up.", "Вы теряете здоровье — вы проснулись." },
     bed_slept     = { "%s went to sleep: the night passes.", "%s лёг спать — ночь проходит." },
     bed_sleep_off = { "The host does not let players skip the night.", "Хост не разрешает игрокам пропускать ночь." },
     bed_early     = { "It's too early to sleep yet, wait until 19:30.", "Ещё рано спать, подождите до 19:30." },
@@ -431,11 +437,12 @@ end
 
 local function install_respawn_hooks()
     if not hooks.get_gi and ue.find_object(GET_GI_FN) then
-        local ok, err = pcall(RegisterHook, GET_GI_FN, function(_, wco_p)
+        -- shared pre-only engine hook (sdc_ue.hook_native): no empty post callback
+        local ok, err = ue.hook_native(GET_GI_FN, "respawn.getgi", function(_, wco_p)
             local okc, e = pcall(on_get_game_instance, wco_p)
             if not okc then log.err_throttled("respawn.getgi", "respawn: GetGameInstance hook: %s", tostring(e)) end
-        end, function() end)
-        hooks.get_gi = ok
+        end)
+        hooks.get_gi = ok == true
         log.info("respawn: GetGameInstance pre-hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     end
     for _, h in ipairs(RESPAWN_RPCS) do
@@ -679,6 +686,21 @@ end
 -- coop_sleep_all (default on). The host keeps who sleeps:
 --   * a player sleeps from its "Sleep" press until it gets up (Esc in the
 --     sleep window), is hurt, dies, leaves, or the night is skipped / over;
+--   * hurt = its health fell more than HURT_HP within a 1 s tick. The health
+--     is the game's own on the host: MedicalComponent.Health of the host's
+--     character and of each client's server-side one (the host gets a hurt
+--     sleeping client up itself and tells it, BED|sleepst|hurt, then
+--     BED|sleepst|off|..|hurt: the mods up to 0.10.0 have no "hurt" state and
+--     would stay in bed, uncounted, but close the window on "off"; for a
+--     newer one the "off" finds nothing left to close).
+--     MedicalComponent does not replicate: a client's own copy stays 100, so
+--     a client reads what the host sends to its HUD (Client_UpdateHealthUI ->
+--     BP_Ingame.UpdateHealth -> HealthBar.PB_SetPercent(Health / 100),
+--     ProgressMethod 0: CurrentPercent; TargetPercent stays 1.0), as sdc_diag
+--     does (up to 0.10.0 inclusive it read the copy: a client never woke up
+--     when hurt). A death is not "hurt": the host drops a dead sleeper without
+--     "hurt", and a client does not show the "hurt" words when its character
+--     is dead or its health reads 0 (the HUD's 0 can come before PlayerDead?);
 --   * every connected player asleep in those hours: the host runs
 --     the game's Transition Time of Day(650, 2, 7, 2, false) - when the host's
 --     own press completes the set, the call the button made is that skip;
@@ -694,7 +716,8 @@ end
 -- a host that answered), SLEEP (an older client: asleep for LEGACY_SLEEP_S);
 -- host -> client BED|sleepst|state|n|N|name|event, state wait / skip / late
 -- (the night is over) / early (a Sleep in the day) / off (coop_sleep_all
--- off), event in / out / end / all / "".
+-- off; with event "hurt": the follow-up to a hurt for older mods) / hurt
+-- (only to the hurt client: it gets up), event in / out / end / all / "".
 -- Logged on both machines ("bed: ..."); the time jump itself in sdc_sync.
 
 local coop = { sleepers = {}, last = nil }   -- host: [controller name | "host"] = { name, since, till }
@@ -719,8 +742,20 @@ local function time_cause(text)
     if type(sync) == "table" and sync.note_time_cause then sync.note_time_cause(text, 15) end
 end
 
+-- Health of a character as the host has it (MedicalComponent.Health), or nil.
+local function host_hp(pawn)
+    return tonumber(ue.prop(ue.prop(pawn, "MedicalComponent"), "Health"))
+end
+
+-- This machine's own health, 0..100, or nil. A client: its HUD's health bar
+-- (the host's value; see "hurt" above), not its own MedicalComponent copy.
 local function own_hp()
-    return tonumber(ue.prop(ue.prop(ue.local_pawn(), "MedicalComponent"), "Health"))
+    local pawn = ue.local_pawn()
+    if S and S.role == "client" then
+        local p = tonumber(ue.prop(ue.prop(ue.prop(pawn, "InGameUI"), "HealthBar"), "CurrentPercent"))
+        return p and p * 100 or nil
+    end
+    return host_hp(pawn)
 end
 
 local function in_viewport(w)
@@ -858,7 +893,21 @@ on_sleep_status = function(state, n, total, name, event, from_host)
             stop_nap(state == "late" and "the night is over" or "not night yet", true)
         end
     elseif state == "off" then
-        stop_nap("the host's rule: any player's sleep skips the night (coop_sleep_all off)", true)
+        -- event "hurt": what the host adds after a "hurt" for older mods (here
+        -- the "hurt" already ended the waiting: nothing left to stop)
+        stop_nap(event == "hurt" and "hurt (the host saw the health fall)"
+            or "the host's rule: any player's sleep skips the night (coop_sleep_all off)", true)
+    elseif state == "hurt" then
+        -- the host saw this player's health fall (its server-side character)
+        if nap.active then
+            local pawn, hp = ue.local_pawn(), own_hp()
+            if not pawn or players.helpers.is_dead(pawn) or (hp and hp <= 0) then
+                stop_nap("the host saw the health fall: dead, no 'hurt' words", true)
+            else
+                log.say("sleep_hurt", "info", 5)
+                stop_nap("hurt (the host saw the health fall)", true)
+            end
+        end
     end
 end
 
@@ -1032,11 +1081,43 @@ local function on_sleep(f, pc)
         return
     end
     local now = os.clock()
-    coop.sleepers[id] = { name = name, since = now, till = (arg ~= "2") and (now + LEGACY_SLEEP_S) or nil }
+    coop.sleepers[id] = { name = name, since = now, till = (arg ~= "2") and (now + LEGACY_SLEEP_S) or nil,
+                          hp = host_hp(ue.pawn_of(pc)) }
     if arg ~= "2" then
         log.info("bed: %s pressed Sleep (an older mod: no waiting window, counted asleep for %d s)", name, LEGACY_SLEEP_S)
     end
     host_evaluate(name .. " pressed Sleep", name, "in")
+end
+
+-- Host: a sleeping client hurt (its server-side character's health fell
+-- more than HURT_HP since the last tick) gets up: it is told
+-- (BED|sleepst|hurt closes its window; then "off" with event "hurt", which
+-- closes it in the mods up to 0.10.0 that have no "hurt"), the others get the
+-- new count. A dead one (PlayerDead? or health 0) only stops counting: its
+-- own death screen, not the "hurt" words.
+local function watch_sleepers()
+    local list = S.remote_pcs or {}
+    for _, pc in ipairs(list) do
+        local id = ue.name(pc)
+        local sl = coop.sleepers[id]
+        local pawn = sl and ue.pawn_of(pc)
+        local hp = sl and host_hp(pawn)
+        if sl and (players.helpers.is_dead(pawn) or (hp and hp <= 0)) then
+            coop.sleepers[id] = nil
+            log.info("bed: %s died while asleep (health %s on the host): no longer counts as asleep", sl.name, tostring(hp))
+            host_evaluate(sl.name .. " died", sl.name, "out")
+        elseif sl and sl.hp and hp and hp < sl.hp - HURT_HP then
+            coop.sleepers[id] = nil
+            local n = 0
+            for _ in pairs(coop.sleepers) do n = n + 1 end
+            log.info("bed: %s was hurt while asleep (health %.0f -> %.0f on the host): gets up", sl.name, sl.hp, hp)
+            net.send_to(pc, "BED", "sleepst", "hurt", tostring(n), tostring(1 + #list), sl.name, "out")
+            net.send_to(pc, "BED", "sleepst", "off", "0", "0", sl.name, "hurt")
+            host_evaluate(sl.name .. " was hurt", sl.name, "out")
+        elseif sl and hp then
+            sl.hp = hp
+        end
+    end
 end
 
 -- Every second: this machine's own waiting; the host's bookkeeping.
@@ -1050,9 +1131,12 @@ local function sleep_tick()
         elseif not pawn or players.helpers.is_dead(pawn) then
             got_up("died or no character")
             close_wait_window("no living character")
-        elseif nap.hp and hp and hp < nap.hp - 3 then
-            got_up(string.format("hurt: health %.0f -> %.0f", nap.hp, hp))
-            close_wait_window("hurt")
+        elseif nap.hp and hp and hp < nap.hp - HURT_HP then
+            -- 0: the death (a client's HUD 0 can come before PlayerDead?): no "hurt" words
+            if hp > 0 then log.say("sleep_hurt", "info", 5) end
+            got_up(string.format("%s: health %.0f -> %.0f%s", hp > 0 and "hurt" or "died", nap.hp, hp,
+                S.role == "client" and " (HUD)" or ""))
+            close_wait_window(hp > 0 and "hurt" or "no living character")
         elseif S.role == "client" and nap.pending and now - nap.pressed_at > ANSWER_WAIT_S then
             log.info("bed: no answer from the host in %d s (an older mod?): the host decides the night", ANSWER_WAIT_S)
             stop_nap("no answer from the host", true)
@@ -1065,7 +1149,10 @@ local function sleep_tick()
         end
         if hp then nap.hp = hp end
     end
-    if S.role == "host" and next(coop.sleepers) then host_evaluate("tick") end
+    if S.role == "host" and next(coop.sleepers) then
+        watch_sleepers()
+        if next(coop.sleepers) then host_evaluate("tick") end
+    end
 end
 
 -- ---------------------------------------------------------------------------

@@ -223,6 +223,10 @@ local function new_jig(conts)
         calls[#calls + 1] = "SERVER_LoadSaveDataFromClientSide"
         self._p.MainJigContainers, self._p.MainContainersIDs, self._p.InventoryWeight = deep(c), deep(u), deep(w)
         self._p.__last_hot = deep(hot)
+        -- (a load hook running inside this call, as UE4SS runs post-hooks:
+        -- sdc_place.on_load - it must leave sdc_persist's own load alone)
+        local pl = package.loaded["sdc_place"]
+        if type(pl) == "table" and type(pl.on_load) == "function" and self._p.__owner then pl.on_load(self._p.__owner) end
     end
     jig._m.AddNewItemSomewhere = function(self, da, n, _, _, _, _, added)
         calls[#calls + 1] = "AddNewItemSomewhere " .. da._short .. " x" .. n
@@ -247,6 +251,7 @@ local function new_pawn(name, loc, kit)
     }, {})
     for _, f in ipairs({ "Client_UpdateHealthUI", "Client_UpdateHungerUI", "Client_UpdateThirstUI",
         "Client_UpdateStaminaUI", "Client_UpdateRadiationUI" }) do p._m[f] = call_rec(f) end
+    p._p.BP_JigMultiplayer._p.__owner = p
     return p
 end
 local function comp(cls, props, extra)
@@ -382,6 +387,7 @@ check(bob.pc._p.Pawn == nil, "first character waits for the id (gate)")
 deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob.pc)
 local fr = last("PSFRESH")
 check(fr and fr.to == bob.pc, "PSFRESH sent (no record)")
+check(fr and fr.args[3] == "tree", "PSFRESH says the host reads the skills from PSPROG (\"tree\")")
 local gen = fr.args[1]
 advance(3)
 host_tick()
@@ -390,8 +396,12 @@ check(bpawn ~= nil, "character spawned after the id")
 check(#bpawn._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i == 1, "fresh character has the starting kit")
 -- client reports progression
 local vals = "L.CurrentLevel=4;L.CurrentXP=321.5;L.CurrentMaxXP=900;P.CurrentFitnessLevel=3;P.StrengthMultiplier=1.25;P.FitnessMultiplierUsed?=1;T.SkillPoints=2;T.CurrentPoints=5;J.ZombieKills=17;J.DaysSurvived=3"
+local skt = require("sdc_skilltree")
+local fp0 = skt.stats.from_prog
 deliver("PSPROG", { gen, vals, "Skill_Parkour", "101:2:3:4,0:0:0:0,0:0:0:0" }, bob.pc)
+check(skt.stats.from_prog == fp0 + 1, "PSPROG's skill list goes to sdc_skilltree (the host's skill checks)")
 deliver("PSPROG", { "wronggen", "L.CurrentLevel=1", "-", "?" }, bob.pc)
+check(skt.stats.from_prog == fp0 + 1, "a PSPROG of another record (gen) does not")
 advance(16)   -- a level / skill change is written within PROG_WRITE_S
 host_tick()
 local files = persist.savegames_dir()
@@ -434,22 +444,25 @@ check(rec.vitals and rec.vitals.Health == 55 and rec.vitals["Bleed?"] == true an
 
 print("3. the game saves to a new slot: records go along")
 current_slot = "QuickSave1"
-local saveh = hooks["/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:SaveGameToSlot"]
-check(saveh and #saveh == 1, "SaveGameToSlot hook registered")
-saveh[1].pre(param(host_pc))
+-- 2026-11-13 (critic B1/B5): no SaveGameToSlot hook any more; EMS's
+-- AsyncSaveActors (every save runs it) is a pre-only shared hook (sdc_ue.hook_native)
+check(hooks["/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:SaveGameToSlot"] == nil,
+    "no SaveGameToSlot hook (AsyncSaveActors covers every save)")
+local emsh = hooks["/Script/EasyMultiSave.EMSAsyncSaveGame:AsyncSaveActors"]
+emsh = emsh and emsh[#emsh]
+check(emsh and emsh.pre and not emsh.post, "AsyncSaveActors hook registered (pre only)")
+emsh.pre(param(nil), param(host_pc), param(3))
 run_delayed()
 check(persist._hs.world_slot == "QuickSave1", "world slot follows the save")
 check(exists(SAVEDIR .. "QuickSave1_SDCoop.json") and exists(SAVEDIR .. "QuickSave1_SDCoop_s76561190000000001.sav"), "records + inventory in the new slot")
 check(persist.stats.host_saves == 1, "host save counted")
--- the same save seen by EMS's AsyncSaveActors too: still one write
-local emsh = hooks["/Script/EasyMultiSave.EMSAsyncSaveGame:AsyncSaveActors"]
-check(emsh and emsh[1] and emsh[1].post, "AsyncSaveActors hook registered")
-saveh[1].pre(param(host_pc)); emsh[1].post(param(nil), param(nil), param(host_pc), param(3))
+-- two calls within one save: still one write
+emsh.pre(param(nil), param(host_pc), param(3)); emsh.pre(param(nil), param(host_pc), param(3))
 run_delayed()
-check(persist.stats.host_saves == 2, "both hooks of one save: one write")
+check(persist.stats.host_saves == 2, "two calls of one save: one write")
 -- a save that EMS reports into the throwaway slot keeps the world's slot
 current_slot = "SDCoop_ClientTemp"
-emsh[1].post(param(nil), param(nil), param(host_pc), param(3))
+emsh.pre(param(nil), param(host_pc), param(3))
 run_delayed()
 check(persist._hs.world_slot == "QuickSave1" and not exists(SAVEDIR .. "SDCoop_ClientTemp_SDCoop.json"), "throwaway slot never gets records")
 current_slot = "QuickSave1"
@@ -484,7 +497,11 @@ deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob2.pc)
 local set = last("PSSET")
 check(set ~= nil and set.to == bob2.pc, "PSSET sent")
 check(set and set.args[2]:find("L.CurrentLevel=4", 1, true) and set.args[3] == "Skill_Parkour", "PSSET carries level and skills")
-check(set and set.args[5]:find("inv", 1, true) and not set.args[5]:find("clear", 1, true), "inventory flag, no UI clear (hooks in)")
+-- (0.9.x: the client clears its inventory UI whenever the saved inventory
+-- replaces the character's, hooks in or not: an item the game gave the new
+-- character anyway stayed on the client's screen, 0.8.1)
+check(set and set.args[5]:find("inv", 1, true) and set.args[5]:find("clear", 1, true), "inventory flag + UI clear (the saved inventory replaces the character's)")
+check(set and set.args[5]:find("tree", 1, true) ~= nil, "flag \"tree\": the host reads the skills from PSPROG")
 local gen2 = set.args[1]
 advance(3)
 host_tick()
@@ -495,6 +512,25 @@ check(l and l.X == 12345 and l.Y == -6789 and math.abs(l.Z - 486) < 1, "spawned 
 check(#b2pawn._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i == 0, "no starting kit")
 check(bob2.pc._p.LevellingComponent._p.CurrentLevel == 4 and bob2.pc._p.ZombieKills == 17, "host copy of the controller restored")
 check(calls[#calls] ~= "SERVER_LoadSaveDataFromClientSide", "inventory waits for the client")
+-- sdc_place, the real one: its load gate (on_load does nothing inside
+-- sdc_persist's own load) - with a rescue that, run inside the load, takes
+-- one item out as a real drop of a hidden item would (2026-11-14 review: the
+-- restore then "did not take" and the record's whole list was added on top)
+package.loaded["sdc_place"] = nil
+package.loaded["sdc_place"] = require("sdc_place")
+package.loaded["sdc_place"].init({ role = "host" })
+package.loaded["sdc_place"].got = {}
+package.loaded["sdc_place"].rescue = function(p, why)
+    local me = package.loaded["sdc_place"]
+    me.got[#me.got + 1] = { pawn = p, why = why, after = #calls }
+    if why == "load" then
+        for _, c in ipairs(p._p.BP_JigMultiplayer._p.MainJigContainers._i) do
+            if #c[F_ITEMS]._i > 0 then table.remove(c[F_ITEMS]._i, 1) break end
+        end
+    end
+    return 0
+end
+package.loaded["sdc_place"].calls0 = #calls
 deliver("PSRDY", { gen2 }, bob2.pc)
 advance(1)
 host_tick()
@@ -509,6 +545,21 @@ local cl = table.concat(calls, ",")
 check(cl:find("Medical.ComponentLoaded", 1, true) and cl:find("Client_UpdateHealthUI", 1, true), "game's load events / UI RPCs called")
 check(last("PSDONE") ~= nil, "PSDONE sent")
 check(persist.stats.inv_restored == 1, "inventory restore counted")
+do
+    local adds = 0
+    for i = package.loaded["sdc_place"].calls0 + 1, #calls do
+        if calls[i]:find("^AddNewItemSomewhere") then adds = adds + 1 end
+    end
+    check(adds == 0 and persist.stats.inv_fallback == 0 and package.loaded["sdc_place"].loading == false,
+        "a load hook inside the restore's own load takes nothing out before its check: no item-list rebuild on top")
+end
+do
+    local pl = package.loaded["sdc_place"]
+    local g, load_at = pl.got[1], nil
+    for i, c in ipairs(calls) do if c == "SERVER_LoadSaveDataFromClientSide" then load_at = i end end
+    check(#pl.got == 1 and g.pawn == b2pawn and g.why == "restore" and load_at ~= nil and load_at <= g.after,
+        "hidden items checked right after the load, in the same call (sdc_place.rescue)")
+end
 
 print("7. client side: the record is applied by the client")
 -- a separate client machine view
@@ -526,6 +577,7 @@ loops.persist(); loops.progress()
 local pid = last("PSID")
 check(pid and pid.args[1] == "76561190000000001" and pid.args[2]:match("^%x+$"), "client sends its SteamID and own id")
 deliver("PSSET", set.args)
+check(persist.carries_tree() == false, "client: the record is not applied yet: SKTREE still carries the skills")
 advance(7)
 loops.progress(); loops.persist(); run_delayed()
 check(cpc._p.LevellingComponent._p.CurrentLevel == 4 and cpc._p.LevellingComponent._p.CurrentXP == 321.5, "client copy: level / XP")
@@ -538,6 +590,16 @@ loops.persist()
 local prog = last("PSPROG")
 check(prog and prog.args[1] == set.args[1] and prog.args[2]:find("L.CurrentLevel=4", 1, true), "client reports progression with the record's gen")
 check(prog and prog.args[3] == "Skill_Parkour", "client reports its skills")
+check(persist.carries_tree() == true, "client: a PSPROG with the skills went out for this record: no SKTREE needed")
+local sk_before = 0
+for _, m in ipairs(sent) do if m.kind == "SKTREE" then sk_before = sk_before + 1 end end
+cpc._unlocked.Skill_HealthRegen = true   -- unlocked in the journal
+advance(4)
+loops.progress(); loops.skilltree(); loops.persist(); loops.skilltree()
+local sk_after, prog2 = 0, last("PSPROG")
+for _, m in ipairs(sent) do if m.kind == "SKTREE" then sk_after = sk_after + 1 end end
+check(sk_after == sk_before and prog2 and prog2.args[3] == "Skill_HealthRegen,Skill_Parkour",
+  "a new skill goes in PSPROG only (no SKTREE): " .. tostring(prog2 and prog2.args[3]))
 S.role = "host"; S.client = nil
 registry["PlayerController"] = { host_pc, bob2.pc }
 ue.forget_world()
@@ -603,15 +665,99 @@ local bob5 = connect("Bob5")
 sent = {}
 deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob5.pc)
 local set5 = last("PSSET")
+-- (0.9.x review) only the item list is left: its items are added to what
+-- the character has, no whole inventory reaches the client - a cleared
+-- screen would hide what the character keeps
+check(set5 and set5.args[5]:find("inv", 1, true) and not set5.args[5]:find("clear", 1, true),
+    "item-list restore: inventory flag, no UI clear")
 advance(3); host_tick()
 check(#bob5.pc._p.Pawn._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i == 0, "item-list restore: no starting kit either")
+-- sdc_place.rescue (items the restored data holds where that player's window
+-- never shows them - a wallet, a med bag): a spy, called with the character
+package.loaded["sdc_place"] = { got = {}, rescue = function(p, why)
+    local me = package.loaded["sdc_place"]
+    me.got[#me.got + 1] = { pawn = p, why = why, after = #calls }
+    return 0
+end }
 deliver("PSRDY", { set5.args[1] }, bob5.pc)
 advance(1); host_tick()
 local adds = 0
 for _, c in ipairs(calls) do if c:find("^AddNewItemSomewhere") then adds = adds + 1 end end
 check(adds >= 3 and persist.stats.inv_fallback >= 1, "items given back one by one from the record's list (" .. adds .. ")")
+do
+    local pl = package.loaded["sdc_place"]
+    local last_add = 0
+    for i, c in ipairs(calls) do if c:find("^AddNewItemSomewhere") then last_add = i end end
+    check(#pl.got == 1 and pl.got[1].pawn == bob5.pc._p.Pawn and pl.got[1].after >= last_add and last_add > 0,
+        "item-list restore: what landed where that window refuses it is checked after the adds (sdc_place.rescue)")
+end
+package.loaded["sdc_place"] = nil
 leave(bob5)
 advance(1); host_tick()
+-- 9d: the files were fine at the verdict (flag clear went out), gone at the
+-- restore: what the character held from before is not on the client's screen
+-- - logged (a block: this file is at Lua's 200-local limit)
+do
+local warns = {}
+local real_warn = log.warn
+log.warn = function(m, ...)
+    local ok, s = pcall(string.format, m, ...)
+    warns[#warns + 1] = ok and s or m
+    return real_warn(m, ...)
+end
+local function warned(pat) for _, w in ipairs(warns) do if w:find(pat, 1, true) then return w end end end
+local bob5b = connect("Bob5b")
+sent = {}
+deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob5b.pc)
+local set5b = last("PSSET")
+check(set5b and set5b.args[5]:find("inv", 1, true) and set5b.args[5]:find("clear", 1, true),
+    "inventory file there at the verdict: inventory flag + UI clear")
+advance(3); host_tick()
+local p5b = bob5b.pc._p.Pawn
+table.insert(p5b._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i, item("DA_Bandage", 2, 0))
+spit(mainblob, "garbage")
+spit(bakblob, "garbage")
+deliver("PSRDY", { set5b.args[1] }, bob5b.pc)
+advance(1); host_tick()
+check(warned("Bob5b's client cleared its inventory screen for this restore: 1 item(s) the character had here before may not show there") ~= nil,
+    "files gone after the verdict: the hidden item logged")
+leave(bob5b)
+advance(1); host_tick()
+-- the same with an empty character (the restore above wrote good files
+-- again): nothing to log
+warns = {}
+local bob5c = connect("Bob5c")
+sent = {}
+deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob5c.pc)
+local set5c = last("PSSET")
+advance(3); host_tick()
+spit(mainblob, "garbage")
+spit(bakblob, "garbage")
+deliver("PSRDY", { set5c.args[1] }, bob5c.pc)
+advance(1); host_tick()
+check(set5c and set5c.args[5]:find("clear", 1, true) and not warned("cleared its inventory screen"),
+    "an empty character: nothing hidden, nothing logged")
+leave(bob5c)
+advance(1); host_tick()
+-- the file loaded but did not take (the load ran: it sends the client the
+-- whole inventory as the host has it): nothing hidden, nothing logged
+warns = {}
+local bob5d = connect("Bob5d")
+sent = {}
+deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob5d.pc)
+local set5d = last("PSSET")
+advance(3); host_tick()
+local jig5d = bob5d.pc._p.Pawn._p.BP_JigMultiplayer
+table.insert(jig5d._p.MainJigContainers._i[1][F_ITEMS]._i, item("DA_Bandage", 2, 0))
+jig5d._m.SERVER_LoadSaveDataFromClientSide = function() calls[#calls + 1] = "SERVER_LoadSaveDataFromClientSide (no effect)" end
+deliver("PSRDY", { set5d.args[1] }, bob5d.pc)
+advance(1); host_tick()
+check(set5d and set5d.args[5]:find("clear", 1, true) and persist.stats.inv_fallback >= 3 and not warned("cleared its inventory screen"),
+    "the load ran but did not take: nothing logged about the screen")
+log.warn = real_warn
+leave(bob5d)
+advance(1); host_tick()
+end
 
 print("10. death: the record keeps no inventory (it is in the loot box)")
 local bob6 = connect("Bob6")
@@ -634,6 +780,7 @@ sent = {}
 deliver("PSID", { "76561190000000001", "00112233445566778899", "Bob" }, bob7.pc)
 local set7 = last("PSSET")
 check(set7 and set7.args[5]:find("dead", 1, true) and not set7.args[5]:find("inv", 1, true), "dead record: progression only")
+check(set7 and not set7.args[5]:find("clear", 1, true), "dead record: no UI clear (the character keeps its starting kit)")
 advance(3); host_tick()
 check(#bob7.pc._p.Pawn._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i == 1, "respawned with the starting kit")
 leave(bob7)
@@ -734,7 +881,7 @@ check(persist.stats.map_new == 4, "4 new places counted: " .. persist.stats.map_
 deliver("PSMAP", { mgen, "BP_POIManager_C_1=Pinewood" }, mia.pc)
 check(persist.stats.map_new == 4, "the same place again: nothing new")
 -- the game saves right away: the places are in the slot file at once
-saveh[1].pre(param(host_pc))
+emsh.pre(param(nil), param(host_pc), param(3))
 run_delayed()
 doc = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json"))
 rec = doc.players.s76561190000000077
@@ -855,6 +1002,349 @@ check(#zs == 2 and zs[1].args[3] == "2" and zs[2].args[2] == "2" and zn == 45, "
 check(persist.status_line():find("map: recorded=", 1, true) ~= nil, "status line has the map counters")
 leave(zed2)
 advance(1); host_tick()
+
+-- ======================================================================
+-- 2026-11-13 (backlog 9.2): the engine destroys a leaving player's character
+-- before any mod tick; leaving wrote what had been gathered (inventory up to
+-- 10 s old). Its BP_JigHelperComp's ReceiveEndPlay runs while it is
+-- destroyed: a snapshot then, used when the player is really leaving.
+print("14. leaving: the character as the engine removes it")
+local LEAVE_SAV = SAVEDIR .. "MapSlot_SDCoop_s76561190000000055_leave.sav"
+local lea = connect("Lea")
+sent = {}
+deliver("PSID", { "76561190000000055", "-", "Lea" }, lea.pc)
+advance(3); host_tick()
+local lpawn = lea.pc._p.Pawn
+check(lpawn ~= nil, "Lea spawned")
+advance(11); host_tick()   -- gathered and written: the starting kit (1 item)
+local LVFN = "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C:ReceiveEndPlay"
+local ep = hooks[LVFN]
+check(ep and ep[1] and ep[1].pre, "character removal hook registered (BP_JigHelperComp ReceiveEndPlay)")
+-- two things picked up and 40 m walked, then the connection drops at once
+local lj = lpawn._p.BP_JigMultiplayer._p.MainJigContainers._i
+table.insert(lj[2][F_ITEMS]._i, item("DA_Rifle", 1, 1))
+table.insert(lj[2][F_ITEMS]._i, item("DA_Ammo", 60, 2))
+lpawn._p.__loc = { X = 4000, Y = 4100, Z = 120 }
+local function helper_of(pawn, name)
+    return new_obj("BP_JigHelperComp_C", name or "BP_JigHelperComp", {}, { GetOwner = function() return pawn end })
+end
+ep[1].pre(param(helper_of(lpawn)), param(1))   -- EndPlayReason LevelTransition: not a leave
+check(not exists(LEAVE_SAV), "another EndPlay reason (level change): no snapshot")
+ep[1].pre(param(helper_of(lpawn)), param(0))   -- the engine: the controller goes, its character is destroyed
+check(exists(LEAVE_SAV), "snapshot written as the character is removed")
+leave(lea)
+advance(1); host_tick()
+doc = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json"))
+rec = doc.players.s76561190000000055
+check(rec and rec.why == "left" and rec.inv and rec.inv.items == 3,
+    "record: the inventory at the moment of leaving (3 items, not the 1 written before)")
+check(rec and rec.pos and rec.pos.x == 4000 and rec.pos.y == 4100, "record: the place at the moment of leaving")
+local lblob = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop_s76561190000000055.sav"):sub(9))
+local ln = 0
+for _, c in ipairs(lblob.JigContainers.__arr) do ln = ln + #c[F_ITEMS].__arr end
+check(ln == 3, "the inventory file holds the 3 items")
+check(not exists(LEAVE_SAV), "snapshot file removed once used")
+check(persist.stats.leave_snaps == 1 and persist.status_line():find("leave: snapshots used=1", 1, true) ~= nil, "counted")
+
+print("14b. a character removed while its player stays (respawn): the snapshot is not used")
+local lea2 = connect("Lea2")
+sent = {}
+deliver("PSID", { "76561190000000055", "-", "Lea" }, lea2.pc)
+local lset = last("PSSET")
+advance(3); host_tick()
+deliver("PSRDY", { lset.args[1] }, lea2.pc)
+advance(1); host_tick()
+local oldp = lea2.pc._p.Pawn
+advance(11); host_tick()
+table.insert(oldp._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i, item("DA_Bandage", 5, 7))
+ep[1].pre(param(helper_of(oldp)), param(0))
+check(exists(LEAVE_SAV), "snapshot of the removed living character taken")
+oldp._valid = false
+local newp = new_pawn("Respawned", { X = 100, Y = 100, Z = 100 })
+lea2.pc._p.Pawn = newp
+advance(1); host_tick()
+check(not exists(LEAVE_SAV), "the player is still here with a new character: the snapshot is thrown away")
+newp._p["PlayerDead?"] = true
+ep[1].pre(param(helper_of(newp, "H3")), param(0))
+check(not exists(LEAVE_SAV), "a dead character's removal: no snapshot (its death wrote the record)")
+newp._p["PlayerDead?"] = false
+leave(lea2)
+advance(1); host_tick()
+doc = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json"))
+rec = doc.players.s76561190000000055
+check(rec and (rec.inv == nil or rec.inv.items ~= 4), "the old character's 4 items were not taken for the record")
+
+print("14d. the world closes right after a character was removed: the record is as it was then")
+local lea3 = connect("Lea3")
+sent = {}
+deliver("PSID", { "76561190000000055", "-", "Lea" }, lea3.pc)
+local lset3 = last("PSSET")
+advance(3); host_tick()
+deliver("PSRDY", { lset3.args[1] }, lea3.pc)
+advance(1); host_tick()
+advance(11); host_tick()
+local p3 = lea3.pc._p.Pawn
+local n3 = 0
+for _, c in ipairs(p3._p.BP_JigMultiplayer._p.MainJigContainers._i) do n3 = n3 + #c[F_ITEMS]._i end
+table.insert(p3._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i, item("DA_Knife", 1, 9))
+ep[1].pre(param(helper_of(p3, "H4")), param(0))
+persist.reset("test: world closed")
+doc = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json"))
+rec = doc.players.s76561190000000055
+check(rec and rec.inv and rec.inv.items == n3 + 1 and not exists(LEAVE_SAV),
+    "world closed: the snapshot's " .. (n3 + 1) .. " items written, its file removed")
+leave(lea3)
+host_tick()
+
+print("14c. in a vehicle: which one and the seat are kept; the character comes back at its door")
+local function door_mesh()
+    return new_obj("SkeletalMeshComponent", "VehMesh", {}, { GetSocketLocation = function(_, s)
+        if s._fname == "DriverSide" then return { X = 9100, Y = 9200, Z = 50 } end
+        if s._fname == "PassengerSide" then return { X = 9300, Y = 9200, Z = 50 } end
+        return nil
+    end })
+end
+local veh = new_obj("BP_Sedan_C", "BP_Sedan_C_7", { Mesh = door_mesh(), __loc = { X = 9200, Y = 9200, Z = 40 } }, {})
+local vseats = {}
+package.loaded["sdc_vehicles"] = { seat_of = function(k) return vseats[k] end }
+local vic, pia = connect("Vic"), connect("Pia")
+deliver("PSID", { "76561190000000066", "-", "Vic" }, vic.pc)
+deliver("PSID", { "76561190000000067", "-", "Pia" }, pia.pc)
+advance(3); host_tick()
+local vpawn, ppawn = vic.pc._p.Pawn, pia.pc._p.Pawn
+vpawn._p["InVehicle?"] = true
+vpawn._p.VehicleDrivingComponent = new_obj("VehicleDrivingComponent_C", "VDC", { Vehicle = veh }, {})
+vseats[vic.key] = "driver"
+ppawn._m.GetAttachParentActor = function() return veh end   -- sdc_vehicles' passenger: attached, no game flag
+vseats[pia.key] = "passenger"
+advance(6); host_tick()
+leave(vic); leave(pia)
+advance(1); host_tick()
+doc = json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json"))
+local rv, rp = doc.players.s76561190000000066, doc.players.s76561190000000067
+check(rv and rv.pos.vehicle == true and rv.pos.veh and rv.pos.veh.name == "BP_Sedan_C_7" and rv.pos.veh.cls == "BP_Sedan_C"
+    and rv.pos.veh.seat == "driver" and rv.pos.veh.x == 9200, "driver: the vehicle, its place and the seat are in the record")
+check(rv and rv.pos.x == 9100 and rv.pos.y == 9200 and rv.pos.z == 110, "driver: the spot is the driver side door (as the game)")
+check(rp and rp.pos.vehicle == true and rp.pos.veh and rp.pos.veh.seat == "passenger" and rp.pos.veh.name == "BP_Sedan_C_7",
+    "passenger (attached, without the game's flag): the vehicle and the seat are in the record")
+check(rp and rp.pos.x == 9300, "passenger: the spot is the passenger side door")
+local vic2 = connect("Vic2")
+sent = {}
+deliver("PSID", { "76561190000000066", "-", "Vic" }, vic2.pc)
+local sv = persist.saved_vehicle(vic2.key)
+check(sv and sv.name == "BP_Sedan_C_7" and sv.seat == "driver", "a rejoin: saved_vehicle gives the vehicle code the vehicle and the seat")
+check(persist.saved_vehicle("nobody") == nil, "saved_vehicle of an unknown player: nil")
+advance(3); host_tick()
+local l2 = vic2.pc._p.Pawn and vic2.pc._p.Pawn._p.__loc
+check(l2 and l2.X == 9100 and l2.Y == 9200, "the character comes at the door; nobody is seated by persist")
+leave(vic2)
+advance(1); host_tick()
+package.loaded["sdc_vehicles"] = nil
+check(type(persist.files) == "table" and type(persist.files.blob_write) == "function" and type(persist.files.blob_load) == "function"
+    and persist.files.TAG == "_SDCoop", "the inventory file helpers for sdc_deathbox (persist.files)")
+
+-- ======================================================================
+-- 2026-11-13 (skeptic of backlog 9.2 / 9.4): guards no test held - each could
+-- be removed with every check still green.
+print("15. leaving: whose snapshot, how old, after a respawn; the files of unused ones")
+;(function()   -- (the main chunk is at Lua's 200-locals limit)
+local function pdata(key) for _, q in pairs(persist._P()) do if q.key == key then return q end end end
+local function items_of(pawn)
+    local k = 0
+    for _, c in ipairs(pawn._p.BP_JigMultiplayer._p.MainJigContainers._i) do k = k + #c[F_ITEMS]._i end
+    return k
+end
+local function rec_of(key) return json_dec(slurp(SAVEDIR .. "MapSlot_SDCoop.json")).players[key] end
+local function join(name, sid)
+    local r = connect(name)
+    sent = {}
+    deliver("PSID", { sid, "-", name }, r.pc)
+    local a = last("PSSET") or last("PSFRESH")
+    advance(3); host_tick()
+    if a and a.kind == "PSSET" then deliver("PSRDY", { a.args[1] }, r.pc); advance(1); host_tick() end
+    advance(11); host_tick()   -- gathered and written
+    return r
+end
+local function leave_file(sid) return SAVEDIR .. "MapSlot_SDCoop_s" .. sid .. "_leave.sav" end
+
+-- 15a. two players' characters removed in the same moment: each record gets its own
+local ann, ben = join("Ann", "76561190000000031"), join("Ben", "76561190000000032")
+local apawn, bpawn2 = ann.pc._p.Pawn, ben.pc._p.Pawn
+local na, nb = items_of(apawn), items_of(bpawn2)
+table.insert(apawn._p.BP_JigMultiplayer._p.MainJigContainers._i[2][F_ITEMS]._i, item("DA_Ammo", 10, 5))
+for k = 1, 2 do table.insert(bpawn2._p.BP_JigMultiplayer._p.MainJigContainers._i[2][F_ITEMS]._i, item("DA_Bandage", k, 5 + k)) end
+ep[1].pre(param(helper_of(apawn, "HA")), param(0))
+ep[1].pre(param(helper_of(bpawn2, "HB")), param(0))
+leave(ann); leave(ben)
+advance(1); host_tick()
+local ra, rb = rec_of("s76561190000000031"), rec_of("s76561190000000032")
+check(ra and ra.inv and ra.inv.items == na + 1 and rb and rb.inv and rb.inv.items == nb + 2,
+    "two characters removed at once: each record holds its own player's things (" .. tostring(ra and ra.inv and ra.inv.items)
+    .. "/" .. tostring(rb and rb.inv and rb.inv.items) .. ")")
+
+-- 15b. a snapshot older than LV.KEEP_S when the player is found gone (no tick in between): not used
+local cal = join("Cal", "76561190000000033")
+local cpawn5 = cal.pc._p.Pawn
+local nc = items_of(cpawn5)
+table.insert(cpawn5._p.BP_JigMultiplayer._p.MainJigContainers._i[2][F_ITEMS]._i, item("DA_Rifle", 1, 8))
+ep[1].pre(param(helper_of(cpawn5, "HC")), param(0))
+check(exists(leave_file("76561190000000033")), "(snapshot taken)")
+advance(20)
+leave(cal)
+host_tick()
+local rc = rec_of("s76561190000000033")
+check(rc and rc.inv and rc.inv.items == nc and not exists(leave_file("76561190000000033")),
+    "a snapshot 20 s old is not used (the record is as last gathered), its file goes")
+
+-- 15c. a snapshot of a character that is no longer the player's: not used
+local dan = join("Dan", "76561190000000034")
+local dpawn = dan.pc._p.Pawn
+local nd = items_of(dpawn)
+table.insert(dpawn._p.BP_JigMultiplayer._p.MainJigContainers._i[2][F_ITEMS]._i, item("DA_Knife", 1, 8))
+ep[1].pre(param(helper_of(dpawn, "HD")), param(0))
+pdata("s76561190000000034").pawn_name = "SomeOtherCharacter"   -- (as if the current one changed without a tick)
+leave(dan)
+advance(1); host_tick()
+local rd = rec_of("s76561190000000034")
+check(rd and rd.inv and rd.inv.items == nd and not exists(leave_file("76561190000000034")),
+    "a snapshot of another character is not used, its file goes")
+
+-- 15d. died, respawned and left within 5 s (before the next gathering knew it lives): alive, with the snapshot's things
+local eli = join("Eli", "76561190000000035")
+local epawn = eli.pc._p.Pawn
+epawn._p["PlayerDead?"] = true
+eli.dead = true
+advance(6); host_tick()
+check(rec_of("s76561190000000035").alive == false, "(Eli's death written)")
+local epawn2 = new_pawn("EliRespawned", { X = 700, Y = 700, Z = 100 })
+table.insert(epawn2._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i, item("DA_Bandage", 3, 2))
+eli.pc._p.Pawn = epawn2
+eli.dead = false
+advance(1); host_tick()   -- the new character is the current one; the 5 s gathering is not due yet
+ep[1].pre(param(helper_of(epawn2, "HE")), param(0))
+leave(eli)
+advance(1); host_tick()
+local re = rec_of("s76561190000000035")
+check(re and re.alive == true and re.inv and re.inv.items == items_of(epawn2),
+    "respawned and left within 5 s: the record is alive with the new character's things (not dead, not empty)")
+
+-- 15e. a snapshot of a player who leaves before its character counts as restored: its file goes
+local fay = join("Fay", "76561190000000036")
+ep[1].pre(param(helper_of(fay.pc._p.Pawn, "HF")), param(0))
+check(exists(leave_file("76561190000000036")), "(snapshot taken)")
+pdata("s76561190000000036").restored = false
+leave(fay)
+advance(1); host_tick()
+check(not exists(leave_file("76561190000000036")), "left before the restore counted: the unused snapshot file is deleted")
+
+-- 15f. the world closes with persist_clients turned off after a snapshot: its file goes
+local gus = join("Gus", "76561190000000037")
+ep[1].pre(param(helper_of(gus.pc._p.Pawn, "HG")), param(0))
+check(exists(leave_file("76561190000000037")), "(snapshot taken)")
+cfg.set("persist_clients", false)
+persist.reset("test: world closed, saving off")
+cfg.set("persist_clients", true)
+check(not exists(leave_file("76561190000000037")), "world closed with saving off: the unused snapshot file is deleted")
+leave(gus)
+host_tick()
+
+end)()
+
+print("16. client: the host reads the skills from PSPROG only when it says so (PSFRESH / PSSET \"tree\")")
+;(function()
+local function client_view(id)
+    S.role = "client"; S.client = { id = id }; S.remote = {}
+    local pc = new_pc("ClientPC" .. id, false)
+    registry["PlayerController"] = { pc }
+    ue.forget_world()
+    local pawn = new_pawn("ClientChar" .. id, { X = 0, Y = 0, Z = 0 })
+    pawn._p.InGameUI = hud
+    pc._p.Pawn = pawn
+    sent = {}
+    return pc
+end
+local function count_kind(kind) local k = 0; for _, m in ipairs(sent) do if m.kind == kind then k = k + 1 end end; return k end
+local function client_run(s)
+    for _ = 1, s do advance(1); loops.progress(); loops.persist(); loops.skilltree(); run_delayed() end
+end
+-- an older host: PSFRESH with two fields - it still needs SKTREE
+local opc = client_view(21)
+loops.persist()
+deliver("PSFRESH", { "gOld", "1" })
+client_run(8)
+local op = last("PSPROG")
+check(op and op.args[1] == "gOld" and op.args[3] ~= "?", "(old host: the record is applied, PSPROG with the skill list went out)")
+check(persist.carries_tree() == false, "an older host (no \"tree\" in PSFRESH): the skills are NOT taken as carried by PSPROG")
+local sk0 = count_kind("SKTREE")
+opc._unlocked.Skill_Parkour = true
+client_run(4)
+check(count_kind("SKTREE") > sk0, "an older host: a skill change still goes out as SKTREE")
+-- a newer host: PSFRESH "tree"; the skill list unreadable for a while ("?") does not count as carried
+local npc = client_view(22)
+loops.persist()
+local real_tech = npc._p.TechTreeComponent
+npc._p.TechTreeComponent = nil
+deliver("PSFRESH", { "gNew", "1", "tree" })
+client_run(8)
+local np = last("PSPROG")
+check(np and np.args[1] == "gNew" and np.args[3] == "?", "(new host: a PSPROG went out without a skill list: \"?\")")
+check(persist.carries_tree() == false, "a PSPROG without the skill list (\"?\"): not carried yet")
+npc._p.TechTreeComponent = real_tech
+client_run(5)
+check(persist.carries_tree() == true, "a newer host (\"tree\"): once a PSPROG with the list went out, it carries the skills")
+S.role = "host"; S.client = nil; S.remote = {}
+registry["PlayerController"] = { host_pc }
+ue.forget_world()
+
+end)()
+
+print("17. client: the inventory UI is cleared before the restore (flag clear), not after the host's own restore time")
+;(function()
+local function client_view(id, with_hud)
+    S.role = "client"; S.client = { id = id }; S.remote = {}
+    local pc = new_pc("ClientPC" .. id, false)
+    registry["PlayerController"] = { pc }
+    ue.forget_world()
+    local pawn = new_pawn("ClientChar" .. id, { X = 0, Y = 0, Z = 0 })
+    pawn._p.BP_JigMultiplayer._m.ClearJSIItems = call_rec("ClearJSIItems " .. id)
+    if with_hud then pawn._p.InGameUI = hud end
+    pc._p.Pawn = pawn
+    sent = {}
+    return pawn
+end
+local function cleared(id)
+    for _, c in ipairs(calls) do if c == "ClearJSIItems " .. id then return true end end
+    return false
+end
+local function run(s) for _ = 1, s do advance(1); loops.progress(); loops.persist(); run_delayed() end end
+-- the HUD is up: cleared, then PSRDY
+client_view(31, true)
+loops.persist()
+deliver("PSSET", { "gC31", "", "-", "0", "inv,clear" })
+run(8)
+check(cleared(31), "flag clear, HUD up: the inventory UI cleared")
+check(last("PSRDY") ~= nil and last("PSRDY").args[1] == "gC31", "and PSRDY sent")
+-- the HUD comes 25 s after the verdict (the host restores on its own after
+-- 30 s): a clear could empty the restored screen - not done
+local p32 = client_view(32, false)
+loops.persist()
+deliver("PSSET", { "gC32", "", "-", "0", "inv,clear" })
+run(25)
+check(last("PSRDY") == nil, "(no HUD yet: no PSRDY)")
+p32._p.InGameUI = hud
+run(3)
+check(not cleared(32), "HUD 25 s after the verdict: the inventory UI NOT cleared")
+check(last("PSRDY") ~= nil and last("PSRDY").args[1] == "gC32", "PSRDY still sent")
+-- no flag: not cleared
+client_view(33, true)
+loops.persist()
+deliver("PSSET", { "gC33", "", "-", "0", "inv" })
+run(8)
+check(not cleared(33), "no flag clear: not cleared")
+S.role = "host"; S.client = nil; S.remote = {}
+registry["PlayerController"] = { host_pc }
+ue.forget_world()
+end)()
 
 print(string.format("%d checks, %s", checks, fails == 0 and "ALL OK" or (fails .. " FAILED")))
 os.exit(fails == 0 and 0 or 1)

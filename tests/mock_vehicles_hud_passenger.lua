@@ -1,5 +1,5 @@
 -- The host's vehicle panel (VehicleUI_C) as a passenger: the mock_vehicles harness (copied)
--- with panels that know whether they are on screen, and the passenger / promotion scenarios.
+-- with panels that know whether they are on screen, and the passenger / seat key scenarios.
 -- usage: lua mock_vehicles.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
@@ -426,18 +426,28 @@ T = T + 1.1
 V.tick()
 check(host_ch._parent == truck and panels() == 1, "P2: still one panel")
 
-print("P3. the client leaves: the host takes the wheel, no second get-in, its panel kept")
+print("P3. the client leaves: the host stays; its seat key takes the wheel, no second get-in, its panel kept")
 local n0 = getins()
 deliver("VEXIT", with(vstr(truck), "d", "20.0", "driver"), cl_pc)
 check(cl_ch._parent == nil and host_ch._parent == truck, "P3: client out, the host still sits")
-check(getins() == n0, "P3: the promotion runs no get-in")
+check(getins() == n0, "P3: the client's exit runs no get-in")
 check(panels() == 1 and truck._p.VehicleUI ~= nil and host_vp[1] == truck._p.VehicleUI,
     "P3: one panel, the host's own (not taken by the client's exit)")
 T = T + 1.1
 V.tick()
 check(panels() == 1, "P3: still one after the tick")
+-- the driver's exit moves nobody: the host stays a passenger until its seat
+-- key (SEATK.on_key, what the frame loop calls on the key's down edge)
+local hst = V._t.vs()[truck._addr]
+T = T + 0.5
+V.tick()
+check(hst and hst.host_seat == "passenger" and host_ch._parent == truck, "P3: 1.6 s after the client's exit: the host still a passenger")
+V._t.seatk.on_key()
+check(hst.host_seat == "driver" and host_ch._parent == truck and V.stats.promoted >= 1, "P3: the host's seat key: the wheel")
+check(getins() == n0, "P3: the move to the wheel runs no get-in")
+check(panels() == 1 and host_vp[1] == truck._p.VehicleUI, "P3: after the move: one panel, the host's own")
 
-print("P4. the host gets out after the promotion: none")
+print("P4. the host gets out after taking the wheel: none")
 T = T + 0.2
 truck:ExitVehicle()
 check(host_ch._parent == nil and panels() == 0, "P4: out, no panel")

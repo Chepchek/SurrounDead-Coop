@@ -53,6 +53,24 @@ local MAX_DMG = 100000
 
 local hooked = {}
 local seen = {}
+-- hooks whose Blueprint class is not loaded yet (it loads with the first
+-- weapon of its kind): the next try per hook (sdc_ue.backoff)
+local RETRY_S, RETRY_MAX_S = 1, 30
+local retry = {}
+
+local function due(key, now)
+    local r = retry[key]
+    return r == nil or now >= r.next_try
+end
+
+local function missed(key, now)
+    local r = retry[key]
+    if not r then
+        r = {}
+        retry[key] = r
+    end
+    ue.backoff(r, now, RETRY_S, RETRY_MAX_S)
+end
 
 local function once(key, fmt, ...)
     if seen[key] then return end
@@ -237,21 +255,24 @@ local function on_add_to_viewport(w)
     if M.stats.zero_hidden <= 2 then log.info("dmgnum: a 0 damage number of the local melee trace hidden") end
 end
 
+-- UserWidget.AddToViewport, pre: a subscriber of sdc_ue.hook_native (it runs
+-- in its own pcall there)
+local function on_viewport(ctx) on_add_to_viewport(ctx and ctx:get()) end
+
 local function hook_zero_filter()
     if zero_hooked or cfg.get("hide_zero_damage_numbers") == false then return end
     zero_hooked = true
-    local ok, err = ue.hook_native(VIEWPORT_FN, "dmgnum.zero", function(ctx)
-        local okc, e = pcall(on_add_to_viewport, ctx and ctx:get())
-        if not okc then log.err_throttled("dmgnum.zero", "dmgnum: zero filter: %s", tostring(e)) end
-    end)
+    local ok, err = ue.hook_native(VIEWPORT_FN, "dmgnum.zero", on_viewport)
     log.info("dmgnum: zero damage number filter %s%s", ok and "ok" or "FAILED ", ok and "" or tostring(err))
 end
 
--- Registered on both roles, once each class is loaded.
+-- Registered on both roles, once each class is loaded (retried until then,
+-- less often each time: at most every 30 s).
 function M.try_hooks()
+    local now = os.clock()
     if S and S.role == "client" then hook_zero_filter() end
-    if S and S.role == "client" and not head_hooked and marker_on() then
-        -- the firearm class loads with the first firearm: retried until then
+    if S and S.role == "client" and not head_hooked and marker_on() and due("head", now) then
+        -- the firearm class loads with the first firearm
         local ok = pcall(RegisterHook, TRACE_HEAD, function(_, loc_p)
             local okh, err = pcall(on_trace_head, loc_p)
             if not okh then log.err_throttled("dmgnum.head", "dmgnum: Trace_Headshot hook: %s", tostring(err)) end
@@ -259,10 +280,12 @@ function M.try_hooks()
         if ok then
             head_hooked = true
             log.info("dmgnum: Trace_Headshot hook ok (colour of the client's hit marker)")
+        else
+            missed("head", now)
         end
     end
     for kind, path in pairs(HOOKS) do
-        if not hooked[kind] then
+        if not hooked[kind] and due(kind, now) then
             local ok = pcall(RegisterHook, path, function(c, d, col, imp)
                 local okh, err = pcall(function() on_hit_ui(kind, c and c:get(), d, col, imp) end)
                 if not okh then log.err_throttled("dmgnum." .. kind, "dmgnum: %s hook: %s", kind, tostring(err)) end
@@ -270,6 +293,8 @@ function M.try_hooks()
             if ok then
                 hooked[kind] = true
                 log.info("dmgnum: %s Client_HitUI hook ok", kind)
+            else
+                missed(kind, now)
             end
         end
     end
@@ -304,13 +329,6 @@ function M.register_handlers()
             log.err_throttled("dmgnum.spawn", "dmgnum: SpawnDamageNumbers failed: %s", tostring(err))
         end
     end)
-end
-
-function M.report(reply)
-    local s = M.stats
-    reply(string.format("dmgnum: host forwarded %d, client native %d, client shown %d, failed %d | hit markers %d (head %d, from the host's bolt via sdc_throw: Client_HitUI skipped %d) failed %d, own headshot points %d",
-        s.host_forwarded, s.client_native, s.client_shown, s.failed, s.markers, s.markers_head, s.marker_skipped,
-        s.marker_failed, s.heads))
 end
 
 return M

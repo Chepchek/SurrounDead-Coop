@@ -46,16 +46,35 @@ local function find_in_tree(widget, name, depth)
     return nil
 end
 
--- Named child of a user widget: its variable, else GetWidgetFromName, else a
--- walk of its tree (designer widgets that are not variables: in game 0.8
--- GetWidgetFromName did not find MenuWidget's "MenuOverlay").
+-- Named child of a user widget, found with UFunctions only: GetWidgetFromName,
+-- else a walk of its tree with GetChildrenCount / GetChildAt (designer
+-- widgets that are not variables: in game 0.8 GetWidgetFromName did not find
+-- MenuWidget's "MenuOverlay").
+-- Never the widget Blueprint's own variable of that name (ue.prop(w, "Load")):
+-- UE4SS 3.0.1 (4fb9b615) keeps every by-name property lookup forever, keyed by
+-- the class's address. A level change can unload the widget's Blueprint class
+-- and load it again at the same address; the lookup then returns the freed
+-- property of the old class (crash in UE4SS, 2026-11-13: a client after a few
+-- failed joins, reading MenuWidget_C's "Load"). The walk starts at
+-- WidgetTree.RootWidget, read by name too, but both are C++ properties
+-- (UUserWidget, UWidgetTree): they are never freed and sit at the same offset
+-- in every user widget, so even a stale entry gives the right answer.
+local function m_widget_from_name(uw, name) return uw:GetWidgetFromName(FName(name)) end
+local function m_root_widget(uw) return uw.WidgetTree.RootWidget end
+local walk_logged = {}
 function W.child(user_widget, name)
-    local w = ue.prop(user_widget, name)
-    if ue.valid(w) then return w end
-    w = ue.try(function() return user_widget:GetWidgetFromName(FName(name)) end)
-    if ue.valid(w) then return w end
-    local root = ue.try(function() return user_widget.WidgetTree.RootWidget end)
-    return find_in_tree(root, name, 0)
+    if type(name) ~= "string" or name == "" or not ue.valid(user_widget) then return nil end
+    local ok, w = pcall(m_widget_from_name, user_widget, name)
+    if ok and ue.valid(w) then return w end
+    local okr, root = pcall(m_root_widget, user_widget)
+    if not okr then return nil end
+    w = find_in_tree(root, name, 0)
+    if w and not walk_logged[name] then
+        walk_logged[name] = true
+        log.info("ui: %s found by a walk of %s's widget tree (not by GetWidgetFromName)", name,
+            ue.class_name(user_widget))
+    end
+    return w
 end
 
 function W.visible(w)
@@ -109,15 +128,12 @@ function W.clone_text(src, label, outer)
     return t
 end
 
--- Adds `w` to `parent` right after `after` (or at the end), copying the slot
--- layout of `layout_from`.
-function W.insert_after(parent, w, after, layout_from)
+-- Adds `w` at the end of `parent`, copying the slot layout of `layout_from`.
+-- A live panel only appends: UPanelWidget::ShiftChild reorders the UMG slot
+-- array, not the Slate box on screen, so a new widget cannot be moved.
+function W.append(parent, w, layout_from)
     local slot = parent:AddChild(w)
     copy_slot(ue.prop(layout_from, "Slot"), slot)
-    if ue.valid(after) then
-        local idx = ue.try(function() return parent:GetChildIndex(after) end)
-        if idx and idx >= 0 then pcall(function() parent:ShiftChild(idx + 1, w) end) end
-    end
     return slot
 end
 
@@ -141,10 +157,14 @@ local function owner_of(w)
 end
 
 -- A button that looks like `orig` (a UButton with a TextBlock, possibly inside
--- a box), placed after `after` (default: right after `orig`) in orig's panel.
+-- a box), appended to orig's panel (W.append). `_after` is accepted for the
+-- callers but has no effect: a live panel cannot put it anywhere else.
 -- `owner` (optional) is the screen the button lives on: its clicks are polled
 -- only while that screen is on screen (see W.frame_tick / W.forget).
-function W.clone_button(orig, label, handler, after, owner)
+function W.clone_button(orig, label, handler, _after, owner)
+    -- GetOuter on a null object (not nil) crashes the game, pcall cannot
+    -- catch it; both callers run this inside pcall and log the error
+    if not ue.valid(orig) then error("clone_button: the source button is gone", 2) end
     local outer = ue.try(function() return orig:GetOuter() end)
     local b = W.new("Button", outer)
     pcall(function() b:SetStyle(orig.WidgetStyle) end)
@@ -166,7 +186,7 @@ function W.clone_button(orig, label, handler, after, owner)
     end
 
     local parent = ue.try(function() return orig:GetParent() end)
-    if ue.valid(parent) then W.insert_after(parent, b, after or orig, orig) end
+    if ue.valid(parent) then W.append(parent, b, orig) end
     W.on_click(b, label, handler, owner)
     return b
 end
@@ -280,8 +300,14 @@ end
 
 -- The game window that is open (inventory / trade / loot window, journal,
 -- map, pause menu...) when sdc_uiinput is loaded and on (config
--- game_ui_input), else nil.
+-- game_ui_input), else nil. The chat's input line (sdc_chat) counts while it
+-- holds the keyboard: no "back to game controls" takes it away mid-message.
 function W.game_window_open()
+    local chat = package.loaded["sdc_chat"]
+    if type(chat) == "table" and type(chat.holds_input) == "function" then
+        local okc, held = pcall(chat.holds_input)
+        if okc and held then return "the chat" end
+    end
     local ui = package.loaded["sdc_uiinput"]
     if type(ui) ~= "table" or type(ui.game_ui_open) ~= "function" then return nil end
     if type(ui.enabled) == "function" and not ui.enabled() then return nil end

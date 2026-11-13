@@ -23,12 +23,18 @@
 -- inherited handles and return at once) and exits with the game.
 -- Files in the helper's folder (see tools\steamlink\Ipc.cs):
 --   cmd_<session>_<n>.txt  mod -> helper, one command each (tmp + rename)
---   status.txt             helper -> mod, rewritten every second
+--   status.txt             helper -> mod, rewritten every second; read here
+--                          once a second in the menus, every 3 s in a world
+--                          (6 s while reads are slow), every tick (0.5 s)
+--                          only while a join is under way or a command waits
+--                          for its answer (status_due, read_gap; [PERF]: one
+--                          read costs ~7 ms in the game thread, 0.9.0 still
+--                          6-7.5 ms/s at one a second, a client once 274 ms)
 --   friends.txt            helper -> mod, friends in SurrounDead right now
 --   helper_log.txt         the helper's own log (English, SteamIDs only)
 --
 -- UI interface (work\steamlink_api.md): status(), friends(), join(id),
--- invite(). Nothing here touches engine objects except through
+-- invite(), invite_friend(id). Nothing here touches engine objects except through
 -- sdc_session.join_tunnel from the tick (game thread).
 -- Config: steam_link, steam_link_friends_only, steam_link_allow.
 
@@ -71,6 +77,11 @@ M._L = L   -- tests
 local TEXT = {
     sl_joining      = { "Connecting to %s through Steam...", "Подключение к %s через Steam..." },
     sl_wait_host    = { "%s has not opened a world yet: waiting up to 2 minutes...", "%s ещё не открыл мир — жду до 2 минут..." },
+    -- the host's Steam gives no answer at all (helper reason timeout / rendezvous)
+    sl_host_silent  = { "%s does not answer through Steam: their game may be closed or may have crashed. Trying again for up to 2 minutes...",
+                        "%s не отвечает через Steam — возможно, игра хоста закрыта или вылетела. Пробую снова до 2 минут..." },
+    sl_host_silent_left = { "%s does not answer: their game seems to have closed or crashed (you were connected %d s ago). Trying again for up to 2 minutes...",
+                        "%s не отвечает — похоже, игра хоста закрылась или вылетела (вы были подключены %d с назад). Пробую снова до 2 минут..." },
     sl_join_failed  = { "Could not connect to %s through Steam: %s.", "Не удалось подключиться к %s через Steam: %s." },
     sl_rejected     = { "%s lets in only Steam friends and invited players.", "%s пускает только друзей в Steam и приглашённых игроков." },
     sl_tunnel_lost  = { "The Steam connection to the host was lost.", "Связь с хостом через Steam потеряна." },
@@ -86,6 +97,8 @@ local TEXT = {
     sl_bad_id       = { "Not a Steam code (SteamID64, 17 digits).", "Это не код Steam (SteamID64, 17 цифр)." },
     sl_overlay      = { "The Steam overlay did not open (is it enabled for the game?).",
                         "Оверлей Steam не открылся (включён ли он для игры?)." },
+    sl_invite_cmd   = { "The Steam invite could not be handed to the Steam helper.",
+                        "Не удалось передать приглашение помощнику Steam." },
     -- status() details
     sl_st_off       = { "Steam join is off (setting steam_link).", "Подключение через Steam выключено (настройка steam_link)." },
     sl_st_starting  = { "Starting the Steam connection...", "Запуск подключения через Steam..." },
@@ -93,6 +106,10 @@ local TEXT = {
     sl_st_ready     = { "Steam: ready.", "Steam: готово." },
     sl_st_hosting   = { "Open to Steam friends · connected: %d", "Открыт для друзей в Steam · подключено: %d" },
     sl_st_waiting   = { "Waiting for %s to open a world...", "Жду, пока %s откроет мир..." },
+    sl_st_silent    = { "%s does not answer (game closed or crashed?): trying again...",
+                        "%s не отвечает (игра закрыта или вылетела?) — пробую снова..." },
+    sl_st_silent_left = { "%s does not answer: the host's game seems to have closed or crashed. Trying again...",
+                        "%s не отвечает — похоже, игра хоста закрылась или вылетела. Пробую снова..." },
     sl_st_connected = { "Connected to %s through Steam (ping %s ms)", "Подключено к %s через Steam (пинг %s мс)" },
     sl_st_no_steam  = { "Steam is not available to the helper: start the game from Steam.",
                         "Steam недоступен помощнику: запустите игру через Steam." },
@@ -125,6 +142,13 @@ local REASON = {
 }
 -- failures worth retrying while the host may still be loading its world
 local RETRY = { not_hosting = true, timeout = true, rendezvous = true }
+-- ... of them, the host's Steam not answering at all: its game (with its
+-- helper) is not running - closed, crashed - or the network is in the way.
+-- not_hosting: its game runs, the world is not open yet. (13.11: after the
+-- host's game crashed, the client said "has not opened a world yet" for 2
+-- minutes; every answer had been "timeout".)
+local SILENT = { timeout = true, rendezvous = true }
+local LEFT_RECENT_S = 180   -- a join this soon after a connection to the same host ended says so
 
 -- The catalog joins sdc_log.TEXT, so log.say / log.tr (and sdc_i18n's
 -- language) work for these keys; never with kind "err", so they go to the
@@ -228,10 +252,10 @@ local function send(line)
         log.warn("steamlink: cannot hand a command to the helper (%s)", line:match("^%S+") or "?")
         return false
     end
+    L.sent_t = os.time()   -- its answer comes in status.txt: read it every tick for a while
     log.debug("steamlink: -> helper: %s", line)
     return true
 end
-M._send = send
 
 local function parse_status(text)
     if type(text) ~= "string" or not text:find("sdcoop_steamlink=1", 1, true) then return nil end
@@ -268,11 +292,32 @@ function M.persona()
     return L.persona
 end
 
+-- How far apart status.txt is read when nothing waits for the helper's
+-- answer (status_due): once a second in the menus, every STATUS_GAME_S in a
+-- world, at least SLOW_WAIT_S after a read that took SLOW_READ_MS or more.
+-- 13.11 (0.9.0): one read cost the host 7 ms on average (sl:status 6-7.5
+-- ms/s at one read a second, max 9-13 ms) and once held a client for 274 ms:
+-- the file is opened in the game thread, and the helper rewrites it every
+-- second (a virus scanner looks at it again each time).
+local STATUS_GAME_S = 3
+local SLOW_READ_MS = 30
+local SLOW_WAIT_S = 6
+local function read_gap()
+    local gap = (L.S and L.S.in_menu == false) and STATUS_GAME_S or 1
+    if L.read_slow then gap = math.max(gap, SLOW_WAIT_S) end
+    return gap
+end
+
+-- The helper runs: its status was fresh when it was last read (the helper
+-- rewrites it every second), and that read is recent for the current gap.
 local function helper_alive(now)
     local st = L.status
     if not st then return false end
     local t = tonumber(st.time)
-    return t ~= nil and math.abs((now or os.time()) - t) <= STALE_S
+    if t == nil then return false end
+    now = now or os.time()
+    local at = L.status_at or now
+    return math.abs(at - t) <= STALE_S and now - at <= STALE_S + read_gap()
 end
 
 -- Host: the ping (ms, -1 = not measured yet) of a player connected through
@@ -328,7 +373,6 @@ local function start_helper(why)
     L.host_sent, L.cfg_sent = nil, nil
     return okp and r1 == true
 end
-M._start_helper = start_helper
 
 local function ensure_helper(why, now)
     now = now or os.time()
@@ -348,8 +392,6 @@ end
 -- before each listen / join; this is the early one.)
 local function patch_net_driver()
     if L.ip_patched then return true end
-    local steam = steam_mod()
-    if steam and steam.ip_mode == false then return false end   -- steam_p2p experiment
     local okn, nd = pcall(require, "sdc_netdiag")
     if not okn or type(nd) ~= "table" then return false end
     if nd.ip_fallback then
@@ -376,11 +418,6 @@ function M.install(S, mod_dir, version)
         log.info("steamlink: off (config steam_link = false)")
         return
     end
-    if steam and steam.ip_mode == false then
-        L.enabled, L.off_reason = false, "steam_p2p"
-        log.info("steamlink: off (config steam_p2p = true: the engine's own Steam sockets are tried instead)")
-        return
-    end
     L.enabled = true
     L.exe_found = file_exists(L.exe)
     if not L.exe_found then
@@ -395,10 +432,24 @@ function M.install(S, mod_dir, version)
 end
 
 -- ---------------------------------------------------------------------------
--- Ticks (every 500 ms, game thread)
+-- Ticks (main.lua's loop, game thread)
 -- ---------------------------------------------------------------------------
 
+-- The real main menu (sdc_session.in_real_menu), not the own world without
+-- a character: dead / respawn screen, where S.in_menu is true as well.
+local function in_real_menu()
+    local S = L.S or {}
+    if not S.in_menu then return false end
+    local session = package.loaded["sdc_session"]
+    if type(session) == "table" and type(session.in_real_menu) == "function" then
+        local ok, real = pcall(session.in_real_menu)
+        return ok and real == true
+    end
+    return true
+end
+
 local function read_status(now)
+    L.reads = (L.reads or 0) + 1
     local text = read_file(path("status.txt"))
     local st = parse_status(text)
     if not st then return end
@@ -441,6 +492,7 @@ local function hosting_tick(now)
     local want = S ~= nil and S.role == "host" and S.in_menu == false
     if want then
         L.host_world = S.world_pc   -- the local controller of the world being hosted
+        L.host_menu_logged = nil
     elseif S ~= nil and S.role == "host" and L.host_sent == 1 then
         -- ue.in_main_menu() is also true while the host is dead (no own
         -- character on the menu map): the death / respawn screen is still the
@@ -449,15 +501,33 @@ local function hosting_tick(now)
         -- Steam hosting there closed every Steam friend's tunnel (0.7.0: a
         -- friend dropped 8 s after the host died). Players still connected keep
         -- it on in any case.
-        local same_world = L.host_world ~= nil and S.world_pc == L.host_world
+        -- The real main menu (its MenuWidget on screen) keeps the same
+        -- controller too: the pause / respawn screen's "Quit to main menu"
+        -- only streams the menu level into this world (13.11 19:00: kept as
+        -- "death / respawn screen", the friend left falling in a world without
+        -- ground). There the world is gone: sdc_session sends the players away
+        -- (HOSTMENU) and the Steam hosting goes - at once with nobody
+        -- connected, else after HOST_OFF_DELAY_S (their leaving goes through
+        -- the tunnel first); a friend's join waits for the host's next world
+        -- (not_hosting: sl_wait_host).
+        local real_menu = in_real_menu()
+        local same_world = not real_menu and L.host_world ~= nil and S.world_pc == L.host_world
         local players = #(S.remote_pcs or {}) > 0
-        if same_world or players then
+        if same_world or (players and not real_menu) then
             want = true
             if not L.host_kept_logged then
                 L.host_kept_logged = true
                 log.info("steamlink: hosting kept while the host is out of its character (%s)",
                     same_world and "same world: death / respawn screen" or "players still connected")
             end
+        elseif real_menu then
+            if not L.host_menu_logged then
+                L.host_menu_logged = true
+                log.info("steamlink: the host is in its main menu: Steam hosting withdrawn %s",
+                    players and string.format("in %d s (the players are told to leave first)", HOST_OFF_DELAY_S)
+                        or "now (nobody connected)")
+            end
+            if not players then L.host_off_since = math.min(L.host_off_since or now, now - HOST_OFF_DELAY_S) end
         end
     end
     if want then
@@ -533,6 +603,7 @@ local function join_tick(now)
     if j.connected then
         -- left the host (or the connection dropped): close the tunnel
         send("leave")
+        L.left = { sid = j.sid, t = now }   -- a join to it soon after that gets no answer: its game is gone
         clear_join("left the host")
         return
     end
@@ -586,7 +657,20 @@ local function join_tick(now)
             clear_join("own id")
         elseif RETRY[reason] and now < j.deadline then
             j.retry_at = now + JOIN_RETRY_S
-            if not j.wait_toasted then
+            j.silent = SILENT[reason] == true
+            if j.silent then
+                -- no answer at all: not "has not opened a world yet"
+                if not j.silent_toasted then
+                    j.silent_toasted = true
+                    local left = L.left
+                    if left and left.sid == j.sid and now - left.t <= LEFT_RECENT_S then
+                        j.silent_left = true
+                        notify("sl_host_silent_left", "warn", 10, { j.name, now - left.t }, { j.sid, now - left.t })
+                    else
+                        notify("sl_host_silent", "warn", 10, { j.name }, { j.sid })
+                    end
+                end
+            elseif not j.wait_toasted then
                 j.wait_toasted = true
                 notify("sl_wait_host", "info", 8, { j.name }, { j.sid })
             end
@@ -612,7 +696,7 @@ local function handle_invite(host, now)
     if S.role == "client" then
         if L.join and L.join.sid == host then return end
         M.join(host)   -- says why it cannot
-    elseif S.in_menu then
+    elseif in_real_menu() then
         M.join(host)
     elseif S.role == "host" then
         notify("sl_invite_host", "warn", 10)
@@ -637,7 +721,8 @@ local function invite_tick(now)
         local S = L.S or {}
         if now > p.until_t then
             L.pending_invite = nil
-        elseif S.in_menu and S.role ~= "client" then
+        elseif S.role ~= "client" and in_real_menu() then
+            -- the real main menu: a death in the single-player world is not it
             L.pending_invite = nil
             M.join(p.sid)
         end
@@ -665,10 +750,44 @@ local function parse_friends(text)
 end
 M._parse_friends = parse_friends
 
+-- A file read timed into sdc_ue's [PERF] "parts" ("sl:status", "sl:friends":
+-- the steamlink task's share that reads files; the rest of the tick reads
+-- none). A read of SLOW_READ_MS or more (either file: the same folder, the
+-- same virus scanner) spaces the next status reads out (read_gap), logged
+-- once and then at most every SLOW_LOG_S. Only a fast status.txt read ends
+-- that: a quick friends.txt read in the same tick (the list changed) must not
+-- cut short the pause a slow status read has just set (skeptic, 13.11 item 18).
+local SLOW_LOG_S = 600
+local function timed(label, fn, ...)
+    local t0 = os.clock()
+    local a, b = fn(...)
+    local ms = (os.clock() - t0) * 1000
+    local ss = ue.sub_stats
+    if type(ss) == "table" then
+        local s = ss[label]
+        if not s then s = { calls = 0, ms = 0, wmax = 0 }; ss[label] = s end
+        s.calls, s.ms = s.calls + 1, s.ms + ms
+        if ms > (s.wmax or 0) then s.wmax = ms end
+    end
+    if ms >= SLOW_READ_MS then
+        local now = os.time()
+        if not L.slow_logged or now - L.slow_logged >= SLOW_LOG_S then
+            L.slow_logged = now
+            log.warn("steamlink: reading the helper's %s took %.0f ms (a virus scanner on the mod folder?);"
+                .. " status.txt is read at most every %d s while reads are this slow",
+                (label:gsub("^sl:", "")) .. ".txt", ms, SLOW_WAIT_S)
+        end
+        L.read_slow = true
+    elseif label == "sl:status" then
+        L.read_slow = false
+    end
+    return a, b
+end
+
 local function friends_tick()
     local st = L.status
     if not st or st.friends_seq == L.friends_seq then return end
-    local list, seq = parse_friends(read_file(path("friends.txt")))
+    local list, seq = parse_friends(timed("sl:friends", read_file, path("friends.txt")))
     if list and seq == st.friends_seq then
         L.friends = list
         L.friends_seq = seq
@@ -692,11 +811,29 @@ local function watch_helper(now)
     if needed then ensure_helper("needed again", now) end
 end
 
+-- Read status.txt on this tick? Every tick (0.5 s) while a join is under
+-- way (its steps come ~100 ms apart) or for SENT_FAST_S after a command (its
+-- answer: hosting, invite); else every read_gap() seconds (1 s in the menus,
+-- 3 s in a world, 6 s after a slow read).
+local SENT_FAST_S = 2
+local function status_due(now)
+    local j = L.join
+    if j and not j.connected then return true end
+    if L.sent_t ~= nil and now - L.sent_t <= SENT_FAST_S then return true end
+    local last = L.read_t
+    return last == nil or now < last or now - last >= read_gap()
+end
+M._status_due = status_due   -- tests
+M._helper_alive = helper_alive   -- tests
+
 function M.tick()
     if not L.ip_patched then patch_net_driver() end
     if not L.enabled or not L.exe_found then return end
     local now = os.time()
-    read_status(now)
+    if status_due(now) then
+        L.read_t = now
+        timed("sl:status", read_status, now)
+    end
     config_tick()
     hosting_tick(now)
     join_tick(now)
@@ -709,8 +846,8 @@ end
 -- sdc_session.join -> here (a friend's Steam code)
 -- ---------------------------------------------------------------------------
 
--- Can a Steam code be joined through the helper? (else sdc_session uses the
--- engine's own steam.<id> path)
+-- Can a Steam code be joined through the helper? (else sdc_session says why
+-- not: status().detail_key sl_st_off / sl_no_helper)
 function M.usable()
     return L.enabled and L.exe_found
 end
@@ -736,6 +873,17 @@ function M.request_tunnel(sid)
     L.join = { sid = sid, name = friend_name(sid), deadline = now + JOIN_WAIT_S, attempt = 0 }
     send_join(now)
     notify("sl_joining", "info", 6, { L.join.name }, { sid })
+    return true
+end
+
+-- Stops a Steam join whose tunnel is still being built or retried (the game
+-- is not connecting through it yet): for a Cancel on the join screen and
+-- the console (sdcoop_steam cancel). Returns true when one was stopped.
+function M.cancel(why)
+    local j = L.join
+    if not j or j.connected or j.opened then return false end
+    send("leave")
+    clear_join(why or "cancelled")
     return true
 end
 
@@ -794,6 +942,8 @@ function M.status()
             return detail(s, "sl_st_connected", j.name, (ping and ping >= 0) and tostring(ping) or "?")
         end
         s.state = "joining"
+        s.silent = j.silent == true   -- the host's Steam gives no answer (its game closed / crashed?)
+        if j.silent then return detail(s, j.silent_left and "sl_st_silent_left" or "sl_st_silent", j.name) end
         if j.retry_at or j.wait_toasted then return detail(s, "sl_st_waiting", j.name) end
         return detail(s, "sl_joining", j.name)
     end
@@ -839,7 +989,8 @@ function M.join(id)
     if restart_needed() then return refuse("sl_st_restart") end
     local S = L.S or {}
     if S.role == "client" then return refuse("already_client") end
-    if S.role == "host" and S.in_menu == false then return refuse("host_cannot_join") end
+    -- a dead host is still in its world (clients connected, progress unsaved)
+    if S.role == "host" and not in_real_menu() then return refuse("host_cannot_join") end
     if L.join and L.join.sid == id and not L.join.connected then return true end
     local session = package.loaded["sdc_session"]
     if type(session) ~= "table" or not session.join then return false, "no session", "no_session" end
@@ -852,7 +1003,6 @@ function M.join(id)
     end
     return true
 end
-M.join_friend = M.join
 
 -- Steam overlay invite dialog (the game's SteamCore; connect string
 -- "+sdcoop_join <own id>").
@@ -865,6 +1015,21 @@ function M.invite()
     return refuse(why == "no_steam" and "sl_st_no_steam" or "sl_overlay")
 end
 
+-- Host: a Steam invite to friend `id` (SteamID64) by the helper ("invite":
+-- Steam sends it, the helper lets that player in). Unlike the overlay
+-- dialog the mod knows who it is: the panel puts the friend on the host's
+-- allowed list (sdc_admin, join_access "invite only").
+function M.invite_friend(id)
+    id = tostring(id or ""):match("^%s*(%d+)%s*$")
+    if not L.enabled then return refuse("sl_st_off") end
+    if not L.exe_found then return refuse("sl_no_helper") end
+    if not is_steam_id(id) then return refuse("sl_bad_id") end
+    if id == own_id() then return refuse("sl_self") end
+    if not send("invite " .. id) then return refuse("sl_invite_cmd") end
+    log.info("steamlink: Steam invite to %s (sent by the helper)", id)
+    return true
+end
+
 -- One line for sdcoop_status / logs.
 function M.status_line()
     local s = M.status()
@@ -872,7 +1037,7 @@ function M.status_line()
         tostring(s.helper), s.peers or 0, #L.friends)
 end
 
--- Console: sdcoop_steam [friends | join <n|SteamID> | invite]
+-- Console: sdcoop_steam [friends | join <n|SteamID> | invite | cancel]
 function M.console(params, reply)
     local a1, a2 = params[1], params[2]
     a1 = a1 and tostring(a1) or nil
@@ -894,6 +1059,8 @@ function M.console(params, reply)
     elseif a1 == "invite" then
         local ok, why = M.invite()
         reply(ok and "invite dialog opened" or ("invite: " .. tostring(why)))
+    elseif a1 == "cancel" then
+        reply(M.cancel("cancelled from the console") and "Steam join cancelled" or "no Steam join to cancel")
     else
         reply(M.status_line())
         local s = M.status()

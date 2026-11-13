@@ -193,6 +193,57 @@ loops.skilltree()
 check(post(param(htech), param(false), param(asset.Skill_HealthRegen)) == nil, "left: engine answer")
 check(progress.status_line():find("skilltree: sent=2") ~= nil, "status line: " .. progress.status_line())
 
+-- 5. one report, not two (2026-11-13, backlog 9.4): the client's skill list
+-- went in SKTREE and again in sdc_persist's PSPROG. Once the host takes it
+-- from PSPROG (persist.carries_tree), no poll and no SKTREE here; a change
+-- here asks persist for the next report at once.
+local persist = require("sdc_persist")
+local carry, soon = false, 0
+local real_carries, real_soon = persist.carries_tree, persist.prog_soon
+check(type(real_carries) == "function" and type(real_soon) == "function", "persist offers carries_tree / prog_soon")
+persist.carries_tree = function() return carry end
+persist.prog_soon = function() soon = soon + 1 end
+S.role, S.remote = "client", {}
+S.client = { id = 9 }   -- a new connection
+local n0 = #sent
+tech._state.Skill_Lockpick = true
+loops.skilltree()
+check(#sent == n0 + 1 and sent[#sent].kind == "SKTREE" and sent[#sent].args[1] == "Skill_Lockpick",
+  "before PSPROG carries the skills: SKTREE as before")
+carry = true
+tech._state.Skill_Parkour = true
+local polls = 0
+local real_isu = tech._m.IsTechnologyUnlocked
+tech._m.IsTechnologyUnlocked = function(s, o) polls = polls + 1; return real_isu(s, o) end
+loops.skilltree(); loops.skilltree()
+check(#sent == n0 + 1 and polls == 0, "PSPROG carries them: no poll, no SKTREE")
+check(logged("no separate SKTREE from now on") ~= nil, "the switch is logged")
+tech._m.IsTechnologyUnlocked = real_isu
+tree.relock(tech, "test 2")
+loops.skilltree()
+check(#sent == n0 + 1 and soon == 1, "a change here (relock): persist's next report at once, no SKTREE")
+carry = false   -- a 2nd record from the host (it loaded a save): not carried until reported again
+loops.skilltree()
+check(#sent == n0 + 2 and sent[#sent].kind == "SKTREE" and sent[#sent].args[1] == "-", "not carried: SKTREE again at once")
+-- a new connection starts uncarried: the switch is made (and counted) again for it
+local c0 = tree.stats.carried
+carry = true
+loops.skilltree()
+S.client = { id = 10 }   -- reconnected, PSPROG carries the skills there too
+loops.skilltree()
+check(tree.stats.carried == c0 + 2, "a new connection starts uncarried: the switch is made again for it (" .. (tree.stats.carried - c0) .. ")")
+carry = false
+-- host: PSPROG's list (sdc_persist.on_prog -> report) answers the checks
+S.role = "host"
+S.remote[key] = { pc = rpc, name = "bag" }
+tree.report(rpc, "Skill_Parkour", "PSPROG")
+loops.skilltree()
+check(post(param(htech), param(false), param(asset.Skill_Parkour)) == true, "host: the PSPROG list answers the skill checks")
+check(post(param(htech), param(false), param(asset.Skill_HealthRegen)) == false, "host: a skill not in it is locked")
+check(logged("bag's unlocked skills: Skill_Parkour %(from PSPROG") ~= nil, "logged with its source")
+check(tree.status_line():find("from PSPROG=1", 1, true) ~= nil, "status line counts it: " .. tree.status_line())
+persist.carries_tree, persist.prog_soon = real_carries, real_soon
+
 print = real_print
 for _, l in ipairs(lines) do if l:find("skilltree:") or l:find("FAIL") then io.write(l, string.char(10)) end end
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))

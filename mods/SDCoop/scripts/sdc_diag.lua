@@ -4,7 +4,8 @@
 --   [SNAP] head   version, role, map, menu state, connected players, uptime
 --   [SNAP] own    own character: alive, health, position, movement mode, held
 --                 item, input ignored (move/look), camera view target, HUD on
---                 screen, ping
+--                 screen, ping (a client's health: its HUD's, "hp=80(hud)":
+--                 the character's own MedicalComponent is not replicated)
 --   [SNAP] remote (host) every connected player: their character as above,
 --                 distance to the host, ping, waiting respawn
 --   [SNAP] other  (client) every other player character here: distance, hidden
@@ -15,7 +16,9 @@
 -- HUD / control / character shows up with its time.
 -- [HITCH] (the 1 s tick came > 3 s late: the game stood still) also names the
 -- longest mod work since the previous tick (task + part, or hook call, with
--- how much of it was writing UE4SS.log), the slowest UE4SS.log write (sdc_log)
+-- how much of it was writing UE4SS.log; on a client the slowest zombie step
+-- of sdc_ai's client tick in that task, "AI step c:ai.looks N ms"), the
+-- slowest UE4SS.log write (sdc_log)
 -- and the Lua heap before / after with the collector cycles in between.
 -- Log only; nothing in the game is changed.
 
@@ -67,25 +70,53 @@ local function is_dead(pawn)
     return ue.valid(pawn) and ue.prop(pawn, "PlayerDead?") == true
 end
 
--- alive, health, position, movement mode, held item of a player character
-local function pawn_info(pawn)
-    if not ue.valid(pawn) then return "pawn=none" end
+-- The held slot: the Jig helper's replicated ActiveWeapon slot tag (as
+-- sdc_items' hotbar reads it; BP_PlayerCharacter has no ActiveWeapon of its
+-- own), "Jig.PlayerSlot." left out; "-" for none.
+local function held_slot(pawn)
+    local helper = ue.prop(pawn, "BP_JigHelperComp")
+    if not ue.valid(helper) then return "-" end
+    local tag = ue.str(try(function() return helper.ActiveWeapon.TagName end))
+    if tag == "" or tag == "None" then return "-" end
+    return (tag:gsub("^Jig%.PlayerSlot%.", ""))
+end
+
+-- Health as "hp=..." of a player character. The host's values are the
+-- game's own (MedicalComponent.Health / MaxHealth). MedicalComponent does not
+-- replicate (sdc_infui): a client's character keeps 100/100 there whatever
+-- its health on the host (13.11: every client line said hp=100/100 while the
+-- host had that player at 80 / 96). A client's own health is what the host
+-- sends to its HUD (Client_UpdateHealthUI -> BP_Ingame.UpdateHealth ->
+-- HealthBar.PB_SetPercent(Health / 100); HealthBar's ProgressMethod 0 sets
+-- CurrentPercent, clamped 0..1): "hp=80(hud)"; no HUD value: "hp=?(client)".
+local function hp_text(pawn, client_own)
+    if client_own then
+        local bar = ue.prop(ue.prop(pawn, "InGameUI"), "HealthBar")
+        local p = tonumber(ue.prop(bar, "CurrentPercent"))
+        if p then return "hp=" .. n0(p * 100) .. "(hud)" end
+        return "hp=?(client)"
+    end
     local med = ue.prop(pawn, "MedicalComponent")
+    return string.format("hp=%s/%s", n0(tonumber(ue.prop(med, "Health"))), n0(tonumber(ue.prop(med, "MaxHealth"))))
+end
+M._hp_text = hp_text   -- tests
+
+-- alive, health, position, movement mode, held item of a player character
+-- (`client_own`: this client's own character, health from its HUD)
+local function pawn_info(pawn, client_own)
+    if not ue.valid(pawn) then return "pawn=none" end
     local cm = ue.prop(pawn, "CharacterMovement")
-    local held = ue.prop(pawn, "ActiveWeapon")
-    return string.format("pawn=%s dead=%s hp=%s/%s loc=%s move=%s held=%s",
-        ue.short(pawn), tostring(is_dead(pawn)),
-        n0(tonumber(ue.prop(med, "Health"))), n0(tonumber(ue.prop(med, "MaxHealth"))),
-        loc_str(ue.location(pawn)), tostring(ue.prop(cm, "MovementMode")),
-        ue.valid(held) and ue.class_name(held) or "-")
+    return string.format("pawn=%s dead=%s %s loc=%s move=%s held=%s",
+        ue.short(pawn), tostring(is_dead(pawn)), hp_text(pawn, client_own),
+        loc_str(ue.location(pawn)), tostring(ue.prop(cm, "MovementMode")), held_slot(pawn))
 end
 
 -- The own player: character, input, camera, HUD, ping. Returns the line, the
 -- change key and the character.
-local function own_state()
+local function own_state(on_client)
     local pc = ue.local_pc()
     local pawn = pc and ue.pawn_of(pc) or nil
-    local parts = { pawn_info(pawn) }
+    local parts = { pawn_info(pawn, on_client) }
     local mi, li, view, hud = nil, nil, "?", "none"
     if pc then
         mi = try(function() return pc:IsMoveInputIgnored() end)
@@ -202,7 +233,10 @@ end
 
 -- The longest piece of mod work since the previous tick: a task (with its
 -- longest part) or a hook call; "none over 50 ms" when nothing took that long.
-local function longest_work(wt, wp, wh)
+-- `ws`: the client's slowest AI step (sdc_ai.take_worst_step), named when it
+-- ran in that task: the steps time themselves (sdc_ue's longest part is then
+-- c:ai as a whole, or none at all in the task ai-client-rest).
+local function longest_work(wt, wp, wh, ws)
     local best, ms = nil, 50
     if ms_of(wh) >= ms then
         ms = ms_of(wh)
@@ -215,13 +249,16 @@ local function longest_work(wt, wp, wh)
         if ms_of(wp) >= 50 and wp.task == wt.label then
             best = best .. string.format(" (part %s %.0f ms)", tostring(wp.label), ms_of(wp))
         end
+        if ms_of(ws) >= 50 and ws.task == wt.label then
+            best = best .. string.format(" (AI step %s %.0f ms)", tostring(ws.label), ms_of(ws))
+        end
     end
     return best or "none over 50 ms"
 end
 
 -- [HITCH] details: what the mod was doing, the slowest UE4SS.log write, the
 -- Lua heap before (previous tick) and now, collector cycles in between.
-local function hitch_details(c, w, wt, wp, wh)
+local function hitch_details(c, w, wt, wp, wh, ws)
     local perf = perf_mod()
     local now_cycles = tonumber(perf and perf.gc_cycles)
     local cycles = now_cycles and st.last_cycles and (now_cycles - st.last_cycles) or -1
@@ -231,7 +268,7 @@ local function hitch_details(c, w, wt, wp, wh)
             tonumber(w.at) and (c - w.at) or -1, tostring(w.activity or "?"), tostring(w.text or ""))
     end
     return string.format("longest mod work: %s | slowest UE4SS.log write: %s | lua heap %.1f MB before, %.1f MB now,"
-        .. " collector cycles finished: %d", longest_work(wt, wp, wh), write, (st.last_kb or 0) / 1024,
+        .. " collector cycles finished: %d", longest_work(wt, wp, wh, ws), write, (st.last_kb or 0) / 1024,
         collectgarbage("count") / 1024, cycles)
 end
 
@@ -247,11 +284,13 @@ function M.tick(S)
     if ue.take_worst then wt, wp = ue.take_worst() end
     local perf = perf_mod()
     local wh = perf and perf.take_worst_hook and perf.take_worst_hook() or nil
+    local ai = package.loaded["sdc_ai"]
+    local ws = type(ai) == "table" and type(ai.take_worst_step) == "function" and ai.take_worst_step() or nil
     if st.last_tick and c - st.last_tick > 3 and S and (S.role == "host" or S.role == "client") and S.in_menu == false then
         local lt = ue.last_done or ue.last_task or {}
         log.warn("[HITCH] the game stood still for %.1f s (last mod task before this one: %s, took %s ms, ended %.1f s ago) | %s",
             c - st.last_tick - 1, tostring(lt.label), lt.ms and string.format("%.0f", lt.ms) or "?",
-            lt.at and (c - lt.at) or -1, hitch_details(c, w, wt, wp, wh))
+            lt.at and (c - lt.at) or -1, hitch_details(c, w, wt, wp, wh, ws))
     end
     st.last_tick = c
     st.last_kb = collectgarbage("count")
@@ -263,7 +302,7 @@ function M.tick(S)
         st.own_key = nil
         return
     end
-    local line, key, pawn = own_state()
+    local line, key, pawn = own_state(S.role == "client")
     if st.own_key ~= nil and key ~= st.own_key then
         M.stats.changes = M.stats.changes + 1
         log.info("[SNAP] change own %s (in_menu=%s)", line, tostring(S.in_menu))

@@ -24,10 +24,9 @@
 --     on every machine, but that multicast is UNRELIABLE and late joiners
 --     never get it. `fl` is whether the owner's light is really on; another
 --     machine whose copy disagrees runs the game's own FlashlightToggle.
---   * aim for other players' lasers: not sent any more. sdc_gearfx uses
+--   * aim for other players' lasers: not sent. sdc_gearfx uses
 --     GetBaseAimRotation (replicated RemoteViewPitch + actor yaw; the
---     character turns with the aim while aiming). cp / cy from an older peer
---     are still read.
+--     character turns with the aim while aiming).
 --
 --   * weapon pose (work/audit/weapon_pose.md). The anim BP picks the pose by
 --     BlendSpaceInt (0 nothing in hand, 1 rifle, 2 sidearm, 3 one-handed
@@ -146,7 +145,7 @@ local function encode(t)
 end
 
 local states = {}    -- [player id] = decoded state
-local published, published_at = nil, 0
+local published = nil
 
 local function m_is_local(p) return p:IsLocallyControlled() end
 local function is_local(p)
@@ -154,22 +153,16 @@ local function is_local(p)
     return ok and v == true
 end
 
--- Every player character here: the list shared with the other modules
--- (sdc_ue.player_chars: rescanned when a new character appears, else at most
--- every second, destroyed ones left out). `fresh` = a message handler: a new
--- scan unless that list is known to be fresh. Older sdc_ue: as before.
-local function char_list(fresh)
-    if ue.player_chars then return ue.player_chars(fresh) or {} end
-    if fresh then return ue.find_all("BP_PlayerCharacter_C") or {} end
-    return (ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {}
-end
-
 -- Characters of other players on this machine (not the hidden stale local copy
--- a client may have from its own save).
+-- a client may have from its own save), from the character list shared with
+-- the other modules (sdc_ue.player_chars: rescanned when a new character
+-- appears, else at most every second, destroyed ones left out). `fresh` = a
+-- message handler: a new scan unless that list is known to be fresh.
+-- Shared: sdc_gearfx (other players' lights / lasers).
 local function others(fresh)
     local out = {}
     local host = S.role == "host"
-    for _, p in ipairs(char_list(fresh)) do
+    for _, p in ipairs(ue.player_chars(fresh) or {}) do
         -- find_all can return a character that is already being destroyed
         -- (e.g. the host's copy leaving a client's network range)
         if ue.valid(p) then
@@ -183,6 +176,7 @@ local function others(fresh)
     end
     return out
 end
+M.others = others
 
 -- ---------------------------------------------------------------------------
 -- Other players' characters: what is looked up once, not every frame
@@ -578,15 +572,6 @@ function M.state_of(pawn)
     return id and states[id] or nil
 end
 
--- Aim (control) rotation of another player's character, if an older peer
--- still sends it (cp / cy); nil otherwise.
-function M.aim_of(pawn)
-    local t = M.state_of(pawn)
-    local cp, cy = t and tonumber(t.cp), t and tonumber(t.cy)
-    if cp and cy then return { Pitch = cp, Yaw = cy, Roll = 0 } end
-    return nil
-end
-
 local function apply_id(id)
     local t = states[id]
     if not t then return end
@@ -595,17 +580,25 @@ local function apply_id(id)
     end
 end
 
--- Every 100 ms: publish the own state when it changed.
+-- Every 100 ms: publish the own state when it changed. A host nobody is
+-- connected to has nobody to tell: nothing is read, and the state goes out
+-- again when somebody is there.
 function M.fast_tick()
     if S.role ~= "host" and S.role ~= "client" then return end
-    if S.role == "host" and pose_fix_on() then ensure_combat_hook(os.clock()) end
+    if S.role == "host" then
+        if pose_fix_on() then ensure_combat_hook(os.clock()) end
+        if #(S.remote_pcs or {}) == 0 then
+            published = nil
+            return
+        end
+    end
     local me = ue.local_pawn()
     if not me then return end
     local id = appearance.player_id(me)
     if not id then return end
     local s = own_state(me)
     if s == published then return end
-    published, published_at = s, os.clock()
+    published = s
     states[id] = decode(s)
     if S.role == "host" then
         net.broadcast(S.remote_pcs or {}, "PSTATE", id, s)
@@ -614,8 +607,10 @@ function M.fast_tick()
     end
 end
 
--- Every second: re-apply (the game's own code may have reset a copy).
-function M.tick()
+-- Every second: re-apply (the game's own code may have reset a copy). The
+-- host forgets the states of players who left (send_all).
+function M.tick(remote_pcs)
+    if S.role == "host" and remote_pcs then appearance.drop_left(states, remote_pcs) end
     for _, p in ipairs(others()) do
         local id = appearance.player_id(p)
         local t = id and states[id]
@@ -650,29 +645,14 @@ local last_frame = os.clock()
 -- scratch values: UE4SS copies a table into the engine struct at once
 local LH = { X = 0, Y = 0, Z = 0 }
 local HEAD = { Pitch = 0, Yaw = 0, Roll = 0 }
--- GetSocketTransform looked up once per component (UE4SS finds a function by
--- walking the class's properties and functions on every obj:Fn()); false
--- after a cached one failed where a plain call worked.
--- OFF since the 0.7.1 crashes of 2026-11-11 (19:12, 19:58, 20:12: UE4SS
--- access violations in Lua table code while wrapping objects = a corrupted
--- Lua heap): a cached UFunction handle keeps calling the old class's
--- function at an address; once the weapon is collected and another object
--- takes that address, IsValid() is true for the NEW object and the call runs
--- with the wrong class / parameter layout. A plain obj:GetSocketTransform()
--- resolves on the object's real class and fails cleanly instead.
-local fn_cache = false
+-- GetSocketTransform: a plain obj:GetSocketTransform() every time. A cached
+-- UFunction handle (removed after the 0.7.1 crashes of 2026-11-11) kept
+-- calling the old class's function at an address that another object could
+-- take; a plain call resolves on the object's real class and fails cleanly.
 
-local function m_field(o, k) return o[k] end
 local function m_anim(mesh) return mesh:GetAnimInstance() end
 local function m_shown(mesh) return mesh:WasRecentlyRendered(RENDER_TOL) end
 local function m_set_head(anim, v) anim.HeadRotation = v end
-
-local function gst_handle(obj)
-    if not fn_cache then return nil end
-    local ok, f = pcall(m_field, obj, "GetSocketTransform")
-    if ok and (type(f) == "userdata" or type(f) == "function") then return f end
-    return nil
-end
 
 -- FTransform.InverseTransformPosition (KismetMathLibrary.InverseTransformLocation):
 -- Rotation.UnrotateVector(v - Translation) * GetSafeScaleReciprocal(Scale3D).
@@ -708,15 +688,10 @@ local function inv_transform(t, v)
 end
 M.inv_transform = inv_transform   -- tests
 
-local function gst(f, obj, name)
-    if f then return f(obj, name, 0) end
-    return obj:GetSocketTransform(name, 0)
-end
-
 -- One character's LeftHandLoc (through pcall); written only when it moved.
-local function ik_apply(r, plain)
-    local target = gst(not plain and r.f_root or nil, r.root, FN_LEFT)
-    local hand = gst(not plain and r.f_mesh or nil, r.mesh, FN_HAND)
+local function ik_apply(r)
+    local target = r.root:GetSocketTransform(FN_LEFT, 0)
+    local hand = r.mesh:GetSocketTransform(FN_HAND, 0)
     local tl = target.Translation
     local x, y, z = inv_transform(hand, tl)
     if x == nil then
@@ -734,7 +709,7 @@ local function ik_apply(r, plain)
 end
 
 -- Refresh: a firearm in hand -> the weapon's root (with a LeftHand socket),
--- the mesh, their GetSocketTransform handles, on screen or not.
+-- the mesh, on screen or not.
 local function ik_setup(r, now)
     r.ik = false
     if not r.mesh then return end
@@ -743,9 +718,6 @@ local function ik_setup(r, now)
     if w.left == nil then w.left = ue.try(m_has_socket, w.root, FN_LEFT) == true end
     if not w.left then return end
     r.ik, r.root = true, w.root
-    if r.f_root_w ~= w then r.f_root, r.f_root_w = gst_handle(w.root), w end
-    local mk = addr(r.mesh)
-    if r.f_mesh_k ~= mk then r.f_mesh, r.f_mesh_k = gst_handle(r.mesh), mk end
     local ok, shown = pcall(m_shown, r.mesh)
     r.every = not ok or shown ~= false
     r.once = true      -- at least once per refresh, written even if unchanged
@@ -843,21 +815,15 @@ function M.frame_tick()
         -- cached for a quarter second: re-check before touching them
         if (r.every or r.once) and ue.valid(r.p) and ue.valid(r.root) and ue.valid(r.mesh) then
             r.once = false
-            local ok = pcall(ik_apply, r)
-            if not ok and (r.f_root or r.f_mesh) then
-                -- the cached function handles: the same with plain calls; when
-                -- that works, no more handles
-                r.f_root, r.f_mesh = nil, nil
-                if pcall(ik_apply, r, true) and fn_cache then
-                    fn_cache = false
-                    log.info("state: cached GetSocketTransform handles failed, plain calls from now on")
-                end
-            end
+            pcall(ik_apply, r)
         end
     end
 end
 
+-- Host: every state known here to a client that said HI (players who left
+-- are dropped first).
 function M.send_all(pc)
+    if S and S.role == "host" then appearance.drop_left(states, S.remote_pcs) end
     for id, t in pairs(states) do
         net.send_to(pc, "PSTATE", id, encode(t))
     end

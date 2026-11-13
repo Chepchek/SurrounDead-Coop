@@ -38,6 +38,8 @@ function ue.location(a) return a and a.__loc end
 local sent_host, sent_client, handlers = {}, {}, {}
 package.loaded["sdc_log"] = log
 ue.load_asset = ue.load_asset or function(p) return pcall(LoadAsset, p) end
+-- (0.7.3: a client takes the binoculars item only from memory)
+ue.loaded_asset = ue.loaded_asset or function(p) return ue.find_object(p) end
 package.loaded["sdc_ue"] = ue
 package.loaded["sdc_config"] = { get = function() return true end }
 package.loaded["sdc_net"] = { send_to = function(pc, kind, ...) sent_client[#sent_client + 1] = { pc, kind, ... } end,

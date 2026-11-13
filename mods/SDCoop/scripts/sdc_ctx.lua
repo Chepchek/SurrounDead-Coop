@@ -53,9 +53,6 @@ local index_count = nil   -- number of controllers when index_of was built
 local refreshing = false
 local num_pcs_ok = true
 local seen = {}
-local post_pending = {}   -- [function name] = true: log the next post call (first redirect)
-local post_logged = {}    -- [function name] = true
-local post_hooked = false -- the logging post-hooks are registered (debug_probes)
 
 -- ---------------------------------------------------------------------------
 -- Hot-path helpers (the hooked functions run ~1000-1500 times a second on a
@@ -91,8 +88,9 @@ end
 -- Counters, every player_for cache miss and every redirect timed whole, and
 -- the reading of the context object and its address (2 engine calls: the
 -- part no Lua change can remove) timed on every 4th call.
+-- Client mode: cmiss / cmiss_ms = client cache misses (character_of walks).
 local PS = { calls = 0, idx = 0, idle = 0, miss = 0, miss_ms = 0, answered = 0, redirect = 0, redirect_ms = 0,
-             quiet = 0, arg_n = 0, arg_ms = 0 }
+             quiet = 0, arg_n = 0, arg_ms = 0, cmiss = 0, cmiss_ms = 0 }
 M.pstats = PS
 local arg_tick = 0
 
@@ -100,7 +98,13 @@ local arg_tick = 0
 -- (2 engine calls instead of 4 and a new string). Classes outlive the
 -- objects; the cache is dropped on a world / role reset.
 local class_names = {}   -- [class address] = "BP_Foo_C"
+-- A null object (a hook parameter / property with no object: NOT nil in
+-- Lua) has address 0, and UE4SS's GetClass on it reads address 0x10: the
+-- game dies, pcall cannot catch it (host crash 2026-11-13 17:36, sdc_ffire's
+-- ApplyDamage hook with DamageCauser None). Its address first (GetAddress is
+-- safe on it); without one, ue.class_name (IsValid first) gives "".
 local function cls_info(o)
+    if not fast_addr(o) then return ue.class_name(o), nil end
     local okc, c = pcall(o_class, o)
     local ca = okc and c ~= nil and fast_addr(c) or nil
     if not ca then return ue.class_name(o), nil end
@@ -277,7 +281,7 @@ end
 -- character's own ReceivePossessed already resolves to its player).
 function M.bind(pawn, pc)
     if not ue.valid(pawn) or not ue.valid(pc) then return end
-    local e = { pc = pc, pawn = pawn }
+    local e = { pc = pc, pawn = pawn, name = ue.name(pawn) }
     local pa, wa = addr(pc), addr(pawn)
     if pa then map[pa] = e end
     if wa then map[wa] = e end
@@ -318,6 +322,20 @@ M.client_mode = false
 local NO_PLAYER = 64
 local client_cache = {}   -- [address] = true (another player's) / false
 local client_seen = {}
+-- How long an answer lasts (client ticks, 1 s each). "Another player's"
+-- (true) is asked again every second, as before: a weapon can change hands.
+-- "Not another player's" (false: own objects, the world) lasts CLIENT_KEEP
+-- ticks: the world's containers ask GetPlayerCharacter about once a second
+-- each, so a cache dropped every second made nearly every such call a full
+-- walk (~7 engine calls, ~25 us; [PERF] 2026-11-12: GetPlayerCharacter
+-- 25-29 us per call on a client against ~4 us for a cached object). The
+-- cost of a stale "no": for up to CLIENT_KEEP s an object that has just
+-- become another player's (its owner changed, or a freed object's address
+-- reused) still acts on this player as in the game without the mod (a
+-- camera shake, XP).
+local CLIENT_KEEP = 5
+local client_others = {}  -- [address] = true: this tick's "another player's" answers
+local client_age = 0      -- client ticks since the whole client cache was dropped
 
 -- The player character an object acts for (itself, a component / anim
 -- instance in its outer chain, or an actor it owns), or nil. The outer walk
@@ -364,6 +382,7 @@ local function client_quiet(fname, wco, idx_p, a)
     if not a then return end
     local other = client_cache[a]
     if other == nil then
+        local t0 = clock()
         local ch = character_of(wco)
         other = false
         if ch then
@@ -371,6 +390,9 @@ local function client_quiet(fname, wco, idx_p, a)
             other = ok and loc ~= true
         end
         client_cache[a] = other
+        if other then client_others[a] = true end
+        PS.cmiss = PS.cmiss + 1
+        PS.cmiss_ms = PS.cmiss_ms + (clock() - t0) * 1000
     end
     if not other then return end
     if not pcall(p_set_none, idx_p) then return end
@@ -394,6 +416,16 @@ M.observer = nil
 -- controller, false (the host's own action: player 0 stays) or nil.
 M.SCOPE_API = 1
 M.scope_resolver = nil
+
+-- The hooked function of the call being decided ("GetPlayerCharacter", ...),
+-- set right before the resolvers are asked (resolvers that only answer one
+-- of them read it).
+M.call_fn = nil
+
+-- sdc_ai_spawnnear: fn(object, address) -> remote controller | false (the
+-- host) | nil, for an AI / prefab spawner asking "is a player near this spawn
+-- point?" (sdc_world's "spawn" scope kind asks it).
+M.spawn_scope = nil
 
 -- Idle checks (hot-path shortcut). A resolver (or M.stand_in) may register
 -- fn(address) -> true when, right now and for that object, it would answer
@@ -474,6 +506,77 @@ function M.classify(obj, role)
     return "world"
 end
 
+-- ---------------------------------------------------------------------------
+-- Living players and where they are (spawn checks, infestation waves, AI
+-- scaling). Objects are for the caller's own call only, never kept.
+-- ---------------------------------------------------------------------------
+
+local function m_has_tag(o, n) return o:ActorHasTag(n) end
+
+-- A player character that died: PlayerDead? (replicated) or the 'Dead' tag
+-- its AfterDeath adds (@187).
+function M.is_dead_player(p)
+    if ue.prop(p, "PlayerDead?") == true then return true end
+    if FName == nil then return false end
+    local ok, r = pcall(m_has_tag, p, FName("Dead"))
+    return ok and r == true
+end
+
+-- Every possessed, living BP_PlayerCharacter here (on the host: its own and
+-- the remote players'): { pawn, pc, remote, loc }, positions read now.
+function M.live_players()
+    local out = {}
+    for _, p in ipairs(ue.player_chars()) do
+        if ue.valid(p) then
+            local pc = ue.prop(p, "Controller")
+            if ue.valid(pc) and not M.is_dead_player(p) then
+                local l = ue.location(p)
+                if l then out[#out + 1] = { pawn = p, pc = pc, remote = is_remote_pc(pc), loc = l } end
+            end
+        end
+    end
+    return out
+end
+
+-- The last answer of nearest_live_player, for the calls of one spawn check:
+-- a spawner's check compares every actor its sphere query found with
+-- GetPlayerCharacter(self, 0), one call per actor (BP_AISpawner_Master.
+-- TraceForPlayer @336, BP_AISpawningVolume_Prefab.TraceForPlayer,
+-- BP_PrefabSpawner.CheckSurroundingArea), and sdc_ai_spawnnear asks with the
+-- same point record (one per query and spawner) each time. That record, its
+-- point unchanged, within NEAREST_KEEP_S (the calls of a query come in the
+-- same frame; the next query brings a new record): the answer found for it,
+-- the same player, not searched again. Other callers pass a new table: no
+-- reuse. Dropped every tick and on a reset (no object is kept longer).
+local NEAREST_KEEP_S = 0.01
+local near = { loc = nil }   -- { loc, X, Y, Z, t, e, d }
+M.near_stats = { asked = 0, reused = 0 }
+local function forget_near() near.loc, near.e, near.d = nil, nil, nil end
+
+-- The living player nearest to `loc` ({ X, Y, Z }) and its distance (cm), or nil.
+function M.nearest_live_player(loc)
+    if not loc then return nil end
+    local ns = M.near_stats
+    ns.asked = ns.asked + 1
+    local now = clock()
+    local n = near
+    if n.loc == loc and n.X == loc.X and n.Y == loc.Y and n.Z == loc.Z and now - n.t <= NEAREST_KEEP_S then
+        ns.reused = ns.reused + 1
+        if not n.e then return nil end
+        return n.e, n.d
+    end
+    local best, bd = nil, nil
+    for _, e in ipairs(M.live_players()) do
+        local dx, dy, dz = e.loc.X - loc.X, e.loc.Y - loc.Y, e.loc.Z - loc.Z
+        local d = dx * dx + dy * dy + dz * dz
+        if not bd or d < bd then best, bd = e, d end
+    end
+    local d = best and math.sqrt(bd) or nil
+    n.loc, n.X, n.Y, n.Z, n.t, n.e, n.d = loc, loc.X, loc.Y, loc.Z, now, best, d
+    if not best then return nil end
+    return best, d
+end
+
 local function make_hook(path)
     local fname = path:match(":([%w_]+)$")
     -- every path returns nothing: a value returned from a hook would replace
@@ -492,7 +595,6 @@ local function make_hook(path)
         if not pcall(p_set, idx_p, n) then return end
         M.count = M.count + 1
         PS.redirect = PS.redirect + 1
-        if post_hooked and not post_logged[fname] then post_pending[fname] = true end
         if first_of(fname, a) then
             local who = cls_name(wco)
             local k = fname .. "|" .. who
@@ -504,6 +606,7 @@ local function make_hook(path)
     end
     -- One call with its context object read (always inside a pcall).
     local function decide(wco, idx_p, a)
+        M.call_fn = fname
         if M.client_mode then
             client_quiet(fname, wco, idx_p, a)
             if M.observer then pcall(M.observer, fname, wco, nil) end
@@ -630,66 +733,45 @@ local function make_hook(path)
     end
 end
 
--- Class of a hook argument (read only), for the log.
-local function describe(p)
-    local ok, v = pcall(function() return p:get() end)
-    if not ok then return "?" end
-    if v == nil then return "nil" end
-    local t = type(v)
-    if t == "number" or t == "boolean" or t == "string" then return tostring(v) end
-    if ue.valid(v) then return ue.class_name(v) end
-    return "None"
-end
-
--- Post hook: once per function, after its first redirected call, log what
--- the engine returned (expected: a controller / character / camera manager of
--- the remote player). Reads only; returns nothing.
-local function make_post(path)
-    local fname = path:match(":([%w_]+)$")
-    local function body(...)
-        post_pending[fname] = nil
-        post_logged[fname] = true
-        local parts = {}
-        for i = 1, select("#", ...) do
-            parts[#parts + 1] = describe((select(i, ...)))
-        end
-        log.info("ctx: first redirected %s returned %s (post args: %s)", fname, parts[1] or "?",
-            table.concat(parts, ", "))
-    end
-    return function(_, ...)
-        if not post_pending[fname] then return end
-        local ok, err = pcall(body, ...)
-        if not ok then log.err_throttled("ctx-post", "ctx: %s post-hook: %s", fname, tostring(err)) end
-    end
-end
-
--- The post-hook only logs what the first redirected call returned. Every
--- registered callback makes UE4SS wrap all parameters again on every call
--- (~1000+ calls a second here), so it is registered only with debug_probes.
+-- Pre-hooks only: every registered callback makes UE4SS wrap all parameters
+-- again on every call (~1000+ calls a second here).
 local function install()
     if installed then return end
     installed = true
-    post_hooked = log.probes_enabled == true
     for _, path in ipairs(FUNCS) do
-        local ok, pre, post = pcall(RegisterHook, path, make_hook(path), post_hooked and make_post(path) or nil)
+        local ok, pre, post = pcall(RegisterHook, path, make_hook(path))
         if ok then
             hooks[#hooks + 1] = { path = path, pre = pre, post = post }
         else
             log.err("ctx: cannot hook %s: %s", path, tostring(pre))
         end
     end
-    log.info("ctx: player-0 hooks installed (%d, %s); active only while remote players are connected", #hooks,
-        post_hooked and "with the first-redirect post-hooks (debug_probes)" or "pre-hooks only")
+    log.info("ctx: player-0 hooks installed (%d, pre-hooks only); active only while remote players are connected", #hooks)
+end
+
+-- A map entry carried over from the last tick (key = the pawn's address when
+-- it was bound): the same object (address, name and class unchanged: a freed
+-- character's address can be reused by a new object), controlled by that
+-- remote player or by nobody (bound before Possess, or a dead body).
+local function still_theirs(e, a)
+    if not (ue.valid(e.pawn) and ue.valid(e.pc) and is_remote_pc(e.pc)) then return false end
+    if a ~= addr(e.pawn) then return false end
+    if e.name and ue.name(e.pawn) ~= e.name then return false end
+    if not cls_name(e.pawn):find("PlayerCharacter", 1, true) then return false end
+    local c = ue.prop(e.pawn, "Controller")
+    if not ue.valid(c) then return true end
+    return addr(c) == addr(e.pc)
 end
 
 -- Host tick (1 s): rebuild the map from the live controllers; the hooks act
 -- only while remote players are connected.
 function M.tick(remote_pcs)
-    if not cfg.get("redirect_player0") then remote_pcs = {} end
+    local enabled = cfg.get("redirect_player0")
+    if not enabled then remote_pcs = {} end
     local m = {}
     for _, pc in ipairs(remote_pcs) do
         local pawn = ue.pawn_of(pc)
-        local e = { pc = pc, pawn = pawn }
+        local e = { pc = pc, pawn = pawn, name = pawn and ue.name(pawn) or nil }
         local pa = addr(pc)
         if pa then m[pa] = e end
         if pawn then
@@ -697,14 +779,20 @@ function M.tick(remote_pcs)
             if wa then m[wa] = e end
         end
     end
-    -- keep pawns bound this second that the controller does not report yet
-    for a, e in pairs(map) do
-        if not m[a] and ue.valid(e.pawn) and ue.valid(e.pc) and is_remote_pc(e.pc) then m[a] = e end
+    -- keep pawns bound this second that the controller does not report yet,
+    -- and a remote player's previous character (its body) while it is still
+    -- theirs (still_theirs: a freed character's address reused by a new
+    -- object is not carried on)
+    if enabled then
+        for a, e in pairs(map) do
+            if not m[a] and still_theirs(e, a) then m[a] = e end
+        end
     end
     map = m
     cache = {}
     weapon_cache = {}
     seen_addr = {}
+    forget_near()
     local want = next(map) ~= nil
     if want then refresh_indices() else index_of, index_count = {}, nil end
     if want and not installed then install() end
@@ -724,18 +812,26 @@ function M.reset()
     if M.active then log.info("ctx: player-0 redirection off (%d calls redirected)", M.count) end
     map, cache, index_of, index_count = {}, {}, {}, nil
     weapon_cache = {}
-    post_pending = {}
-    client_cache = {}
+    client_cache, client_others, client_age = {}, {}, 0
     seen_addr = {}
     class_names = {}
     no_owner = {}
+    forget_near()
     M.client_mode = false
     M.active = false
 end
 
--- Client tick (1 s): client mode on / off.
+-- Client tick (1 s): client mode on / off. "Another player's" answers are
+-- dropped every tick, the rest every CLIENT_KEEP ticks (see client_cache).
 function M.tick_client(on)
-    client_cache = {}
+    client_age = client_age + 1
+    if client_age >= CLIENT_KEEP then
+        client_age = 0
+        client_cache, client_others = {}, {}
+    else
+        for a in pairs(client_others) do client_cache[a] = nil end
+        client_others = {}
+    end
     seen_addr = {}
     if on and not installed then install() end
     if on ~= M.client_mode then
@@ -764,11 +860,16 @@ function M.perf_text(dt)
     end
     dt = math.max(0.001, tonumber(dt) or 1)
     if d.calls <= 0 and d.miss <= 0 then return nil end
+    -- a client's own lookups (client mode): misses = full walks
+    local client = ""
+    if M.client_mode or d.cmiss > 0 then
+        client = string.format(", client misses %.1f/s %.1fms/s", d.cmiss / dt, d.cmiss_ms / dt)
+    end
     return string.format("%.0f calls/s (idle shortcut %.0f/s, index not 0 %.0f/s), player_for misses %.1f/s"
         .. " %.1fms/s, resolver answers %.1f/s, redirected %.1f/s %.1fms/s, weapon quiet %.1f/s, context read"
-        .. " ~%s us/call", d.calls / dt, d.idle / dt, d.idx / dt, d.miss / dt, d.miss_ms / dt, d.answered / dt,
+        .. " ~%s us/call%s", d.calls / dt, d.idle / dt, d.idx / dt, d.miss / dt, d.miss_ms / dt, d.answered / dt,
         d.redirect / dt, d.redirect_ms / dt, d.quiet / dt,
-        d.arg_n > 0 and string.format("%.1f", d.arg_ms * 1000 / d.arg_n) or "?")
+        d.arg_n > 0 and string.format("%.1f", d.arg_ms * 1000 / d.arg_n) or "?", client)
 end
 
 return M

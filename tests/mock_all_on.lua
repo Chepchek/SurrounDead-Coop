@@ -299,6 +299,7 @@ local function load_mods(w)
     for _, name in ipairs(MODS) do m[name:gsub("^sdc_", "")] = require(name) end
     for _, k in ipairs(OFF) do m.config.values[k] = false end
     m.config.values.player_name = "Boss"
+    m.config.values.ai_kill_log = true   -- default off since 2026-11-13 (a debug log); this test covers it
     leave(w)
     return m
 end
@@ -684,10 +685,8 @@ check(level_zombie._valid and boss_copy._valid, "level-placed actor and host cop
 check(find_log("removed 2 AI that existed only on this client: BP_ZombieBoss_Survivor_Small_C_%d+%(dead=false at 2010 0 400%) BP_AnimalWolf_C_2147470001", mark) ~= nil,
     "ghosts named in the log")
 check(boss_copy._p.SD_AIComponent._p["CanSystemDespawnAI?"] == false, "boss copy: CanSystemDespawnAI? = false")
--- the client's optimizer despawning a host copy is logged
-local subj = new(CW, { "AIOSubjectComponent" }, "AIOSubject_1", { _owner = boss_copy })
-fire(CW, "/Script/AIOptimizer.AIOptimizerSubsystem:K2_DespawnSubject", "pre", param(nil), param({}), param(1), param(subj), param(-1), param(false))
-check(find_log("this client's AI optimizer despawns the host's BP_ZombieBoss_Survivor_Small_C", mark) ~= nil, "optimizer despawn of a host copy logged")
+-- 2026-11-13 (critic B8): the client's optimizer despawns are no longer hooked (that was evidence only)
+check(CW.hooks["/Script/AIOptimizer.AIOptimizerSubsystem:K2_DespawnSubject"] == nil, "no K2_DespawnSubject hook on the client")
 
 say("== 11. client: an attack already playing on a copy is not restarted")
 enter(CW); C.config.values.ai_attack_montages = true; leave(CW)

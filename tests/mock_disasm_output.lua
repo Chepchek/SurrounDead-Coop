@@ -272,10 +272,19 @@ local function items_of(rc)
   table.sort(out)
   return table.concat(out, ",")
 end
+-- (0.7.3: JMC|*|<key>|<op,args>|...: one entry per op, as the single form JMC|<op>|<key>|<args> was;
+-- number-like args as numbers, as the host passed them before)
 local function sends(kind, op)
   local out = {}
   for _, s in ipairs(sent) do
-    if s.kind == kind and (op == nil or s.args[1] == op) then out[#out + 1] = s end
+    if s.kind == "JMC" and s.args[1] == "*" then
+      for i = 3, #s.args do
+        local one = {}
+        for part in (s.args[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = tonumber(part) or part end
+        table.insert(one, 2, s.args[2])
+        if kind == "JMC" and (op == nil or one[1] == op) then out[#out + 1] = { pc = s.pc, kind = "JMC", args = one } end
+      end
+    elseif s.kind == kind and (op == nil or s.args[1] == op) then out[#out + 1] = s end
   end
   return out
 end

@@ -76,6 +76,32 @@ local function player_id(pawn)
 end
 M.player_id = player_id
 
+-- Host: the player ids of everybody in the session now (its own and every
+-- remote controller's PlayerState, which outlives the characters), or nil
+-- when its own id cannot be read (nothing is dropped then).
+function M.present_ids(remote_pcs)
+    local ids = {}
+    local own = ue.local_pc()
+    local mine = own and player_id(own)
+    if not mine then return nil end
+    ids[mine] = true
+    for _, pc in ipairs(remote_pcs or {}) do
+        local id = ue.valid(pc) and player_id(pc)
+        if not id then return nil end
+        ids[id] = true
+    end
+    return ids
+end
+
+-- Host: entries of `t` ([player id] = ...) of players who left.
+function M.drop_left(t, remote_pcs)
+    local ids = M.present_ids(remote_pcs)
+    if not ids then return end
+    for id in pairs(t) do
+        if not ids[id] then t[id] = nil end
+    end
+end
+
 local function short_path(p) return (p:gsub("^/Game/", "")) end
 local function full_path(p)
     if p == "" or p:sub(1, 1) == "/" then return p end
@@ -222,7 +248,6 @@ function M.dress(pawn, why)
     if is_local(pawn) then armor_sprint(pawn, das) end
     return handled
 end
-M.dress_own = M.dress
 
 -- BP_PlayerCharacter.OnRep_Clothing*Equipped? / OnRep_BodyArmorEquipped?, post
 -- (client): the game has just dressed the character from empty data.
@@ -256,13 +281,42 @@ end
 
 local tp_flags = {}   -- [component name] = flags last seen in third person (own character)
 
+-- The game hides parts of the OWNER's body for its own camera only
+-- (component visibility is not replicated; nobody else is meant to see it):
+--   * first-person camera on (ChangePlayerPerspective(true, ..) @141,
+--     SetFPMeshesVisibility(true) @49: Head & co hidden). The scope
+--     (SetEnableScope @110) and binoculars (BinocularsVisibility @878) turn
+--     it on WITHOUT PlayerInFirstPerson?, so that flag alone missed them;
+--   * the scope: SetEnableScope @76 Mesh:SetVisibility(false, true) clears
+--     bVisible of every body and clothing component ("v"), @954 sets it back.
+-- Published as they were, those flags hid a scoping player's whole body (and
+-- a binocular user's head) on the host and, relayed, on every other client.
+local function fp_camera_on(pawn)
+    local cam = ue.prop(pawn, "FirstPersonCamera")
+    if not ue.valid(cam) then return false end
+    local ok, on = pcall(function() return cam:IsActive() end)
+    if ok and type(on) == "boolean" then return on end
+    return ue.prop(cam, "bIsActive") == true   -- the flag behind IsActive()
+end
+
+local own_view = ""   -- "scope" / "fp" / "" of the last look_string, for the log
+
 function M.look_string(pawn)
-    local fp = ue.prop(pawn, "PlayerInFirstPerson?") == true
+    local fp = ue.prop(pawn, "PlayerInFirstPerson?") == true or fp_camera_on(pawn)
+    local mesh = ue.prop(pawn, "Mesh")
+    local scoped = ue.valid(mesh) and ue.prop(mesh, "bVisible") == false
+    local view = scoped and "scope" or (fp and "fp" or "")
+    if view ~= own_view then
+        own_view = view
+        log.debug("look: own view now %s%s", view == "" and "third person" or view,
+            view == "" and "" or " (hidden only for the own camera; others get the third-person flags)")
+    end
     local parts = { "m=" .. ((ue.prop(pawn, "IsPlayerMale?") == true) and "1" or "0") }
     for _, comp in ipairs(mesh_comps(pawn)) do
         local name = ue.short(comp)
         if not SKIP_COMPS[name] and ue.prop(comp, "bOnlyOwnerSee") ~= true then
             local flags = flags_of(comp)
+            if scoped then flags = (flags:gsub("v", "")) end
             if FP_COMPS[name] then
                 if fp then flags = tp_flags[name] or "" else tp_flags[name] = flags end
             end
@@ -328,11 +382,39 @@ local function apply_sex(pawn, s)
     end
 end
 
+-- A look from an older SDCoop (before look_string published the third-person
+-- flags) still carries what the sender's own scope / binoculars camera hides:
+-- "v" on every body and clothing part (SetEnableScope @76) and "h" on Head &
+-- co (SetFPMeshesVisibility @49). Neither is ever part of the third-person
+-- look (nothing else in the game clears bVisible of a player's part or hides
+-- Head; HairMesh / BeardMesh "h" alone is the helmet / no beard), and a
+-- version mismatch only warns, so such a look drops its "v" and leaves the
+-- head flags as the last third-person look set them.
+local function own_view_leaked(s)
+    for entry in s:gmatch("[^;]+") do
+        local name, flags = entry:match("^([^=]+)=[^,]*,[^,]*,(.*)$")
+        if flags and (flags:find("v", 1, true) or (name == "Head" and flags:find("h", 1, true))) then
+            return true
+        end
+    end
+    return false
+end
+local leak_noted = {}   -- [pawn address] = true: logged once
+
 -- skip: component names not to touch (dressed from replicated data).
 local function apply_look(pawn, s, skip)
     local leader = ue.prop(pawn, "Mesh")
     local changed, failed = 0, 0
     local what = {}   -- "<component>:mesh|mat|flags old->new", for the log
+    local leaked = own_view_leaked(s)
+    if leaked then
+        local key = addr(pawn) or ue.short(pawn)
+        if not leak_noted[key] then
+            leak_noted[key] = true
+            log.info("look: %s sends the flags of its own scope / first-person camera (older SDCoop there?): "
+                .. "kept visible, head as in its last third-person look", ue.short(pawn))
+        end
+    end
     for entry in s:gmatch("[^;]+") do
         local m = entry:match("^m=(%d)$")
         if m then
@@ -372,8 +454,9 @@ local function apply_look(pawn, s, skip)
                         mark_bad("material", mat_key, pawn)
                     end
                 end
+                if leaked then flags = (flags:gsub("v", "")) end
                 local had_flags = flags_of(comp)
-                if had_flags ~= flags then
+                if not (leaked and FP_COMPS[name]) and had_flags ~= flags then
                     what[#what + 1] = string.format("%s:flags %s->%s", name, tostring(had_flags), tostring(flags))
                     pcall(function() comp:SetHiddenInGame(flags:find("h", 1, true) ~= nil, false) end)
                     pcall(function() comp:SetVisibility(flags:find("v", 1, true) == nil, false) end)
@@ -393,15 +476,31 @@ end
 local looks = {}        -- [player id] = look string (known on this machine)
 local published = nil   -- own look last sent
 
+-- A client's own character whose co-op look (sdc_charcreate) is not on it
+-- yet: its look is not published now - the host would put that default look
+-- back on the character it has just given the right one (13.11: MYLOOK at
+-- 17:00:03.7 with the old beard / brows / hair colour, the look itself put on
+-- at 17:00:04.4, right on the host only at 17:00:05.8).
+local function own_look_pending(me)
+    if S.role ~= "client" then return false end
+    local cc = package.loaded["sdc_charcreate"]
+    if type(cc) ~= "table" or type(cc.own_look_pending) ~= "function" then return false end
+    local ok, pending = pcall(cc.own_look_pending, me)
+    return ok and pending == true
+end
+
 -- Every machine, every 2 s.
 function M.tick(remote_pcs)
+    if S.role == "host" then M.drop_left(looks, remote_pcs) end
     local me = ue.local_pawn()
     if S.role == "client" then try_hook_onreps() end
     if me then
         if S.role == "client" then M.dress(me, "tick") end
         local s = M.look_string(me)
         local id = player_id(me)
-        if id and s ~= published then
+        if id and s ~= published and own_look_pending(me) then
+            log.debug("look: own look not published yet (the co-op character's look is not on it yet)")
+        elseif id and s ~= published then
             published = s
             looks[id] = s
             if S.role == "host" then
@@ -412,7 +511,7 @@ function M.tick(remote_pcs)
             log.debug("look: own look published (%d bytes)", #s)
         end
     end
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    for _, p in ipairs(ue.player_chars() or {}) do
         if ue.valid(p) and not is_local(p) then
             local id = player_id(p)
             local s = id and looks[id]
@@ -429,12 +528,15 @@ function M.tick(remote_pcs)
     end
 end
 
+-- Host: every look known here to a client that said HI (players who left
+-- are dropped first).
 function M.send_all(pc)
+    if S and S.role == "host" then M.drop_left(looks, S.remote_pcs) end
     for id, s in pairs(looks) do net.send_to(pc, "LOOK", id, s) end
 end
 
 function M.reset()
-    looks, published, tp_flags, bad_paths = {}, nil, {}, {}
+    looks, published, tp_flags, bad_paths, own_view, leak_noted = {}, nil, {}, {}, "", {}
 end
 
 function M.register_handlers()

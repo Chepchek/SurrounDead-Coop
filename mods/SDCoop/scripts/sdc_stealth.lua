@@ -35,7 +35,8 @@
 --   trace:  a post-hook on BP_ZombieAIController.PerceptionUpdate logs which
 --           sense noticed a player (sight / hearing, distance, crouch, gait),
 --           at most one line per zombie, player and sense every 10 s.
--- Config: stealth_sync (cap), stealth_trace (log). Kept state: addresses,
+-- Config: stealth_sync (cap; the host's noise hook only with it), stealth_trace
+-- (log; its own PerceptionUpdate hook). Kept state: addresses,
 -- numbers and strings only; objects come from hook parameters or this tick.
 --
 -- Gunshots (combat.md section 4, surroundsync_compare.md C2). The game reports
@@ -129,6 +130,9 @@ local TAG_WEAPON_NOISE = "Jig.AttachmentStat.WeaponNoise"
 -- module state
 local hooks = { noise = false, trace = false }
 local trace_fail_logged = false
+-- Blueprint hooks whose class is not loaded yet: the next try (sdc_ue.backoff)
+local RETRY_S, RETRY_MAX_S = 1, 30
+local retry = { shot = { next_try = 0 }, trace = { next_try = 0 } }
 local slow_at, summary_at, summary_sig = -1000, -1000, ""
 local last_role, last_world = nil, nil
 local host_active, client_active, trace_active = false, false, false
@@ -160,12 +164,7 @@ local function cap_on() return cfg.get("stealth_sync") ~= false end
 local function trace_on() return cfg.get("stealth_trace") ~= false end
 local function shot_on() return cfg.get("shot_noise") ~= false end
 
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
+local get = ue.param
 
 local function near(a, b, tol) return math.abs(a - b) <= tol end
 
@@ -379,16 +378,14 @@ end
 
 -- One native hook for both roles: AISense_Hearing.ReportNoiseEvent(
 -- WorldContextObject, NoiseLocation, Loudness, Instigator, MaxRange, Tag).
+-- A subscriber of sdc_ue.hook_native: it runs in its own pcall there.
 local function on_noise(_, wco_p, loc_p, loud_p, inst_p, range_p, tag_p)
-    local ok, err = pcall(function()
-        if not S then return end
-        if S.role == "host" then
-            if host_active then on_noise_host(wco_p, loc_p, loud_p, inst_p, range_p, tag_p) end
-        elseif S.role == "client" then
-            if client_active then on_noise_client(wco_p, loc_p, loud_p, inst_p, range_p, tag_p) end
-        end
-    end)
-    if not ok then log.err_throttled("stealth.noise", "stealth: ReportNoiseEvent hook: %s", tostring(err)) end
+    if not S then return end
+    if S.role == "host" then
+        if host_active then on_noise_host(wco_p, loc_p, loud_p, inst_p, range_p, tag_p) end
+    elseif S.role == "client" then
+        if client_active then on_noise_client(wco_p, loc_p, loud_p, inst_p, range_p, tag_p) end
+    end
 end
 
 -- Host: STEALTH|range|kind|mult from a client (its own footsteps).
@@ -643,7 +640,7 @@ end
 -- Ticks
 -- ---------------------------------------------------------------------------
 
-local function try_hooks()
+local function try_hooks(now)
     local want_noise = (S.role == "host" and host_active) or (S.role == "client" and client_active)
     if want_noise and not hooks.noise then
         local ok, err = ue.hook_native(HEARING_FN, "stealth.noise", on_noise)
@@ -654,8 +651,8 @@ local function try_hooks()
             log.err_throttled("stealth.hook", "stealth: ReportNoiseEvent hook failed: %s", tostring(err))
         end
     end
-    if S.role == "host" and shot.any and shot_on() and not shot.hooked then
-        -- the firearm class loads with the first firearm: retried every second until then
+    if S.role == "host" and shot.any and shot_on() and not shot.hooked and now >= retry.shot.next_try then
+        -- the firearm class loads with the first firearm: retried until then, less often each time
         local ok, err = pcall(RegisterHook, SHOT_FX_FN, function(c, emitter_p, attach_p)
             local okc, e = pcall(on_shot_fx, c, emitter_p, attach_p)
             if not okc then log.err_throttled("stealth.shotfx", "stealth: Svr_WeaponEffects hook: %s", tostring(e)) end
@@ -663,13 +660,16 @@ local function try_hooks()
         if ok then
             shot.hooked = true
             log.info("stealth: Svr_WeaponEffects hook ok (clients' gunshots reach the AI)")
-        elseif not shot.fail_logged then
-            shot.fail_logged = true
-            log.debug("stealth: Svr_WeaponEffects hook not ready (%s)", tostring(err))
+        else
+            ue.backoff(retry.shot, now, RETRY_S, RETRY_MAX_S)
+            if not shot.fail_logged then
+                shot.fail_logged = true
+                log.debug("stealth: Svr_WeaponEffects hook not ready (%s)", tostring(err))
+            end
         end
     end
-    if trace_active and not hooks.trace then
-        -- the class loads with the first zombie: retried every second until then
+    if trace_active and not hooks.trace and now >= retry.trace.next_try then
+        -- the class loads with the first zombie: retried until then, less often each time
         local ok, err = pcall(RegisterHook, PERCEPTION_FN, function(c, actor_p, stim_p)
             local okc, e = pcall(on_perception, c, actor_p, stim_p)
             if not okc then log.err_throttled("stealth.trace", "stealth: PerceptionUpdate hook: %s", tostring(e)) end
@@ -677,9 +677,12 @@ local function try_hooks()
         if ok then
             hooks.trace = true
             log.info("stealth: zombie PerceptionUpdate hook ok")
-        elseif not trace_fail_logged then
-            trace_fail_logged = true
-            log.debug("stealth: PerceptionUpdate hook not ready (%s)", tostring(err))
+        else
+            ue.backoff(retry.trace, now, RETRY_S, RETRY_MAX_S)
+            if not trace_fail_logged then
+                trace_fail_logged = true
+                log.debug("stealth: PerceptionUpdate hook not ready (%s)", tostring(err))
+            end
         end
     end
 end
@@ -724,7 +727,8 @@ local function host_slow()
     local me = ue.local_pawn()
     host_pawn = me and addr(me) or nil
     local any = next(live) ~= nil
-    host_active = any and (cap_on() or trace_on())
+    -- the noise hook on the host only caps (stealth_sync); the trace has its own hook
+    host_active = any and cap_on()
     trace_active = any and trace_on()
     shot.any = any
     client_active = false
@@ -772,6 +776,7 @@ function M.reset(why)
     trace_last, trace_keys, first_kind = {}, 0, {}
     host_active, client_active, trace_active = false, false, false
     shot.owner, shot.own, shot.dirty, shot.any = {}, {}, false, false
+    retry.shot, retry.trace = { next_try = 0 }, { next_try = 0 }   -- a new world: classes load again
     if had then log.info("stealth: reset (%s)", tostring(why)) end
 end
 
@@ -799,8 +804,8 @@ function M.tick()
         host_active, client_active, trace_active = false, false, false
         return
     end
-    try_hooks()
-    if host_active and now - summary_at >= SUMMARY_S then
+    try_hooks(now)
+    if (host_active or trace_active) and now - summary_at >= SUMMARY_S then
         summary_at = now
         local sig = kinds_str(M.stats.host) .. M.stats.capped .. "|" .. M.stats.seen .. "|" .. M.stats.heard
         if sig ~= summary_sig then

@@ -457,11 +457,56 @@ check(sent("NOTE") == 0, "90 m away (a left-over CurrentActor): not sent")
 H.ctx.scope_resolver = nil
 rpawn._p._loc = nil
 
+print("== N17. a client's battery into a charger that names nobody (CurrentActor not that client): the note goes to the client")
+local MOVE_FN = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestMoveItemToAnotherComp"
+new(HW, { "Function" }, "SERVER_RequestMoveItemToAnotherComp", {}, {}, MOVE_FN)
+WORLD = HW; H.notes.try_hooks(true)
+check(HW.hooks[MOVE_FN] and #HW.hooks[MOVE_FN] == 1, "host hooked SERVER_RequestMoveItemToAnotherComp")
+HW.outbox = {}
+advance(5)
+local charger = new(HW, { "Buildable_BatteryCharger_C" }, "Buildable_BatteryCharger_C_2147300010", {})
+local cjig = new(HW, { "BP_JigComponent_C" }, "BP_JigMultiplayer_7", { _owner = charger })
+local GEN = "Generator needed to charge battery"
+-- inside the client's move: Handle Comp to Comp Move -> the charger's JigMP_OnMainContainerItemAdded -> its note
+game_note(HW, GEN, nil, WHITE, 2, false, charger)
+check(on_screen(HW, GEN) == 1, "(the game put it on the host's screen: no scope named the client)")
+fire(HW, MOVE_FN, param(rjig), param(rjig), param(cjig), param({}), param(nil), param(0), param(nil))
+check(on_screen(HW, GEN) == 0, "taken off the host's screen")
+check(sent("NOTE") == 1, "sent to the client")
+settle()
+check(on_screen(CW, GEN) == 1, "on the client's screen")
+advance(5)
+game_note(HW, GEN, nil, WHITE, 2, false, charger)
+fire(HW, MOVE_FN, param(hjig), param(hjig), param(cjig), param({}), param(nil), param(0), param(nil))
+check(on_screen(HW, GEN) == 1 and sent("NOTE") == 0, "the host's own move into it: on the host's screen, nothing sent")
+advance(5)
+local box2 = new(HW, { "Buildable_StorageBox_C" }, "Buildable_StorageBox_C_2147300011", {})
+local bjig = new(HW, { "BP_JigComponent_C" }, "BP_JigMultiplayer_8", { _owner = box2 })
+game_note(HW, "Charger test note", nil, WHITE, 2, false, charger)
+fire(HW, MOVE_FN, param(rjig), param(rjig), param(bjig), param({}), param(nil), param(0), param(nil))
+check(on_screen(HW, "Charger test note") == 1 and sent("NOTE") == 0, "a client's move into another container does not take the charger's note")
+HW.outbox = {}
+
+print("== N18. a bite on the host's copy of a client's fishing rod: not sent (its machine has its own), logged")
+local rfish = new(HW, { "FishingComponent_C" }, "FishingComponent_1", { _owner = rpawn })
+local hfish = new(HW, { "FishingComponent_C" }, "FishingComponent_0", { _owner = HW.pawn })
+local b0 = H.notes.stats.fish_bites
+advance(5)
+game_note(HW, "You feel a tug on the line", nil, WHITE, 2, false, rfish)
+check(sent("NOTE") == 0 and on_screen(HW, "You feel a tug on the line") == 0, "not sent, not on the host's screen")
+check(H.notes.stats.fish_bites == b0 + 1, "counted as a bite of the host's copy (diagnostics)")
+game_note(HW, "You didn't catch anything", nil, WHITE, 2, false, rfish)
+check(H.notes.stats.fish_bites == b0 + 1, "other fishing notes are not bites")
+game_note(HW, "You feel a tug on the line", nil, WHITE, 2, false, hfish)
+check(H.notes.stats.fish_bites == b0 + 1 and on_screen(HW, "You feel a tug on the line") == 1,
+    "the host's own rod: its bite on its own screen, not counted")
+
 print("== N15. status")
 WORLD = HW
 local sl = H.notes.status_line()
 print("  " .. sl)
 check(sl:find("relayed=", 1, true) ~= nil and sl:find("notes+", 1, true) ~= nil, "status line with the hooks")
+check(sl:find("moved=1 host-copy bites=1", 1, true) ~= nil and sl:find("move+", 1, true) ~= nil, "status: moved=1, host-copy bites=1, move hook")
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

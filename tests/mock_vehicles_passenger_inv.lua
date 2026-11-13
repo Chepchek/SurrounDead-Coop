@@ -181,6 +181,8 @@ ctx.scope_resolver = function(wco) if wco == gi then return nil end return nil e
 local V = require("sdc_vehicles")
 local S = { role = "host", remote = {}, remote_pcs = {}, client = nil }
 V.install(S)
+-- (the driver's exit moves nobody: the host takes the wheel with its seat key,
+-- SEATK.on_key; the key itself: mock_vehicles_seats W / K)
 
 -- ------------------------------------------------------------ world
 local CHAR_HOOK = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:VehicleInteraction"
@@ -490,6 +492,9 @@ local function last_warn() return warns[#warns] or "" end
 local IK = V._t.ik
 
 print("setup")
+-- (0.7.3: the hooks that only name the cause of a quick close - the interact
+-- key, the distance check, a loot window - are registered with config debug)
+log.debug_enabled = true
 ctx.tick(S.remote_pcs)
 V.tick()
 local truck = new_vehicle("Vehicle_FlatbedTruck_C_2147475976", { X = 1050, Y = 0, Z = 80 })
@@ -497,8 +502,7 @@ T = T + 3
 V.tick()
 check(hooks[IA_HOOK] ~= nil and hooks[TOGGLE_HOOK] ~= nil and hooks[DIST_HOOK] ~= nil and hooks[INTERACT_HOOK] ~= nil,
     "the inventory key / ToggleInventory / closing callers are hooked")
-check(tab_cb == nil and said("inventory key watch on (Tab read on the game thread each frame while seated") ~= nil,
-    "Tab is read on the game thread, no UE4SS key bind (its thread runs Lua beside the unlocked native hooks)")
+check(tab_cb == nil, "Tab is read on the game thread, no UE4SS key bind (its thread runs Lua beside the unlocked native hooks)")
 -- not seated: no key read at all
 local reads0 = 0
 local key_read = host_pc._m.IsInputKeyDown
@@ -661,10 +665,12 @@ press_tab(true)
 run_delayed()
 check(not inv_w._in and n_lines(warns, "s after it opened") + n_lines(infos, "s after it opened") == n8, "P8: a window open for 3 s: no quick-close line")
 
-print("P9. the host takes the wheel: lost presses there are only logged")
+print("P9. the host takes the wheel (its seat key): lost presses there are only logged")
 T = T + 5
 deliver("VEXIT", with(vstr(truck), "d", "40.0", "driver"), cl_pc)
-check(V._t.vs()[truck._addr].host_seat == "driver", "P9: the host drives")
+check(V._t.vs()[truck._addr].host_seat == "passenger", "P9: the driver out: the host stays a passenger")
+V._t.seatk.on_key()
+check(V._t.vs()[truck._addr].host_seat == "driver", "P9: the host's seat key: the host drives")
 T = T + 1
 V.tick()
 local t9 = toggles

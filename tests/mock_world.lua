@@ -419,8 +419,19 @@ local info = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = HW.paths["/Game/Inve
 local drop = new(HW, { "BP_StaticMeshPickup_C" }, "BP_StaticMeshPickup_C_3")
 fire(HW, "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:JigMP_OnRequestDropItem", param(rpawn), param(info), param(nil), param(drop))
 run_timers(HW)
-check(called(rjig, "Add") ~= nil, "drop for the remote player went to its inventory")
-check(drop._valid == false, "the dropped pickup removed")
+-- (no word from that client's screen: the drop waits for one, then that
+-- screen is asked where it goes - sdc_place - never the plugin's any-grid add)
+check(called(rjig, "Add") == nil and drop._valid == true, "a world resource's drop waits for the client's word first")
+local asked = {}
+local prev_place = package.loaded["sdc_place"]
+package.loaded["sdc_place"] = { ask = function(p, d, n, dp, why) asked[#asked + 1] = { p = p, d = d, n = n, dp = dp, why = why }; return true end }
+advance(H.world._t.harvest.SPOT_WAIT + 0.1)
+H.world._t.harvest.pend_pass(os.clock())
+package.loaded["sdc_place"] = prev_place
+check(called(rjig, "Add") == nil, "no word in time: not the plugin's any-grid add")
+check(#asked == 1 and asked[1].p == rpawn and asked[1].n == 9 and asked[1].dp == LVL .. "BP_StaticMeshPickup_C_3",
+    "no word in time: that client's screen is asked where it goes, with its drop")
+check(drop._valid == true, "the drop waits at its feet for the answer (sdc_place removes it once the item is in)")
 check(H.world.resolver(HW.paths[LVL .. "BP_WarehouseDoors_C_1"]) == nil and prev_called > 0, "other objects fall through to the previous resolver")
 
 -- a rock / trash pile that hands out its resource inside the swing
@@ -479,6 +490,18 @@ fire(HW, "/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C:Spaw
 deliver()
 check(called(CW.jig, "SERVER_RequestConsumeItem") ~= nil, "client consumed the placed item")
 check(called(CW.bc, "Event_StopBuildMode") ~= nil, "client left build mode (no more items)")
+-- placing from a ground pickup (PickupRef): no Blueprint of game 0.8.0 sets it; if
+-- an update ever does, the tail still runs here and the log says it is not mirrored
+local gpick = new(CW, { "BP_StaticMeshPickup_C" }, "BP_StaticMeshPickup_C_2147300001", {},
+    { PickupBuildFromGround = rec("PickupBuildFromGround") })
+CW.bc._p.PickupRef = gpick
+local warned, warn0 = {}, C.log.warn
+C.log.warn = function(m, ...) warned[#warned + 1] = string.format(m, ...); return warn0(m, ...) end
+WORLD = CW; C.net.handlers.WBUILT({ "0" }, CW.pc)
+C.log.warn = warn0
+CW.bc._p.PickupRef = nil
+check(called(gpick, "PickupBuildFromGround") ~= nil and #warned == 1 and warned[1]:find("ground pickup", 1, true) ~= nil,
+    "a placement from a ground pickup: the game's tail here, and a warning that the host's pickup stays")
 
 print("== 8. horde boss")
 WORLD = HW
@@ -732,6 +755,83 @@ local ctree5 = new(CW, { "BP_HarvestableObject_Tree_C", "BP_HarvestableObject_C"
 C.net.handlers["WFOL"]({ C.world.pack(LVL .. "InstancedFoliageActor_0.FoliageISMC_5"), "8000,0,0", "" }, CW.pc)
 advance(2.5); WORLD = CW; C.world.tick()
 check(ctree5c._p.StaticMesh == CW.paths["/Game/Foliage/SM_Tree.SM_Tree"], "a harvestable the watch missed is found by a scan and shown")
+check(called(ccomp3, "SetMobility") == nil, "a tree's mesh component is left as it is (its construction made it movable)")
+
+print("== 13b. rocks: the host's rock (Static mesh component) shown on the client, the client's hits counted")
+do
+    local ROCK_CLS = "/Game/Blueprints/Other/HarvestableObjects/BP_HarvestableObject_Rocks.BP_HarvestableObject_Rocks_C"
+    local rlines = {}
+    local w0, i0 = C.log.warn, C.log.info
+    C.log.warn = function(msg, ...) rlines[#rlines + 1] = string.format(msg, ...); return w0(msg, ...) end
+    C.log.info = function(msg, ...) rlines[#rlines + 1] = string.format(msg, ...); return i0(msg, ...) end
+    local function rlogged(pat) for _, s in ipairs(rlines) do if s:find(pat, 1, true) then return s end end return nil end
+    WORLD = CW
+    local sm_rock = new(CW, { "StaticMesh" }, "SM_Rock01", {}, {}, "/Game/Foliage/SM_Rock01.SM_Rock01")
+    new(CW, { "FoliageInstancedStaticMeshComponent" }, "InstancedFoliageActor_0.FoliageISMC_9",
+        { _owner = CW.paths[LVL .. "InstancedFoliageActor_0"], StaticMesh = sm_rock }, {
+        GetInstancesOverlappingSphere = function() return {} end,
+        GetInstanceTransform = function() return false end,
+        RemoveInstance = rec("RemoveInstance") })
+    -- the engine: SetStaticMesh on a registered Static component after BeginPlay
+    -- does nothing; SetMobility(Movable) on a parent makes its children Movable
+    local function comp(name, mesh_comp, never)
+        local m = { SetMobility = function(self, v)
+            self._calls[#self._calls + 1] = { "SetMobility", v }
+            self._p.Mobility = v
+            if v == 2 then for _, ch in ipairs(self._kids or {}) do ch:SetMobility(2) end end
+        end }
+        if mesh_comp then
+            m.SetStaticMesh = function(self, mesh)
+                self._calls[#self._calls + 1] = { "SetStaticMesh", mesh }
+                if never or self._p.Mobility ~= 2 then return false end
+                self._p.StaticMesh = mesh
+                return true
+            end
+        end
+        return new(CW, { mesh_comp and "StaticMeshComponent" or "SceneComponent" }, name, { Mobility = 0 }, m)
+    end
+    local function crock_at(name, x, never)
+        local sm = comp(name .. ".StaticMesh", true, never)
+        local root = comp(name .. ".DefaultSceneRoot", false)
+        root._kids = { sm }
+        local a = new(CW, { "BP_HarvestableObject_Rocks_C", "BP_HarvestableObject_C" }, name,
+            { _loc = { X = x, Y = 0, Z = 0 }, Role = 1, MaxHits = 5, StaticMesh = sm },
+            { K2_GetRootComponent = function() return root end })
+        notify_w(CW, ROCK_CLS, a)
+        C.net.handlers["WFOL"]({ C.world.pack(LVL .. "InstancedFoliageActor_0.FoliageISMC_9"), x .. ",0,0", "" }, CW.pc)
+        return a, sm, root
+    end
+    local crock, crsm, crroot = crock_at("BP_HarvestableObject_Rocks_C_2147400010", 9500)
+    WORLD = CW; C.world.tick()
+    check(crroot._p.Mobility == 2 and crsm._p.Mobility == 2, "client made the host's rock movable (root and mesh component)")
+    check(crsm._p.StaticMesh == sm_rock and crock._p.Mesh == sm_rock, "client's copy of the host's rock got its mesh (was refused while Static)")
+    check(rlogged("the host's rock BP_HarvestableObject_Rocks_C_2147400010 at 9500,0,0 shown here (mesh SM_Rock01, made movable)") ~= nil,
+        "the first rock shown is logged at info")
+    -- the host's rock at that place; the client's own swing hits its copy
+    WORLD = HW
+    local hrock = new(HW, { "BP_HarvestableObject_Rocks_C", "BP_HarvestableObject_C" }, "BP_HarvestableObject_Rocks_C_2147300010",
+        { _loc = { X = 9500, Y = 0, Z = 0 }, Role = 3, MaxHits = 5 })
+    for k, fn in pairs(HARV_METHODS) do hrock._m[k] = fn end
+    advance(1)
+    CW.outbox = {}
+    fire(CW, HARV .. "HitFoliageRock", param(cknife), param(crock), param({ X = 9500, Y = 10, Z = 50 }), param(nil), param(0), param(1))
+    WORLD = CW; C.world.tick()
+    check(#CW.outbox == 1 and CW.outbox[1]:find("WHHIT|r|9500,0,0|1|", 1, true) ~= nil, "client sent its rock hit (" .. tostring(CW.outbox[1]) .. ")")
+    deliver()
+    check(called(hrock, "HitHarvestableObject") ~= nil and hrock._p.MaxHits == 6, "host ran the rock's HitHarvestableObject (MaxHits " .. tostring(hrock._p.MaxHits) .. ")")
+    WORLD = HW
+    check(H.world.resolver(hrock) == rpc, "the rock's player 0 = the client who hit it (its stone)")
+    -- a component that still refuses: not called shown, said once, tried again
+    local _, bsm = crock_at("BP_HarvestableObject_Rocks_C_2147400011", 9900, true)
+    WORLD = CW; C.world.tick()
+    check(bsm._p.StaticMesh == nil and rlogged("cannot be shown here: its mesh component did not take SM_Rock01") ~= nil,
+        "a rock whose component still refuses the mesh is reported, not called shown")
+    local n_set = 0
+    advance(1.5); WORLD = CW; C.world.tick()
+    for _, c in ipairs(bsm._calls) do if c[1] == "SetStaticMesh" then n_set = n_set + 1 end end
+    check(n_set >= 2, "and tried again (" .. n_set .. " tries)")
+    C.log.warn, C.log.info = w0, i0
+end
 
 print("== 14. foliage lookup when UE4SS fills the out table itself / the overlap query fails")
 local function alt_ism(w, inst, inplace, overlap_fails)
@@ -1061,6 +1161,409 @@ WORLD = HW
 print(H.world.status_line())
 WORLD = CW
 print(C.world.status_line())
+
+-- ===========================================================================
+-- 2026-11-13 log review (0.8.1), world group
+-- ===========================================================================
+local review_lines = {}
+for _, m in ipairs({ H, C }) do
+    for _, lv in ipairs({ "info", "warn", "debug" }) do
+        local f0 = m.log[lv]
+        m.log[lv] = function(msg, ...)
+            local ok, s = pcall(string.format, msg, ...)
+            review_lines[#review_lines + 1] = ok and s or tostring(msg)
+            return f0(msg, ...)
+        end
+    end
+end
+local function nlogged(pat)
+    local n = 0
+    for _, s in ipairs(review_lines) do if s:find(pat, 1, true) then n = n + 1 end end
+    return n
+end
+
+print("== 19. a client's camp AI volume: switched off at its first blocked spawn")
+do
+    WORLD = CW
+    local SPAWN_AI = "/Script/AIModule.AIBlueprintHelperLibrary:SpawnAIFromClass"
+    local function tarray(items, broken)
+        return { _items = items, Empty = function(self)
+            if broken then error("Empty: no such method") end
+            self._items = {}
+        end }
+    end
+    local function camp_volume(w, name, broken)
+        WORLD = w
+        return new(w, { "BP_AISpawningVolume_Prefab_C" }, name, {
+            Role = 3, ["Enable Spawn AI"] = true, ["Respawn AI"] = true, ["Spawn Retries"] = 5,
+            ["Remaining Spawning AI"] = tarray({ { SpawnCount = 3 } }, broken),
+            ["Spawning AI"] = tarray({ { SpawnCount = 3 } }, broken) })
+    end
+    -- the volume's own loop (BP_AISpawningVolume_Prefab): every Spawn Time a
+    -- Spawn Location Trace while Remaining Spawning AI has entries (@98),
+    -- Spawn Retries + 1 tries in it (@142); a failed spawn leaves the list as
+    -- it was (@3168 only after a spawn), Restart Spawning starts over
+    local function run_volume(w, vol, rounds)
+        local calls = 0
+        for _ = 1, rounds do
+            if #vol._p["Remaining Spawning AI"]._items == 0 then break end   -- the loop @2908 ends
+            local tries = 0
+            while tries <= vol._p["Spawn Retries"] do
+                local cp = param(bandit)
+                fire(w, SPAWN_AI, param(nil), param(vol), cp)
+                calls = calls + 1
+                if cp._v() == bandit then break end   -- spawned (not blocked)
+                tries = tries + 1
+            end
+        end
+        return calls
+    end
+    local st = C.world.stats
+    local s0, a0, b0 = st.prefab_ai_stopped, st.prefab_ai_again, st.prefab_ai_blocked
+    local vol = camp_volume(CW, "BP_AISpawningVolume_Prefab_C_2147473800")
+    local calls = run_volume(CW, vol, 30)
+    check(calls == 1, "30 rounds of the volume's loop: one blocked spawn, then none (" .. calls .. " SpawnAIFromClass calls; 180 before)")
+    check(vol._p["Spawn Retries"] == -1 and vol._p["Enable Spawn AI"] == false and vol._p["Respawn AI"] == false,
+        "switched off its own way (Spawn Retries -1, Enable Spawn AI / Respawn AI false)")
+    check(#vol._p["Remaining Spawning AI"]._items == 0 and #vol._p["Spawning AI"]._items == 0, "both spawn lists emptied")
+    check(st.prefab_ai_stopped - s0 == 1 and st.prefab_ai_again == a0 and st.prefab_ai_blocked - b0 == 1,
+        "counted: 1 blocked, 1 switched off, 0 again")
+    check(nlogged("camp AI volume BP_AISpawningVolume_Prefab_C_2147473800 switched off on this client (3/3 settings, 2/2 spawn lists emptied)") == 1,
+        "logged once, with what was set")
+    -- lists that cannot be emptied: Spawn Retries -1 alone ends the tries
+    local vol2 = camp_volume(CW, "BP_AISpawningVolume_Prefab_C_2147473801", true)
+    calls = run_volume(CW, vol2, 30)
+    check(calls == 1, "lists not emptied: still one call in 30 rounds (" .. calls .. ")")
+    check(nlogged("BP_AISpawningVolume_Prefab_C_2147473801 switched off on this client (3/3 settings, 0/2 spawn lists emptied)") == 1,
+        "the log says the lists stayed")
+    -- the camp's copy made again (it came back in range): a new volume at the old address
+    local vol3 = camp_volume(CW, "BP_AISpawningVolume_Prefab_C_2147473802")
+    vol3._addr = vol._addr
+    calls = run_volume(CW, vol3, 30)
+    check(calls == 1 and vol3._p["Spawn Retries"] == -1, "a new volume at the old address is switched off too (" .. calls .. ")")
+    -- a volume whose settings cannot be written: the loop goes on, counted as "again", warned once
+    local vol4 = camp_volume(CW, "BP_AISpawningVolume_Prefab_C_2147473803", true)
+    vol4.SetPropertyValue = function() error("SetPropertyValue failed") end
+    calls = run_volume(CW, vol4, 3)
+    check(calls == 18, "settings not written: the loop goes on (" .. calls .. " calls in 3 rounds)")
+    check(st.prefab_ai_again - a0 == 17, "17 spawns blocked again after the switch-off (" .. (st.prefab_ai_again - a0) .. ")")
+    check(nlogged("camp AI volume BP_AISpawningVolume_Prefab_C_2147473803 still tries to spawn after it was switched off") == 1,
+        "warned once for that volume")
+    check(nlogged("BP_AISpawningVolume_Prefab_C_2147473803 switched off on this client (0/3 settings") == 1, "its switch-off line says 0/3")
+    -- [PERF] world: the window's counts, on the client's tick
+    WORLD = CW
+    C.world.tick()
+    advance(61)
+    C.world.tick()
+    local perf = nil
+    for _, s in ipairs(review_lines) do if s:find("[PERF] world", 1, true) then perf = s end end
+    check(perf ~= nil and perf:find("camp AI spawns blocked on this client", 1, true) ~= nil
+        and perf:find("blocked again after a switch-off 17", 1, true) ~= nil,
+        "[PERF] world line with the blocked spawns - " .. tostring(perf))
+    local nperf = nlogged("[PERF] world")
+    advance(61)
+    C.world.tick()
+    check(nlogged("[PERF] world") == nperf, "a window without blocked spawns: no [PERF] world line")
+    check(C.world.status_line():find("camp AI volumes switched off=", 1, true) ~= nil, "status line: volumes switched off")
+    -- the host's own camp volume spawns its bandits as before
+    local hvol = camp_volume(HW, "BP_AISpawningVolume_Prefab_C_2147473900")
+    local hcp = param(bandit)
+    fire(HW, SPAWN_AI, param(nil), param(hvol), hcp)
+    check(hcp._v() == bandit and hvol._p["Spawn Retries"] == 5 and hvol._p["Enable Spawn AI"] == true
+        and #hvol._p["Remaining Spawning AI"]._items == 1, "host: its camp volume untouched")
+end
+
+print("== 20. a client's door on the host: no echo back to it, the other clients told once")
+do
+    local DOOR_EV = "/Game/Blueprints/Other/Doors/BP_LockedDoor.BP_LockedDoor_C:Event_Door"
+    local DIR = "Timeline_OpenDoor__Direction_CA4B83EF45872B61E7779EAD32D6380C"
+    local other = {}
+    WORLD = HW
+    local conn2 = new(HW, { "IpConnection" }, "IpConnection_2")
+    local rpc2 = new(HW, { "BP_PlayerController_C", "PlayerController" }, "BP_PlayerController_C_2",
+        { NetConnection = conn2, Player = conn2 }, { ClientMessage = function(self, msg) other[#other + 1] = msg end })
+    HS.remote_pcs = { rpc, rpc2 }
+    local function door(w)
+        WORLD = w
+        local tl = new(w, { "TimelineComponent" }, "TL12_" .. w.id, {}, { IsPlaying = function(self) return self._playing == true end })
+        return new(w, { "BP_LockedDoor_C", "BP_LockPickObject_C" }, "BP_LockedDoor_C_12",
+            { ["Closed?"] = true, ["IsLocked?"] = true, Timeline_OpenDoor = tl, [DIR] = 0 },
+            { Event_Door = function(self)
+                self._calls[#self._calls + 1] = { "Event_Door" }
+                if w == CW then
+                    tl._playing = true
+                    self._p[DIR] = self._p["Closed?"] and 0 or 1
+                    fire(w, DOOR_EV, param(self))
+                else
+                    -- the host as on 2026-11-13: inside the call the door still reads closed
+                    fire(w, DOOR_EV, param(self))
+                    tl._playing = true
+                    self._p[DIR] = self._p["Closed?"] and 0 or 1
+                end
+            end })
+    end
+    local hd = door(HW)
+    local cd = door(CW)
+    local function host_out()
+        local out = {}
+        for _ = 1, 6 do
+            WORLD = HW; H.world.tick()
+            for _, m in ipairs(HW.outbox) do out[#out + 1] = m end
+            HW.outbox = {}
+        end
+        return out
+    end
+    local function doors_in(list)
+        local n, last = 0, nil
+        for _, m in ipairs(list) do
+            if m:find("WDOOR", 1, true) and m:find("BP_LockedDoor_C_12", 1, true) then n, last = n + 1, m end
+        end
+        return n, last
+    end
+    host_out()
+    -- the client picked the lock and opens the door
+    WORLD = CW
+    cd._p["IsLocked?"] = false
+    cd:Event_Door()
+    local sent = CW.outbox
+    CW.outbox = {}
+    check(#sent == 1 and sent[1]:find("BP_LockedDoor_C_12", 1, true) ~= nil, "client sent its door")
+    WORLD = HW
+    for _, msg in ipairs(sent) do
+        local kind, f = H.net.decode(msg)
+        H.net.handlers[kind](f, rpc)
+    end
+    check(called(hd, "Event_Door") ~= nil and hd._p["IsLocked?"] == false, "host door opened and unlocked")
+    local back = host_out()
+    local nb = doors_in(back)
+    check(nb == 0, "nothing back to the client that opened it (" .. nb .. " WDOOR)")
+    local no, last = doors_in(other)
+    check(no == 1 and last:find("|d|o|u", 1, true) ~= nil, "the other client told once: open, unlocked (" .. no .. ": " .. tostring(last) .. ")")
+    check(H.world._t.locks.door_in == nil, "no door left marked as applied")
+    -- the host's own use of the door still goes to every client
+    other = {}
+    WORLD = HW
+    hd:Event_Door()
+    local mine = host_out()
+    local n1 = doors_in(mine)
+    local n2 = doors_in(other)
+    check(n1 == 1 and n2 == 1, "the host's own door use: each client told once (" .. n1 .. ", " .. n2 .. ")")
+    HS.remote_pcs = { rpc }
+end
+
+print("== 21. a client-only camp destroyed once, not again every pass until the GC")
+do
+    WORLD = CW
+    local camp = new(CW, { "Alternate_ZombiesObservatory_C", "PrefabMaster_C" }, "Alternate_ZombiesObservatory_C_2147473700", { Role = 3 })
+    local destroys = 0
+    -- the engine marks it for removal; FindAllOf and IsValid still see it until the GC
+    camp.K2_DestroyActor = function() destroys = destroys + 1 end
+    local r0 = C.world.stats.prefab_removed
+    for _ = 1, 12 do advance(5); WORLD = CW; C.world._t.client_only_pass() end
+    check(destroys == 1, "destroyed once in a minute of passes (" .. destroys .. ")")
+    check(C.world.stats.prefab_removed - r0 == 1, "counted once (" .. (C.world.stats.prefab_removed - r0) .. ")")
+    check(nlogged("removed client-only Alternate_ZombiesObservatory_C_2147473700") == 1, "logged once")
+    -- the GC took it; another client-only camp gets the same address: removed
+    camp._valid = false
+    local camp2 = new(CW, { "Alternate_ZombiesObservatory_C", "PrefabMaster_C" }, "Alternate_ZombiesObservatory_C_2147473500", { Role = 3 })
+    camp2._addr = camp._addr
+    advance(5); C.world._t.client_only_pass()
+    check(camp2._valid == false, "a new client-only camp at the freed address is removed")
+end
+
+print("== 22. a locked door's move as the game made it (Closed?), not the timeline's lagging Direction")
+do
+    local DOOR_EV = "/Game/Blueprints/Other/Doors/BP_LockedDoor.BP_LockedDoor_C:Event_Door"
+    local DIR = "Timeline_OpenDoor__Direction_CA4B83EF45872B61E7779EAD32D6380C"
+    local other = {}
+    WORLD = HW
+    local conn3 = new(HW, { "IpConnection" }, "IpConnection_3")
+    local rpc3 = new(HW, { "BP_PlayerController_C", "PlayerController" }, "BP_PlayerController_C_3",
+        { NetConnection = conn3, Player = conn3 }, { ClientMessage = function(self, msg) other[#other + 1] = msg end })
+    HS.remote_pcs = { rpc, rpc3 }
+    -- BP_LockedDoor and its TimelineComponent as the engine runs them:
+    -- Event_Door @4256: PlayFromStart if Closed?, else ReverseFromEnd. FTimeline's
+    -- PlayFromStart / ReverseFromEnd: SetPlaybackPosition (writes the owner's
+    -- Direction from the previous move), then Play / Reverse (bReversePlayback,
+    -- IsReversing). Each tick writes the move's Direction; at the end the
+    -- finished function @4587 sets Closed? from it. pre: the hook runs before
+    -- the body (its timing is not what the sent move depends on).
+    local function real_door(w, name, pre)
+        WORLD = w
+        local d
+        local tl = new(w, { "TimelineComponent" }, "TL_" .. name .. "_" .. w.id, {}, {
+            IsPlaying = function(self) return self._playing == true end,
+            IsReversing = function(self) return self._rev == true end,
+            PlayFromStart = function(self) d._p[DIR] = self._rev and 1 or 0; self._rev, self._playing = false, true end,
+            ReverseFromEnd = function(self) d._p[DIR] = self._rev and 1 or 0; self._rev, self._playing = true, true end,
+        })
+        d = new(w, { "BP_LockedDoor_C", "BP_LockPickObject_C" }, name,
+            { ["Closed?"] = true, ["IsLocked?"] = false, Timeline_OpenDoor = tl, [DIR] = 0 },
+            { Event_Door = function(self)
+                self._calls[#self._calls + 1] = { "Event_Door" }
+                if pre then fire(w, DOOR_EV, param(self)) end
+                if self._p["Closed?"] then tl:PlayFromStart() else tl:ReverseFromEnd() end
+                if not pre then fire(w, DOOR_EV, param(self)) end
+            end })
+        return d
+    end
+    local function frame(d)    -- one tick of its timeline
+        local tl = d._p.Timeline_OpenDoor
+        if tl._playing then d._p[DIR] = tl._rev and 1 or 0 end
+    end
+    local function finish(d)   -- its timeline at the end
+        local tl = d._p.Timeline_OpenDoor
+        if not tl._playing then return end
+        frame(d)
+        tl._playing = false
+        d._p["Closed?"] = d._p[DIR] ~= 0
+    end
+    local function truth(d)    -- what the door really does (test side)
+        local tl = d._p.Timeline_OpenDoor
+        if tl._playing then return tl._rev and "c" or "o" end
+        return d._p["Closed?"] and "c" or "o"
+    end
+    local function host_sent(name)
+        local out = {}
+        for _ = 1, 6 do
+            WORLD = HW; H.world.tick()
+            for _, m in ipairs(HW.outbox) do
+                if m:find("WDOOR", 1, true) and m:find(name, 1, true) then out[#out + 1] = m end
+            end
+            HW.outbox = {}
+        end
+        return out
+    end
+    local function others(name)
+        local out = {}
+        for _, m in ipairs(other) do
+            if m:find("WDOOR", 1, true) and m:find(name, 1, true) then out[#out + 1] = m end
+        end
+        other = {}
+        return out
+    end
+    local function to_client(list)
+        WORLD = CW
+        for _, msg in ipairs(list) do
+            local kind, f = C.net.decode(msg)
+            C.net.handlers[kind](f, CW.pc)
+        end
+    end
+    local function says(list, want) return #list == 1 and list[1]:find("|d|" .. want .. "|", 1, true) ~= nil end
+    local N = "BP_LockedDoor_C_14"
+    local hd, cd = real_door(HW, N), real_door(CW, N)
+    host_sent(N); others(N)
+    -- the host opens, closes, opens, closes its own door; the client's follows
+    for i, want in ipairs({ "o", "c", "o", "c" }) do
+        WORLD = HW
+        hd:Event_Door()
+        local mine, them = host_sent(N), others(N)
+        to_client(mine)
+        check(says(mine, want) and says(them, want) and truth(hd) == want and truth(cd) == want,
+            string.format("host's own press %d: \"%s\" to each client, the client's door follows (%s; client %s)",
+                i, want, tostring(mine[1]), truth(cd)))
+        finish(hd); finish(cd)
+    end
+    -- a press while it opens: the game opens it again, never "c" before it has opened
+    WORLD = HW
+    hd:Event_Door(); host_sent(N); others(N)
+    frame(hd)
+    hd:Event_Door()
+    local again = host_sent(N)
+    check(says(again, "o") and truth(hd) == "o", "a press while opening: \"o\" again (" .. tostring(again[1]) .. ")")
+    to_client(again)
+    finish(hd); finish(cd)
+    hd:Event_Door(); to_client(host_sent(N)); others(N)
+    finish(hd); finish(cd)
+    check(truth(hd) == "c" and truth(cd) == "c", "both closed again")
+    -- the client opens, then closes; the host follows silently, the other client is told
+    for i, want in ipairs({ "o", "c" }) do
+        WORLD = CW
+        cd:Event_Door()
+        local sent = CW.outbox
+        CW.outbox = {}
+        check(#sent == 1 and sent[1]:find("|d|" .. want .. "|", 1, true) ~= nil,
+            string.format("client's press %d sends \"%s\" (%s)", i, want, tostring(sent[1])))
+        WORLD = HW
+        for _, msg in ipairs(sent) do
+            local kind, f = H.net.decode(msg)
+            H.net.handlers[kind](f, rpc)
+        end
+        local back, them = host_sent(N), others(N)
+        check(#back == 0 and says(them, want) and truth(hd) == want,
+            string.format("host door %s, nothing back, the other client told \"%s\" once (%d back, %s)",
+                truth(hd), want, #back, tostring(them[1])))
+        finish(hd); finish(cd)
+    end
+    -- the client's door applied twice in one frame (two "c" in a row): the
+    -- second sees it closing and leaves it (Direction still said "open")
+    WORLD = CW
+    cd:Event_Door(); CW.outbox = {}
+    finish(cd)
+    WORLD = HW
+    hd:Event_Door(); host_sent(N); others(N)
+    finish(hd)
+    local pk = H.world._t.pack(LVL .. N)
+    local n0 = #cd._calls
+    WORLD = CW
+    C.net.handlers.WDOOR({ pk, "d", "c", "u" }, CW.pc)
+    C.net.handlers.WDOOR({ pk, "d", "c", "u" }, CW.pc)
+    check(#cd._calls - n0 == 1 and truth(cd) == "c", "two \"c\" in one frame: the client's door closed once ("
+        .. (#cd._calls - n0) .. " Event_Door)")
+    -- the hook run before the body: the same move goes out
+    local N2 = "BP_LockedDoor_C_15"
+    local hp = real_door(HW, N2, true)
+    real_door(CW, N2, true)
+    host_sent(N2); others(N2)
+    for i, want in ipairs({ "o", "c" }) do
+        WORLD = HW
+        hp:Event_Door()
+        local mine = host_sent(N2)
+        others(N2)
+        check(says(mine, want), string.format("hook before the body, press %d: \"%s\" (%s)", i, want, tostring(mine[1])))
+        finish(hp)
+    end
+    HS.remote_pcs = { rpc }
+end
+
+print("== 23. a world reset forgets switched-off camp volumes and destroyed camps")
+do
+    WORLD = CW
+    local SPAWN_AI = "/Script/AIModule.AIBlueprintHelperLibrary:SpawnAIFromClass"
+    local PFt = C.world._t.prefabs
+    local st = C.world.stats
+    local function list1() return { _items = { { SpawnCount = 3 } }, Empty = function(self) self._items = {} end } end
+    local function vol_at(name, a)
+        WORLD = CW
+        local v = new(CW, { "BP_AISpawningVolume_Prefab_C" }, name, { Role = 3, ["Enable Spawn AI"] = true,
+            ["Respawn AI"] = true, ["Spawn Retries"] = 5, ["Remaining Spawning AI"] = list1(), ["Spawning AI"] = list1() })
+        if a then v._addr = a end
+        return v
+    end
+    local VN = "BP_AISpawningVolume_Prefab_C_2147473810"
+    local v1 = vol_at(VN)
+    fire(CW, SPAWN_AI, param(nil), param(v1), param(bandit))
+    check(v1._p["Spawn Retries"] == -1, "before the reset: the volume switched off")
+    local camp = new(CW, { "Alternate_ZombiesObservatory_C", "PrefabMaster_C" }, "Alternate_ZombiesObservatory_C_2147473710", { Role = 3 })
+    local destroys = 0
+    camp.K2_DestroyActor = function() destroys = destroys + 1 end   -- findable until the GC
+    advance(5); WORLD = CW; C.world._t.client_only_pass()
+    check(destroys == 1, "before the reset: the camp destroyed once (" .. destroys .. ")")
+    WORLD = CW
+    C.world.reset("test: another world")
+    check(next(PFt.vols) == nil and PFt.nvols == 0 and next(PFt.gone) == nil,
+        "reset: no switched-off volume and no destroyed camp remembered")
+    -- the next world's actors at the same address and name: handled anew
+    v1._valid = false
+    local v2 = vol_at(VN, v1._addr)
+    local s0, a0 = st.prefab_ai_stopped, st.prefab_ai_again
+    fire(CW, SPAWN_AI, param(nil), param(v2), param(bandit))
+    check(v2._p["Spawn Retries"] == -1 and st.prefab_ai_stopped - s0 == 1 and st.prefab_ai_again == a0,
+        "after the reset: a volume with the old address and name is switched off, not counted as \"again\"")
+    advance(5); WORLD = CW; C.world._t.client_only_pass()
+    check(destroys == 2, "after the reset: a camp with the old address and name is removed (" .. destroys .. ")")
+    camp._valid = false
+end
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

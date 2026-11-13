@@ -227,10 +227,7 @@ local function on_question(f, pc)
     local n = 0
     for i = 1, #out do
         if n >= ANSWER_MAX then break end
-        -- out-array elements come as params (read with :get())
-        local e = out[i]
-        local okg, o = pcall(function() return e:get() end)
-        if not okg then o = e end
+        local o = ue.elem(out[i])   -- out-array elements come as params
         if ue.valid(o) and ue.role(o) == ue.ROLE_AUTHORITY then
             local kind, cur, std, max = health_of(o)
             if kind and send_hp(pc, o, kind, cur, std, max) then n = n + 1 end
@@ -270,9 +267,8 @@ local function apply_hp(o, d)
     if not ok then return end
     got[ue.name(o)] = clock()
     M.stats.applied = M.stats.applied + 1
-    if core.first("hud.apply", 3) then
-        log.info("ai: hud: health of %s = %.0f/%.0f (host)", ue.short(o), d.cur, d.std)
-    end
+    local say = core.line("hud.apply", 3)
+    if say then say("ai: hud: health of %s = %.0f/%.0f (host)", ue.short(o), d.cur, d.std) end
 end
 
 -- <AI>.AIHealthBarInfo, post (client): the player looks at it (20 times a second)

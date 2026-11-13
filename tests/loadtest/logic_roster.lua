@@ -3,7 +3,10 @@
 -- sdc_session.roster() on the host (itself + remote records with their state
 -- and ping), the host's ROSTER messages from its 1 s tick (on a change, every
 -- 5 s, "me" per receiving client), the client's ROSTER handler and its
--- fallback before the first list. Every other module is an automatic stub.
+-- fallback before the first list. 0.7.3 wave: "lag" (nothing received for
+-- 4 s), "menu" (AWAY: the pause menu), the host's own entry dead / in the
+-- menu, and a client taking the first entry as the host's whatever its
+-- state. Every other module is an automatic stub.
 local dir = arg[1] or "."
 package.path = dir .. "/?.lua;" .. package.path
 
@@ -61,6 +64,9 @@ ue.local_pc = function() return { key = "hostpc", Player = {} } end
 ue.in_main_menu = function() return false end
 ue.net_role = function() return "host" end
 ue.has_pending_connection = function() return false end
+-- the host's own character (its roster entry: "host" while alive, 0.7.3 wave)
+local HOSTPAWN = { key = "hostpawn" }
+ue.local_pawn = function() return HOSTPAWN end
 package.loaded["sdc_ue"] = ue
 
 local cfg = require("sdc_config")
@@ -130,6 +136,56 @@ n = 0
 for _, m in ipairs(sent) do if m.kind == "ROSTER" then n = n + 1 end end
 ok(n == 2, "ROSTER at once when a state changes")
 
+-- 0.7.3 wave: "lag" (nothing received for 4 s), "menu" (AWAY), the host's own state
+local function state_of(name)
+    for _, e in ipairs(session.roster()) do if e.name == name then return e.state end end
+end
+bob.NetConnection.LastReceiveTime = 10.0
+fake_now = fake_now + 1; session.tick()
+fake_now = fake_now + 3; session.tick()
+ok(state_of("Bob") == "game", "lag: 3 s without a packet is still in game")
+fake_now = fake_now + 1; session.tick()
+ok(state_of("Bob") == "lag", "lag: 4 s without a packet -> lag")
+st.remote.bobpc.dead = true
+ok(state_of("Bob") == "lag", "lag: shown before dead (silent is what matters)")
+st.remote.bobpc.dead = false
+local bobpawn = bob.pawn
+bob.pawn = nil
+ok(state_of("Bob") == "loading", "silent while it has no character (a level load): loading, not lag")
+bob.pawn = bobpawn
+bob.NetConnection.LastReceiveTime = 14.5
+fake_now = fake_now + 1; session.tick()
+ok(state_of("Bob") == "game", "lag: a packet again -> in game")
+handlers.AWAY({ "1" }, bob)
+ok(state_of("Bob") == "menu", "AWAY|1: menu")
+st.remote.bobpc.dead = true
+ok(state_of("Bob") == "dead", "dead before menu")
+st.remote.bobpc.dead = false
+handlers.AWAY({ "0" }, bob)
+ok(state_of("Bob") == "game", "AWAY|0: in game again")
+handlers.AWAY({ "1" }, { key = "strangerpc" })
+ok(st.remote.strangerpc == nil, "AWAY from an unknown controller: no record made")
+-- the host's own entry
+HOSTPAWN["PlayerDead?"] = true
+sent = {}
+fake_now = fake_now + 1; session.tick()
+ok(session.roster()[1].state == "dead" and session.roster()[1].host, "host dead: its entry says dead, still the host")
+local hf = nil
+for _, m in ipairs(sent) do if m.kind == "ROSTER" and m.pc == "bobpc" then hf = m.fields end end
+ok(hf and hf[1] == "Hosty" and hf[2] == "dead", "ROSTER sent at once: the host is dead")
+HOSTPAWN["PlayerDead?"] = nil
+local saved_lp = ue.local_pawn
+ue.local_pawn = function() return nil end   -- the body unpossessed: the death screen
+fake_now = fake_now + 1; session.tick()
+ok(session.roster()[1].state == "dead", "host without a character in its world: dead")
+ue.local_pawn = saved_lp
+package.loaded["sdc_lobby"] = { pause_menu_shown = function() return true end }
+fake_now = fake_now + 1; session.tick()
+ok(session.roster()[1].state == "menu", "host's pause menu open: menu")
+package.loaded["sdc_lobby"] = nil
+fake_now = fake_now + 1; session.tick()
+ok(session.roster()[1].state == "host", "host alive, no menu: host")
+
 -- client side: the handler and the fallback
 st.role = "client"
 st.client = { host_name = "Hosty", ping = 77 }
@@ -139,6 +195,10 @@ handlers.ROSTER({ "Hosty", "host", "", "0", "Bob", "game", "40", "1", "Gleb", "l
 r = session.roster()
 ok(#r == 3 and r[1].host and r[2].name == "Bob" and r[2].me and r[2].ping == 40 and r[3].state == "loading"
     and r[3].ping == nil, "client: the host's list")
+handlers.ROSTER({ "Hosty", "dead", "", "0", "Bob", "menu", "40", "1", "Gleb", "lag", "", "0" })
+r = session.roster()
+ok(r[1].host and r[1].state == "dead" and not r[2].host and r[2].state == "menu" and r[3].state == "lag",
+    "client: a dead host is still the host (the first entry); menu / lag states")
 st.client = nil
 ok(#session.roster() == 0, "no client state: empty list")
 st.role = "standalone"

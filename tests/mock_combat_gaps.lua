@@ -608,9 +608,39 @@ check(H.throw.status_line():find("projectiles", 1, true) ~= nil, "host status: "
 check(H.stealth.status_line():find("shots", 1, true) ~= nil, "stealth status has the shots")
 WORLD = CW
 check(C.throw.status_line():find("hit markers=1", 1, true) ~= nil, "client status: " .. C.throw.status_line())
-local rep
-C.dmgnum.report(function(s) rep = s end)
-check(rep and rep:find("hit markers", 1, true) ~= nil, "dmgnum report: " .. tostring(rep))
+-- (2026-11-13: sdc_dmgnum.report, never called by the mod, is gone)
+check(C.dmgnum.stats.markers >= 1, "dmgnum: hit markers counted: " .. tostring(C.dmgnum.stats.markers))
+
+-- ---------------------------------------------------------------- 7. a client's grenade on the host
+-- 0.7.3: a frag the host spawns for a client starts its own fuse (the event
+-- bound to Event_Throw); up to 0.7.2 it lay on the host: no explosion, no
+-- damage, and the clients' copies "never went off".
+WORLD = HW
+advance(3)
+local FRAG = "/Game/Blueprints/Throwables/BP_Throwable_Frag.BP_Throwable_Frag_C"
+local fcls = asset(HW, "BlueprintGeneratedClass", FRAG)
+fcls._name = "BP_Throwable_Frag_C"
+local frags = {}
+local real_bd = HW.gs._m.BeginDeferredActorSpawnFromClass
+HW.gs._m.BeginDeferredActorSpawnFromClass = function(self, wc, cls, tf, coll, owner, scale)
+    if cls ~= fcls then return real_bd(self, wc, cls, tf, coll, owner, scale) end
+    local a = new(HW, { "BP_Throwable_Frag_C", "BP_MasterThrowable_C", "Actor" }, "BP_Throwable_Frag_C_" .. (#frags + 1),
+        { _loc = { X = tf.Translation.X, Y = tf.Translation.Y, Z = tf.Translation.Z }, _owner = owner, ExplosionDelay = 3.0 }, {})
+    a._fuse = 0
+    a._m.Frag = function(self) self._fuse = self._fuse + 1 end
+    a._p.Capsule = new(HW, { "CapsuleComponent" }, "Capsule_" .. (#frags + 1), {}, {
+        SetPhysicsLinearVelocity = function(c, v) c._vel = v end,
+        SetNotifyRigidBodyCollision = function() end,
+    })
+    frags[#frags + 1] = a
+    HW.spawned[#HW.spawned + 1] = a
+    return a
+end
+H.net.handlers.THROW({ "950", "BP_Throwable_Frag_C", "10,0,150", "0,90,0", "1500,0,0" }, rpc)
+local fr = frags[1]
+check(fr ~= nil and fr._p.Capsule._vel ~= nil, "a client's frag spawned on the host with its velocity: " .. tostring(last(HW, "THRACK")))
+check(fr and fr._fuse == 1 and fr._p.ExplosionDelay == 3.0, "its fuse started once, with the game's own 3 s delay")
+HW.gs._m.BeginDeferredActorSpawnFromClass = real_bd
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

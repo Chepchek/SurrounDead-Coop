@@ -327,6 +327,19 @@ function SPY.sent_to(pc, text, s)
     SPY.calls[#SPY.calls + 1] = { "sent_to", pc, text, s }
     return SPY.sent
 end
+-- sdc_notes.take_off: the newest notification with this text leaves this screen
+-- (sdc_world's PW.unnote uses it)
+function SPY.take_off(text)
+    SPY.calls[#SPY.calls + 1] = { "take_off", text }
+    local vb = WORLD.vb
+    for i = #vb._children, 1, -1 do
+        if vb._children[i]._p.NotificationDetailsStruct[MSG]:ToString() == text then
+            table.remove(vb._children, i)
+            return true
+        end
+    end
+    return false
+end
 local function spied(kind, arg)
     for _, c in ipairs(SPY.calls) do if c[1] == kind and (arg == nil or c[2] == arg) then return c end end
     return nil

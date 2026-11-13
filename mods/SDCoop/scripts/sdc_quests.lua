@@ -51,14 +51,24 @@
 --                copy) gets Quest_TheSafeZone on its own component 5 s later.
 --   givers       sdc_dialogue: dialogue + Quest_Task_InteractWithActor on the
 --                pressing player's component.
---   generator    host GetNarrativeComponent(BP_LaboratoryGenerator) -> None
---                when the host's character is not at it; the client's own
---                Event_TurnOn (GetNarrativeComponent seen there) -> QT -> the
---                host completes the data task on that client's component.
+--   generator    a powered generator is the group's progress (the co-op world
+--                is shared): every player's PowerOnGenerator task counts,
+--                whoever powered it and wherever they stand. The host's own
+--                Event_TurnOn (its press, a client's step run there, the
+--                save's restore) credits the host (player 0, the game's own
+--                call, nothing cleared); each client's Event_TurnOn (its own
+--                press or the host's state applied there by sdc_world)
+--                -> QT -> the host completes the data task on that client's
+--                component. (Up to 0.11.0 the host's call got None when the
+--                host stood over 15 m away: a client powering it left the
+--                host's task undone for good - the generator was on.)
 --   rewards      Quest_Event_RewardPlayerXP of a client's quest (Controller =
 --                its controller) -> QX to that client only; the client adds
 --                it on its own LevellingComponent (the XP's owner, PSPROG),
---                unless the reward event ran there too.
+--                unless the reward event ran there too. A reward refired by
+--                the Load of that player's quests is not sent (see refire);
+--                the host's own refired one is the game's (noted for
+--                sdc_savecheck).
 --   markers      the host's copy of a client's quest marker is removed, the
 --                client gets QM; the host's own quests' markers stay its own.
 --   journal      "Forget quest" on a client (absorbed there) -> QQ -> the
@@ -87,45 +97,23 @@ local log = require("sdc_log")
 local ue  = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local ctx = require("sdc_ctx")
 local dialogue = require("sdc_dialogue")
+local consume = require("sdc_consume")   -- shared helpers (param)
 
+-- counters of the F7 panel lines (status_lines)
 local M = {
-    stats = { tasks_relayed = 0, tasks_credited = 0, goto_done = 0, crates = 0, qs_sent = 0, markers_sent = 0, xp_sent = 0, xp_got = 0,
-              bounties = 0, areas = 0, starts = 0, forgets = 0, saves = 0, loads = 0, gnc_cleared = 0,
-              shared_sent = 0, shared_markers = 0, shared_xp = 0 },
+    stats = { bounties = 0, areas = 0, starts = 0, forgets = 0, saves = 0, loads = 0 },
 }
 
 local S   -- sdc_session.state
 
--- ---------------------------------------------------------------------------
--- Settings (defaults apply until the keys are in sdc_config's SCHEMA)
--- ---------------------------------------------------------------------------
-
-local DEFAULTS = {
-    quest_own = true,
-    quest_bounty_shared = true,
-    quest_sync = true,
-    quest_tracker = true,
-    quest_datatask = true,
-    quest_goto = true,
-    quest_crate = true,
-    quest_markers = true,
-    quest_xp = true,
-}
-
-local function opt(key)
-    local v = cfg.get(key)
-    if v == nil then return DEFAULTS[key] end
-    return v
-end
-
-local function own() return opt("quest_own") ~= false end
+local function own() return cfg.get("quest_own") ~= false end
 
 -- ---------------------------------------------------------------------------
 -- Game assets
 -- ---------------------------------------------------------------------------
 
-local CNDT = "/Script/Narrative.NarrativeFunctionLibrary:CompleteNarrativeDataTask"
 local LIB_CDO = "/Script/Narrative.Default__NarrativeFunctionLibrary"
 local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker.Quest_Event_SpawnMarker_C"
 local REMOVE_MARKER = "/Game/Quests/Events/Quest_Event_RemoveMarker.Quest_Event_RemoveMarker_C"
@@ -149,7 +137,6 @@ local Q = {
     F_ITEMID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848",
     F_COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD",
     F_PENDING = "Pending?_31_C3AE39044666796C0FA128BA521590CB",
-    GEN_REACH = 1500,      -- cm: the host's character this close to a generator = the host powered it
     START_DELAY = 5,       -- s after a fresh client character appears
     SAVE_DELAY = 5,        -- s after a change of a client's quests
     BOUNTY_GAP = 5,        -- s: one bounty per player and intel purchase
@@ -168,12 +155,7 @@ local CRATE_PAWN = 1200       -- uu between the crate and the client's character
 
 local function role() return S and S.role or "unknown" end
 
-local function pget(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
+local pget = consume.param
 
 local function each(arr, fn)
     if arr == nil then return end
@@ -185,7 +167,11 @@ local function each(arr, fn)
     end)
 end
 
+-- An object by its path: loaded if needed on the host; on a client only one
+-- already in memory (the marker class and texture come in a QM message:
+-- no synchronous load on a client).
 local function load_obj(path)
+    if role() == "client" then return ue.loaded_asset(path, "quests") end
     local o = ue.find_object(path)
     if o then return o end
     ue.load_asset(path, "quests")
@@ -267,10 +253,7 @@ local function call_text(o, fname)
     return nil
 end
 
-local function addr(o)
-    local a = ue.try(function() return o:GetAddress() end)
-    return a
-end
+local addr = ctx.addr
 
 -- The remote controller among an event's parameters (Controller), or nil
 -- for the host's own controller / none.
@@ -343,6 +326,21 @@ local function snapshot(comp)
     return list
 end
 
+-- One snapshot per component and host tick: host_own_tick's save check and
+-- shared_tick read the same quest logs in the same second. `tick_snaps` is a
+-- table only while M.host_tick runs (no task object outlives the tick).
+local tick_snaps = nil
+local function snapshot_once(comp)
+    if not tick_snaps then return snapshot(comp) end
+    local k = ue.name(comp)
+    local list = tick_snaps[k]
+    if not list then
+        list = snapshot(comp)
+        tick_snaps[k] = list
+    end
+    return list
+end
+
 local function encode(list)
     local fields = {}
     for _, q in ipairs(list) do
@@ -377,7 +375,6 @@ local function goto_check(list, pcs)
                         local d2 = dist2(p.loc, goal)
                         if d2 < tol * tol then
                             local ok, err = pcall(function() t.obj:CompleteTask() end)
-                            M.stats.goto_done = M.stats.goto_done + 1
                             log.info("quests: host: go-to task '%s' of '%s' completed for the group by %s (%.0f m from the goal): %s",
                                 t.desc, q.name, ue.short(p.pc), math.sqrt(d2) / 100, ok and "ok" or tostring(err))
                             break
@@ -411,7 +408,7 @@ local function is_bounty_class(name)
     return type(name) == "string" and name:sub(1, 13) == "Quest_Bounty_"
 end
 
-local function shared_on() return own() and opt("quest_bounty_shared") ~= false end
+local function shared_on() return own() and cfg.get("quest_bounty_shared") ~= false end
 
 -- The quest object an event of it belongs to: the first outer with a
 -- QuestName (event -> QuestState / QuestBranch -> quest). ue.has_prop, not
@@ -420,6 +417,8 @@ local function shared_on() return own() and opt("quest_bounty_shared") ~= false 
 -- "TrivialObject: <address>", and no laptop bounty recognised as one (logs
 -- of 2026-11-11 / 12).
 local function quest_of(ev)
+    -- GetOuter on a null object (not nil) crashes the game: valid first
+    if not ue.valid(ev) then return nil end
     local o = ev
     for _ = 1, 5 do
         o = ue.try(function() return o:GetOuter() end)
@@ -463,13 +462,35 @@ local function first_tag(actor)
     return tag
 end
 
+-- A destroyed actor stays valid for ~30 s (until GC) and its location reads
+-- 0,0,0: markers destroyed here are remembered by full name (60 s), and a
+-- marker at 0,0,0 counts as gone.
+local gone_markers = {}   -- [full name] = os.clock() of its K2_DestroyActor here
+
+local function destroy_marker_actor(a)
+    local now = os.clock()
+    for k, t in pairs(gone_markers) do
+        if now - t > 60 then gone_markers[k] = nil end
+    end
+    gone_markers[ue.name(a)] = now
+    return (pcall(function() a:K2_DestroyActor() end))
+end
+
+-- A marker destroyed here, or one at 0,0,0 (destroyed elsewhere: the
+-- game's RemoveMarker).
+local function marker_gone(a)
+    if gone_markers[ue.name(a)] then return true end
+    local loc = ue.location(a)
+    return loc ~= nil and loc.X == 0 and loc.Y == 0 and loc.Z == 0
+end
+
 -- All quest markers the host has now (also those of a loaded save): the
 -- runtime-spawned BP_QuestMarker actors. Level-placed ones exist on clients.
 local function send_all_markers(pc)
     local n = 0
     for _, a in ipairs(ue.find_all(MARKER_SHORT)) do
         if ue.valid(a) and ue.is_runtime_spawned(a) then
-            local tag, loc = first_tag(a), ue.location(a)
+            local tag, loc = first_tag(a), not marker_gone(a) and ue.location(a)
             if tag and tag ~= "" and loc then
                 net.send_to(pc, "QM", marker_fields(tag, loc, ue.prop(a, "Marker Texture"), ue.str(ue.prop(a, "Text")),
                     ue.prop(a, "Color"), ue.prop(a, "Underground?") == true))
@@ -477,7 +498,6 @@ local function send_all_markers(pc)
             end
         end
     end
-    M.stats.markers_sent = M.stats.markers_sent + n
     if n > 0 then log.info("quests: host: %d quest marker(s) sent to %s", n, ue.short(pc)) end
 end
 
@@ -486,17 +506,17 @@ end
 local function drop_host_marker(tag)
     local best, best_n = nil, math.huge
     for _, a in ipairs(ue.find_all(MARKER_SHORT)) do
-        if ue.valid(a) and ue.is_runtime_spawned(a) and first_tag(a) == tag then
+        if ue.valid(a) and ue.is_runtime_spawned(a) and not marker_gone(a) and first_tag(a) == tag then
             local n = tonumber(ue.short(a):match("_(%d+)$")) or math.huge
             if n < best_n then best, best_n = a, n end
         end
     end
     if not best then return false end
-    return (pcall(function() best:K2_DestroyActor() end))
+    return destroy_marker_actor(best)
 end
 
 local function on_spawn_marker(ev_p, _, ctl_p)
-    if role() ~= "host" or not opt("quest_markers") then return end
+    if role() ~= "host" or not cfg.get("quest_markers") then return end
     local ev = pget(ev_p)
     local tag = ue.str(ue.prop(ev, "ActorTag"))
     local loc = vec(ue.prop(ev, "Location"))
@@ -516,8 +536,6 @@ local function on_spawn_marker(ev_p, _, ctl_p)
                     if ue.valid(p) then net.send_to(p, "QM", table.unpack(fields, 1, fields.n)) end
                 end
             end)
-            M.stats.markers_sent = M.stats.markers_sent + #pcs
-            M.stats.shared_markers = M.stats.shared_markers + 1
             return
         end
         if not pc then
@@ -528,7 +546,6 @@ local function on_spawn_marker(ev_p, _, ctl_p)
         ue.game_thread("quests-qm-own", function()
             local gone = drop_host_marker(tag)
             if ue.valid(pc) then net.send_to(pc, "QM", table.unpack(fields, 1, fields.n)) end
-            M.stats.markers_sent = M.stats.markers_sent + 1
             if not gone then log.debug("quests: host: no host copy of marker '%s' found", tag) end
         end)
         return
@@ -540,11 +557,10 @@ local function on_spawn_marker(ev_p, _, ctl_p)
             if ue.valid(pc) then net.send_to(pc, "QM", table.unpack(fields, 1, fields.n)) end
         end
     end)
-    M.stats.markers_sent = M.stats.markers_sent + #pcs
 end
 
 local function on_remove_marker(ev_p, _, ctl_p)
-    if role() ~= "host" or not opt("quest_markers") then return end
+    if role() ~= "host" or not cfg.get("quest_markers") then return end
     local ev = pget(ev_p)
     local tag = ue.str(ue.prop(ev, "ActorTag"))
     if tag == "" then return end
@@ -587,6 +603,45 @@ local function quest_name_of(ev)
     return quest_title(quest_of(ev))
 end
 
+-- Rewards given again by a quest LOAD. Narrative refires a quest's events
+-- when its save is loaded: UNarrativeEvent's constructor sets bRefireOnLoad
+-- (offset 0x28, its SetBit at exe 0x1445b3b20) to true (exe 0x144850395),
+-- and no event asset of the game changes it (json dumps: no bRefireOnLoad
+-- anywhere). Quest_TheSafeZone ("My New Quest", every fresh character's)
+-- ends in Event_RewardPlayerXP_C_0, Amount 300: each load runs it again and
+-- LevellingComponent.AddXP multiplies it by the difficulty's XP multiplier.
+--   * the host's own quests: loaded by the game itself (BP_PlayerCharacter
+--     @14347-14446 "<slot>_SDQuests"): that XP is the game's own (13.11:
+--     +1200 at each load, single player too); only noted (refire.host, read
+--     by sdc_savecheck for its load line).
+--   * a client's quests: loaded by this mod (M.persist_bind: Narrative Load
+--     on the client's component) - a reward event that runs inside that Load
+--     (or right after it) is not sent to the client (13.11: QX|300 and a
+--     "+300 XP" toast at every join).
+local REFIRE_S = 2
+local refire = { key = nil, till = -1, host = {} }   -- key: the controller whose quests load now
+
+-- pawn: the host's character when the reward ran (its full name). A load
+-- starts from the main menu, where the old character is gone, and the game
+-- refires the quests in the NEW character's Event_LoadPlayer: a real reward
+-- of the world before the load has another pawn (sdc_savecheck tells them apart).
+local function note_host_reward(amount, qname)
+    local h = refire.host
+    local p = ue.local_pawn()
+    local pk = ue.valid(p) and ue.name(p) or nil
+    h[#h + 1] = { at = os.clock(), amount = amount, name = qname, pawn = pk }
+    if #h > 8 then table.remove(h, 1) end
+end
+
+-- The host's own quest rewards since os.clock() t: { amount, name, pawn }... (sdc_savecheck).
+function M.host_rewards_since(t)
+    local out = {}
+    for _, e in ipairs(refire.host) do
+        if e.at >= t then out[#out + 1] = { amount = e.amount, name = e.name, pawn = e.pawn } end
+    end
+    return out
+end
+
 local function on_reward_xp(ev_p, _, ctl_p)
     local ev, ctl = pget(ev_p), pget(ctl_p)
     local amount = tonumber(ue.prop(ev, "Amount")) or 0
@@ -597,16 +652,20 @@ local function on_reward_xp(ev_p, _, ctl_p)
             clean(quest_name_of(ev)), amount)
         return
     end
-    if role() ~= "host" or not opt("quest_xp") or amount <= 0 then return end
+    if role() ~= "host" or not cfg.get("quest_xp") or amount <= 0 then return end
     local qname = clean(quest_name_of(ev))
     local pcs
     if own() then
         local pc = remote_owner(ctl)
+        if pc and refire.key == ue.name(pc) and os.clock() <= refire.till then
+            log.info("quests: host: %s's quest '%s' reward event (%d XP) ran again while their quests were loaded (Narrative refires quest events on Load): not sent, no XP twice",
+                ue.short(pc), qname, amount)
+            return
+        end
         if bounty_event(ev) then
             -- a shared laptop bounty: its XP for every player (the owner's
             -- comes from this event when it is the host's own)
             pcs = remote_pcs()
-            M.stats.shared_xp = M.stats.shared_xp + 1
             log.info("quests: host: %s laptop bounty '%s' rewards %d XP: shared, sent to %d client(s)%s",
                 pc and (ue.short(pc) .. "'s") or "the host's", qname, amount, #pcs,
                 pc and "; the host gets it too" or "; the host's own from the event")
@@ -619,13 +678,13 @@ local function on_reward_xp(ev_p, _, ctl_p)
                 for _, p in ipairs(pcs) do
                     if ue.valid(p) then
                         net.send_to(p, "QX", string.format("%.0f", amount), qname)
-                        M.stats.xp_sent = M.stats.xp_sent + 1
                     end
                 end
             end)
             return
         end
         if not pc then
+            note_host_reward(amount, qname)
             log.info("quests: host: the host's quest '%s' rewards %d XP (the host's own)", qname, amount)
             return
         end
@@ -634,6 +693,7 @@ local function on_reward_xp(ev_p, _, ctl_p)
     else
         local me = ue.local_pc()
         if not ue.valid(ctl) or not me or ue.name(ctl) ~= ue.name(me) then return end   -- group (host) quests only
+        note_host_reward(amount, qname)
         pcs = remote_pcs()
         log.info("quests: host: quest '%s' rewards %d XP; sending it to %d client(s)", qname, amount, #pcs)
     end
@@ -641,7 +701,6 @@ local function on_reward_xp(ev_p, _, ctl_p)
         for _, pc in ipairs(pcs) do
             if ue.valid(pc) then
                 net.send_to(pc, "QX", string.format("%.0f", amount), qname)
-                M.stats.xp_sent = M.stats.xp_sent + 1
             end
         end
     end)
@@ -786,9 +845,7 @@ local function overlapping(area, pawn)
 end
 
 local function clear_wco(wco_p)
-    local ok = pcall(function() wco_p:set(nil) end)
-    if ok then M.stats.gnc_cleared = M.stats.gnc_cleared + 1 end
-    return ok
+    return (pcall(function() wco_p:set(nil) end))
 end
 
 -- GetNarrativeComponent(self) of a quest object (sdc_dialogue's native
@@ -803,13 +860,12 @@ local function quest_gnc(r, kind, obj, wco_p)
                 log.info("quests: client: the bounty event ran here (its BeginQuest is server-only); asking the host (QB)")
                 ue.game_thread("quests-qb", function() net.send_to_host("QB") end)
             end
-        elseif kind == "generator" and opt("quest_datatask") then
+        elseif kind == "generator" and cfg.get("quest_datatask") then
             -- Event_TurnOn @1702: its CompleteNarrativeDataTask is absorbed here
             local arg = ue.str(ue.prop(obj, "QuestArgument"))
             local key = Q.POWER_TASK .. "|" .. arg
             if not cl.qt_at[key] or now - cl.qt_at[key] > 5 then
                 cl.qt_at[key] = now
-                M.stats.tasks_relayed = M.stats.tasks_relayed + 1
                 log.info("quests: client: %s powered on here: data task Quest_Task_PowerOnGenerator(%s) sent to the host (QT)",
                     ue.short(obj), arg)
                 ue.game_thread("quests-qt-send", function() net.send_to_host("QT", Q.POWER_TASK, clean(arg), "1") end)
@@ -840,14 +896,9 @@ local function quest_gnc(r, kind, obj, wco_p)
             log.info("quests: host: %s noticed another player (not the host's character): the host's quest log stays untouched (each player gets it in their own)",
                 ue.short(obj))
         end
-    elseif kind == "generator" then
-        local me = ue.local_pawn()
-        if me and dist2(ue.location(me), ue.location(obj)) <= Q.GEN_REACH * Q.GEN_REACH then return end
-        if clear_wco(wco_p) then
-            log.info("quests: host: %s powered on away from the host's character: its data task is not the host's (the client's own QT credits theirs)",
-                ue.short(obj))
-        end
     end
+    -- (kind "generator": the host's own data task counts too - the group's
+    -- progress, wherever the host stands; see the header)
 end
 dialogue.quest_gnc = quest_gnc
 
@@ -897,7 +948,7 @@ local function host_own_tick()
         local b = P.bound[ue.name(pc)]
         local comp = b and comp_of(pc)
         if comp then
-            local sig = table.concat(encode(snapshot(comp)), "|")
+            local sig = table.concat(encode(snapshot_once(comp)), "|")
             if b.sig == nil then
                 b.sig = sig
             elseif sig ~= b.sig then
@@ -918,7 +969,7 @@ end
 
 local function on_task_request(f, pc)
     ue.game_thread("quests-qt", function()
-        if role() ~= "host" or not opt("quest_datatask") or not ue.valid(pc) then return end
+        if role() ~= "host" or not cfg.get("quest_datatask") or not ue.valid(pc) then return end
         local path, arg, qty = f[1] or "", f[2] or "", tonumber(f[3]) or 1
         local task = path ~= "" and load_obj(path)
         local comp = own() and comp_of(pc) or host_comp()
@@ -929,7 +980,6 @@ local function on_task_request(f, pc)
             return
         end
         local ok, r = pcall(function() return lib:CompleteNarrativeDataTask(comp, task, arg, qty) end)
-        M.stats.tasks_credited = M.stats.tasks_credited + 1
         log.info("quests: host: data task %s(%s) x%d from %s credited to %s -> %s",
             ue.short(task), arg, qty, ue.short(pc), own() and "their own quest log" or "the group quest log",
             ok and tostring(r) or ("error " .. tostring(r)))
@@ -938,7 +988,7 @@ end
 
 local function on_crate_request(f, pc)
     ue.game_thread("quests-qc", function()
-        if role() ~= "host" or not opt("quest_crate") or not ue.valid(pc) then return end
+        if role() ~= "host" or not cfg.get("quest_crate") or not ue.valid(pc) then return end
         local x, y, z = tonumber(f[1]), tonumber(f[2]), tonumber(f[3])
         local pawn = ue.pawn_of(pc)
         local ploc = pawn and ue.location(pawn)
@@ -960,7 +1010,6 @@ local function on_crate_request(f, pc)
         end
         ue.set_prop(best, "CurrentActor", pawn)
         local ok, err = pcall(function() best:OpenContainer() end)
-        M.stats.crates = M.stats.crates + 1
         log.info("quests: host: crate %s opened for %s on the host (quest progress, lid, reward item): %s, Opened=%s",
             ue.short(best), ue.short(pc), ok and "ok" or tostring(err), tostring(ue.prop(best, "Opened")))
     end)
@@ -1014,7 +1063,11 @@ function M.persist_bind(pc, slot, key, load)
         log.warn("quests: host: %s has no NarrativeComponent: quests %s not loaded", ue.short(pc), name)
         return false
     end
+    -- its finished quests' reward events run again inside this Load (see
+    -- refire above): not sent to the player
+    refire.key, refire.till = ue.name(pc), math.huge
     local ok, r = pcall(function() return comp:Load(name, 0) end)
+    refire.till = os.clock() + REFIRE_S
     if ok and r == true then M.stats.loads = M.stats.loads + 1 end
     log.info("quests: host: %s's own quests loaded from %s -> %s", ue.short(pc), name,
         ok and (r == true and "ok" or "no save yet") or ("error " .. tostring(r)))
@@ -1046,29 +1099,8 @@ end
 -- Client: hooks
 -- ---------------------------------------------------------------------------
 
--- CompleteNarrativeDataTask(Target, Task, Argument, Quantity), native pre-hook.
--- (A Blueprint's call is absorbed on a client - BlueprintAuthorityOnly - so
--- this sees only native callers; the generator goes through quest_gnc.)
-local function on_cndt(_, _, task_p, arg_p, qty_p)
-    if role() ~= "client" or not opt("quest_datatask") then return end
-    local task = pget(task_p)
-    if not ue.valid(task) then return end
-    local path = ue.path(task)
-    local arg = ue.str(pget(arg_p))
-    local qty = tonumber(pget(qty_p)) or 1
-    local key = path .. "|" .. arg
-    local now = os.clock()
-    if cl.qt_at[key] and now - cl.qt_at[key] < 5 then return end
-    cl.qt_at[key] = now
-    M.stats.tasks_relayed = M.stats.tasks_relayed + 1
-    log.info("quests: client: data task %s(%s) x%d done here; sent to the host", ue.short(task), arg, qty)
-    ue.game_thread("quests-qt-send", function()
-        net.send_to_host("QT", path, clean(arg), tostring(qty))
-    end)
-end
-
 local function on_open_container(crate_p)
-    if role() ~= "client" or not opt("quest_crate") then return end
+    if role() ~= "client" or not cfg.get("quest_crate") then return end
     local crate = pget(crate_p)
     local loc = ue.location(crate)
     if not loc then return end
@@ -1133,7 +1165,7 @@ local function tracker_line(t)
 end
 
 local function tracker(q, subtitle)
-    if not opt("quest_tracker") then return end
+    if not cfg.get("quest_tracker") then return end
     local hud = dialogue.hud()
     if not hud then return end
     local title, sub = ue.prop(hud, "QuestUpdatedText"), ue.prop(hud, "QuestUpdatedSubtext")
@@ -1319,7 +1351,6 @@ local function apply_xp(amount, qname)
         log.err_throttled("quests.xp", "quests: client: AddXP: %s", tostring(err))
         return
     end
-    M.stats.xp_got = M.stats.xp_got + 1
     cl.xp_recent[qname] = os.clock()
     local given = math.floor(tonumber(out.XPOutput) or amount)
     notify(string.format("Задание выполнено: %s (+%d опыта)", qname, given),
@@ -1331,7 +1362,7 @@ M._apply_xp = apply_xp   -- the host's XP for a client's shared bounty (on_rewar
 -- too (the component replays the host's updates); the XP then is there
 -- already: QX waits 2.5 s and gives it only if no reward event ran here.
 local function on_xp(f)
-    if role() ~= "client" or not opt("quest_xp") then return end
+    if role() ~= "client" or not cfg.get("quest_xp") then return end
     local amount = tonumber(f[1]) or 0
     local qname = f[2] or ""
     local got = os.clock()
@@ -1354,21 +1385,27 @@ end
 
 local function destroy_marker(tag)
     local m = cl.markers[tag]
-    if m and marker_ok(m.actor) then pcall(function() m.actor:K2_DestroyActor() end) end
+    if m and marker_ok(m.actor) then destroy_marker_actor(m.actor) end
     if m then m.actor = nil end
 end
 
--- A marker with this tag that this machine's own quest event placed.
+-- A live marker with this tag that this machine's own quest event placed
+-- (not one destroyed here a moment ago: it stays valid until GC).
 local function native_marker(tag, ours)
     for _, a in ipairs(ue.find_all(MARKER_SHORT)) do
-        if marker_ok(a) and (not ours or ue.name(a) ~= ue.name(ours)) and first_tag(a) == tag then return a end
+        if marker_ok(a) and (not ours or ue.name(a) ~= ue.name(ours)) and not marker_gone(a) and first_tag(a) == tag then
+            return a
+        end
     end
     return nil
 end
 
+-- (m.retry: the marker class or the world was not there yet; client_tick
+-- tries again)
 local function spawn_marker(tag)
     local m = cl.markers[tag]
     if not m then return end
+    m.retry = nil
     local r = m.rec
     if native_marker(tag, m.actor) then
         log.info("quests: client: quest marker '%s' is placed here by this player's own quest already", tag)
@@ -1377,7 +1414,9 @@ local function spawn_marker(tag)
     local cls = load_obj(MARKER)
     local gs, wc = ue.gameplay_statics(), ue.local_pc()
     if not (cls and gs and wc) then
-        log.err_throttled("quests.marker", "quests: client: BP_QuestMarker / GameplayStatics / controller missing")
+        m.retry = true
+        log.err_throttled("quests.marker", "quests: client: BP_QuestMarker (in memory: %s) / GameplayStatics / controller missing; tried again later",
+            tostring(cls ~= nil))
         return
     end
     local tf = transform(r.loc)
@@ -1386,7 +1425,9 @@ local function spawn_marker(tag)
         log.err_throttled("quests.marker.spawn", "quests: client: marker spawn failed: %s", tostring(a))
         return
     end
+    -- the path came over the network: a texture only
     local tex = r.tex ~= "" and load_obj(r.tex) or nil
+    if tex and not ue.class_name(tex):find("Texture", 1, true) then tex = nil end
     if tex then ue.set_prop(a, "Marker Texture", tex) end
     ue.set_prop(a, "Color", r.color)
     ue.set_prop(a, "Text", r.text)
@@ -1398,7 +1439,7 @@ end
 
 local function on_marker(f)
     ue.game_thread("quests-qm-recv", function()
-        if role() ~= "client" or not opt("quest_markers") then return end
+        if role() ~= "client" or not cfg.get("quest_markers") then return end
         local op, tag = f[1], f[2]
         if (op ~= "a" and op ~= "d") or not tag or tag == "" then return end
         if op == "d" then
@@ -1437,9 +1478,10 @@ end
 -- Hooks
 -- ---------------------------------------------------------------------------
 
--- Blueprint functions hooked here and nowhere else in the mod (a second
--- RegisterHook on a BP function can replace the first). Post-hooks. The
--- journal's class is not loaded for it (it comes with the game's UI).
+-- Blueprint functions hooked here and nowhere else in the mod (each is
+-- registered once: a second RegisterHook on the same function would add a
+-- second callback; they stack). Post-hooks. The journal's class is not
+-- loaded for it (it comes with the game's UI).
 local BP_HOOKS = {
     { cls = SPAWN_MARKER, fn = SPAWN_MARKER .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_spawn_marker(ev_p, t_p, c_p) end },
     { cls = REMOVE_MARKER, fn = REMOVE_MARKER .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_remove_marker(ev_p, t_p, c_p) end },
@@ -1450,12 +1492,13 @@ local BP_HOOKS = {
 }
 local bp_done = {}
 local bp_next_try = 0
--- Log only: where a quest begins / is forgotten (host), and the host's
--- quest updates arriving on this client's component (its PendingUpdateList
--- rep notify; EUpdateType: 1 CompleteTask, 2 BeginQuest, 3 ForgetQuest,
--- 4 RestartQuest, 5 QuestNewState, 6 TaskProgressMade).
+-- Log only, hooked with config debug_probes only: where a quest begins / is
+-- forgotten, and the host's quest updates arriving on this client's
+-- component (its PendingUpdateList rep notify; EUpdateType: 1 CompleteTask,
+-- 2 BeginQuest, 3 ForgetQuest, 4 RestartQuest, 5 QuestNewState,
+-- 6 TaskProgressMade).
 local UPDATE_NAME = { [0] = "none", "data task", "quest begun", "quest forgotten", "quest restarted", "quest new state", "task progress" }
-local seen_update = {}   -- [update key] = os.clock()
+local seen_update = {}   -- [update key] = os.clock(); entries older than 30 s go
 
 local function comp_owner_name(comp)
     local o = ue.valid(comp) and ue.try(function() return comp:GetOwner() end)
@@ -1464,7 +1507,7 @@ end
 
 local function on_begin_quest(comp_p, cls_p)
     local r = role()
-    if r ~= "host" and r ~= "client" then return end
+    if (r ~= "host" and r ~= "client") or not log.probes_enabled then return end
     local comp = pget(comp_p)
     local name, owner = comp_owner_name(comp)
     local whose = (r == "host" and remote_owner(owner)) and "a client's" or "this machine's own"
@@ -1473,15 +1516,18 @@ end
 
 local function on_forget_quest(comp_p, cls_p)
     local r = role()
-    if r ~= "host" and r ~= "client" then return end
+    if (r ~= "host" and r ~= "client") or not log.probes_enabled then return end
     log.info("quests: %s: ForgetQuest %s on the component of %s", r, ue.short(pget(cls_p)), (comp_owner_name(pget(comp_p))))
 end
 
 local function on_updates(comp_p)
-    if role() ~= "client" then return end
+    if role() ~= "client" or not log.probes_enabled then return end
     local comp = pget(comp_p)
     if not ue.valid(comp) then return end
     local now = os.clock()
+    for k, t in pairs(seen_update) do
+        if now - t > 30 then seen_update[k] = nil end
+    end
     local n, new = 0, 0
     each(ue.prop(comp, "PendingUpdateList"), function(u)
         n = n + 1
@@ -1489,7 +1535,7 @@ local function on_updates(comp_p)
         local q = ue.try(function() return u.QuestClass end)
         local payload = ue.str(ue.try(function() return u.Payload end))
         local key = tostring(t) .. "|" .. ue.short(q) .. "|" .. payload .. "|" .. n
-        if not seen_update[key] or now - seen_update[key] > 30 then
+        if not seen_update[key] then
             seen_update[key] = now
             new = new + 1
             log.info("quests: client: from the host, on this player's own quest log: %s %s%s", UPDATE_NAME[t] or tostring(t),
@@ -1499,8 +1545,8 @@ local function on_updates(comp_p)
     if new == 0 then log.debug("quests: client: quest update list replicated again (%d entries, nothing new)", n) end
 end
 
+-- (all log only: registered with config debug_probes only)
 local NATIVES = {
-    { CNDT, "CompleteNarrativeDataTask", function() return safe("cndt", on_cndt) end },
     { "/Script/Narrative.NarrativeComponent:BeginQuest", "BeginQuest", function() return safe("begin-quest", on_begin_quest) end },
     { "/Script/Narrative.NarrativeComponent:ForgetQuest", "ForgetQuest", function() return safe("forget-quest", on_forget_quest) end },
     { "/Script/Narrative.NarrativeComponent:OnRep_PendingUpdateList", "OnRep_PendingUpdateList", function() return safe("updates", on_updates) end },
@@ -1509,6 +1555,7 @@ local native_done = {}
 
 -- Native hooks (pre only); called at load and from the ticks until they are in.
 function M.install()
+    if not log.probes_enabled then return end
     for i, h in ipairs(NATIVES) do
         if not native_done[i] and ue.find_object(h[1]) then
             local ok, err = pcall(RegisterHook, h[1], h[3](), nil)
@@ -1550,7 +1597,7 @@ local function shared_markers_to(pc)
     end
     for _, a in ipairs(ue.find_all(MARKER_SHORT)) do
         if ue.valid(a) and ue.is_runtime_spawned(a) then
-            local tag, loc = first_tag(a), ue.location(a)
+            local tag, loc = first_tag(a), not marker_gone(a) and ue.location(a)
             if tag and loc and not sent[tag] and is_bounty_class(tag) then
                 net.send_to(pc, "QM", marker_fields(tag, loc, ue.prop(a, "Marker Texture"), ue.str(ue.prop(a, "Text")),
                     ue.prop(a, "Color"), ue.prop(a, "Underground?") == true))
@@ -1558,7 +1605,6 @@ local function shared_markers_to(pc)
             end
         end
     end
-    M.stats.markers_sent = M.stats.markers_sent + n
     return n
 end
 
@@ -1573,14 +1619,14 @@ local function shared_tick(pcs)
     local function add(pc, comp)
         if not (pc and comp) then return end
         local list = {}
-        for _, q in ipairs(snapshot(comp)) do
+        for _, q in ipairs(snapshot_once(comp)) do
             if is_bounty_class(q.cls) then list[#list + 1] = q end
         end
         owners[#owners + 1] = { pc = pc, key = ue.name(pc), list = list }
     end
     add(me, host_comp())
     for _, pc in ipairs(pcs) do add(pc, comp_of(pc)) end
-    if opt("quest_goto") then
+    if cfg.get("quest_goto") then
         for _, o in ipairs(owners) do
             if #o.list > 0 then
                 local others = {}
@@ -1610,7 +1656,6 @@ local function shared_tick(pcs)
             local first = SH.sent[key] == nil
             SH.sent[key] = str
             net.send_to(pc, "QG", table.unpack(fields))
-            M.stats.shared_sent = M.stats.shared_sent + 1
             if #fields > 0 or not first then
                 log.info("quests: host: the other players' laptop bounties to %s: %d (QG)", ue.short(pc), #fields)
             end
@@ -1642,10 +1687,12 @@ function M.host_tick(now)
     local pcs = remote_pcs()
     if #pcs == 0 then return end
     if own() then
+        tick_snaps = {}
         local ok, err = pcall(host_own_tick)
         if not ok then log.err_throttled("quests.own", "quests: host: own quests tick: %s", tostring(err)) end
         local oks, errs = pcall(shared_tick, pcs)
         if not oks then log.err_throttled("quests.shared", "quests: host: shared bounties tick: %s", tostring(errs)) end
+        tick_snaps = nil
         return
     end
     -- group design: joiners get every quest marker the host has
@@ -1656,18 +1703,18 @@ function M.host_tick(now)
         -- once the joiner has a character (its world is loaded)
         if not host.known[key] and ue.pawn_of(pc) then
             host.known[key] = true
-            if opt("quest_markers") then send_all_markers(pc) end
+            if cfg.get("quest_markers") then send_all_markers(pc) end
         end
     end
     for key in pairs(host.known) do
         if not present[key] then host.known[key], host.sent[key] = nil, nil end
     end
-    if not (opt("quest_sync") or opt("quest_goto")) then return end
+    if not (cfg.get("quest_sync") or cfg.get("quest_goto")) then return end
     local comp = host_comp()
     if not comp then return end
     local list = snapshot(comp)
-    if opt("quest_goto") then goto_check(list, pcs) end
-    if not opt("quest_sync") then return end
+    if cfg.get("quest_goto") then goto_check(list, pcs) end
+    if not cfg.get("quest_sync") then return end
     if now >= host.resend_at then
         host.resend_at = now + QS_RESEND_S
         host.sent = {}
@@ -1679,7 +1726,6 @@ function M.host_tick(now)
         if host.sent[key] ~= str then
             host.sent[key] = str
             net.send_to(pc, "QS", table.unpack(fields))
-            M.stats.qs_sent = M.stats.qs_sent + 1
             log.debug("quests: host: QS to %s: %d quest(s)", ue.short(pc), #fields)
         end
     end
@@ -1695,7 +1741,7 @@ function M.client_tick(now, pc, pawn)
     if pk ~= cl.pawn_key then
         local had = cl.pawn_key ~= nil
         cl.pawn_key = pk
-        if had and opt("quest_markers") then
+        if had and cfg.get("quest_markers") then
             local n = 0
             for tag in pairs(cl.markers) do
                 destroy_marker(tag)
@@ -1703,6 +1749,13 @@ function M.client_tick(now, pc, pawn)
                 n = n + 1
             end
             if n > 0 then log.info("quests: client: new character, %d quest marker(s) placed again", n) end
+        end
+    end
+    -- markers not placed yet (class not in memory, no world): again every 5 s
+    if cfg.get("quest_markers") and now - (cl.marker_retry_at or -100) >= 5 then
+        cl.marker_retry_at = now
+        for tag, m in pairs(cl.markers) do
+            if m.retry and not marker_ok(m.actor) then spawn_marker(tag) end
         end
     end
 end
@@ -1713,7 +1766,7 @@ function M.register_handlers()
     net.on("QB", function(f, pc) on_bounty_request(f, pc) end)
     net.on("QQ", function(f, pc) on_quest_request(f, pc) end)
     net.on("QS", function(f)
-        if role() ~= "client" or not opt("quest_sync") then return end
+        if role() ~= "client" or not cfg.get("quest_sync") then return end
         local list = parse_qs(f)
         ue.game_thread("quests-qs", function()
             if role() == "client" then apply_snapshot(list) end
@@ -1735,22 +1788,17 @@ end
 -- (marker actors die with their world).
 function M.reset(why)
     cl.quests, cl.markers, cl.pawn_key, cl.xp_recent, cl.level_timer, cl.tb_class = nil, {}, nil, {}, {}, nil
-    cl.local_xp, cl.qt_at, cl.journal_quest = nil, {}, nil
+    cl.local_xp, cl.qt_at, cl.journal_quest, cl.marker_retry_at = nil, {}, nil, nil
+    gone_markers, seen_update = {}, {}
     host.sent, host.known, host.resend_at = {}, {}, 0
     P.bounty_at, P.bounty_clear, P.areas, P.areas_at, P.starts, P.bound = {}, {}, {}, -100, {}, {}
     SH.sent, SH.known, SH.markers, SH.view, SH.host_str = {}, {}, {}, nil, nil
+    refire.key, refire.till = nil, -1   -- (refire.host: time-stamped, the load right after a reset reads it)
     log.info("quests: reset (%s)", tostring(why))
 end
 
 function M.init(state)
     S = state
-end
-
-function M.report(out)
-    out(string.format("quests: own=%s tasks relayed=%d credited=%d goto=%d crates=%d QS=%d markers=%d xp sent=%d got=%d | bounties=%d areas=%d starts=%d forgets=%d saves=%d loads=%d gnc-none=%d",
-        tostring(own()), M.stats.tasks_relayed, M.stats.tasks_credited, M.stats.goto_done, M.stats.crates, M.stats.qs_sent,
-        M.stats.markers_sent, M.stats.xp_sent, M.stats.xp_got, M.stats.bounties, M.stats.areas, M.stats.starts,
-        M.stats.forgets, M.stats.saves, M.stats.loads, M.stats.gnc_cleared))
 end
 
 return M

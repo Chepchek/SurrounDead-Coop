@@ -31,17 +31,21 @@
 -- Fix:
 --   host, each of those multicasts on a world container: the same data to the
 --   remote players who have it open, through the mod's reliable channel
---   (JMC); the client runs the multicast's own handler on its copy of the
---   component (HandleClientMoveItemToIndex, the removal of MC_ItemRemoved,
---   FuncHandleStackResponse, ClientUpdateCount). Each handler leaves a view
---   that already shows the result as it is. An added item is checked a
+--   (JMC; the ops of one game tick go together, one message per viewer and
+--   container, in their order); the client runs the multicast's own handler
+--   on its copy of the component (HandleClientMoveItemToIndex, the removal of
+--   MC_ItemRemoved, FuncHandleStackResponse, ClientUpdateCount). Each handler
+--   leaves a view that already shows the result as it is. An added item is checked a
 --   moment later; if it is still missing the client asks (JADD) and the host
 --   sends it with the plugin's own reliable CLIENT_AddNewItem(item, content,
 --   <container component>).
 --   host, after each move request: the item where the request wanted it? If
 --   not, the plugin's own failure answer CLIENT_MoveToIndexFailed(uid,
 --   <component holding the pending slot>) - the blinking stops, the item
---   stays where it is (the host did not move it).
+--   stays where it is (the host did not move it). A stack with fewer items
+--   than before the request (ammo loaded into a magazine) moved in part: no
+--   failure. An item the host has nowhere (a slot only the client shows): the
+--   client is told it is gone (CLIENT_UpdateCount 0, tell_gone).
 --   client: a pending slot of an open container that still waits after
 --   STUCK_S stops blinking (RemoveRequestByUID(uid, false)) and is reported.
 
@@ -55,6 +59,7 @@ local deathbox = require("sdc_deathbox")
 
 local M = {
     stats = { host_moves = 0, host_refused = 0, failed_sent = 0, forwards = 0, resends = 0,
+              host_partial = 0, gone_sent = 0,
               client_moves = 0, applied = 0, already = 0, unknown = 0, asked = 0, stuck = 0 },
 }
 local S
@@ -174,7 +179,7 @@ end
 -- Host
 -- ===========================================================================
 
-local views = {}    -- [component address] = { comp =, key =, by = { [pawn address] = { pawn =, t = } } }
+local views = {}    -- [component address] = { comp =, key =, by = { [pawn address] = { pawn =, name =, t = } } }
 local by_key = {}   -- [container key] = component address
 
 -- The container's key on both machines: its first main container UID (the
@@ -200,13 +205,18 @@ function M.note_view(pawn, comp)
         by_key[key] = k
     end
     v.comp = comp
-    v.by[pk] = { pawn = pawn, t = os.clock() }
+    v.by[pk] = { pawn = pawn, name = ue.short(pawn), t = os.clock() }
 end
 
 local function dist2(a, b)
     if not a or not b then return 0 end
     local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
     return dx * dx + dy * dy + dz * dz
+end
+
+-- A viewer entry still counts: not too old, the same remote character.
+local function viewer_live(e, now)
+    return now - e.t <= VIEW_KEEP and is_remote_character(e.pawn) and ue.short(e.pawn) == e.name
 end
 
 -- The remote players who have this container open: { { pawn =, pc = } }.
@@ -218,7 +228,7 @@ local function viewers_of(comp)
     local out = {}
     for pk, e in pairs(v.by) do
         local p = e.pawn
-        if now - e.t > VIEW_KEEP or not is_remote_character(p) then
+        if not viewer_live(e, now) then
             v.by[pk] = nil
         elseif dist2(at, ue.location(p)) <= VIEW_REACH * VIEW_REACH then
             out[#out + 1] = { pawn = p, pc = ue.prop(p, "Controller") }
@@ -237,19 +247,63 @@ local function watched(c)
     return comp
 end
 
+-- The JMC ops of this game tick, per (viewer, container) in their order,
+-- sent together FLUSH_MS later (and by the host tick, if that delay never
+-- ran): JMC|*|<container key>|<op,arg,arg>|<op,...>|... Up to 0.7.3 every op
+-- was a message of its own to every viewer (a disassembly with N outputs:
+-- N messages per viewer).
+local jmc = { q = {}, order = {}, due = false, PER_MSG = 24, FLUSH_MS = 30 }
+
+local function jmc_flush()
+    local q, order = jmc.q, jmc.order
+    jmc.q, jmc.order, jmc.due = {}, {}, false
+    for _, bk in ipairs(order) do
+        local b = q[bk]
+        -- (the controller again: the same one, not a wrapper left from before)
+        if ue.valid(b.pc) and ue.short(b.pc) == b.pname then
+            local n = #b.ops
+            for i = 1, n, jmc.PER_MSG do
+                net.send_to(b.pc, "JMC", "*", b.key, table.unpack(b.ops, i, math.min(n, i + jmc.PER_MSG - 1)))
+            end
+        end
+    end
+end
+
+-- Host: the queued JMC ops go now (sdc_stations, before its DISASMR).
+function M.flush_viewers()
+    if jmc.due or next(jmc.q) ~= nil then jmc_flush() end
+end
+
 -- One multicast of a world container to its remote viewers.
 local function forward(comp, op, ...)
     if S.role ~= "host" or not on() or not views[addr(comp) or -1] or not is_world_comp(comp) then return end
     local vs, key = viewers_of(comp)
     if #vs == 0 or not key then return end
+    local parts = { op }
+    for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
+    local item = table.concat(parts, ",")
     local names = {}
     M.stats.forwards = M.stats.forwards + 1
     for _, e in ipairs(vs) do
-        net.send_to(e.pc, "JMC", op, key, ...)
-        names[#names + 1] = ue.short(e.pawn)
+        local pk = ue.valid(e.pc) and addr(e.pc)
+        if pk then
+            local bk = tostring(pk) .. "|" .. key
+            local b = jmc.q[bk]
+            if not b then
+                b = { pc = e.pc, pname = ue.short(e.pc), key = key, ops = {} }
+                jmc.q[bk] = b
+                jmc.order[#jmc.order + 1] = bk
+            end
+            b.ops[#b.ops + 1] = item
+            names[#names + 1] = ue.short(e.pawn)
+        end
+    end
+    if not jmc.due and #names > 0 then
+        jmc.due = true
+        ue.delay("containers-jmc", jmc.FLUSH_MS, jmc_flush)
     end
     local line = string.format("containers: %s %s in %s -> %s (reliable copy of the plugin's multicast)", op,
-        table.concat({ ... }, " "), comp_name(comp), table.concat(names, ", "))
+        table.concat(parts, " ", 2), comp_name(comp), table.concat(names, ", "))
     if counted("forwards") then log.info("%s", line) else log.debug("%s", line) end
 end
 
@@ -414,79 +468,6 @@ local function is_vendor(comp)
     return ue.try(function() return comp:IsVendor() end) == true
 end
 
--- The plugin's own answer to a refused move: the pending slot in `holder`
--- stops blinking, the item stays where it is.
-local function send_failed(mover_comp, holder, g)
-    local ok, err = pcall(function() mover_comp:CLIENT_MoveToIndexFailed({ { A = g.A, B = g.B, C = g.C, D = g.D } }, holder) end)
-    M.stats.failed_sent = M.stats.failed_sent + 1
-    return ok and "the client was told (CLIENT_MoveToIndexFailed)" or ("telling the client FAILED: " .. tostring(err))
-end
-
-local function host_move_log(line, bad)
-    if bad then log.warn("%s", line)
-    elseif counted("host_moves") then log.info("%s", line)
-    else log.debug("%s", line) end
-end
-
--- SERVER_SameContainer_MoveToIndex(JigMPCompRef, ItemUID, ToContainerUID, ToIndex, Rotated?, InContainerIndex)
-local function on_same_move(mcomp, mover, ref_p, uid_p, to_p, idx_p)
-    local ref = param(ref_p)
-    local g, to = param(uid_p), ue.try(guid_str, param(to_p))
-    local u = g and ue.try(guid_str, g)
-    if not ue.valid(ref) or not u or not to then return end
-    M.note_view(mover, ref)
-    M.stats.host_moves = M.stats.host_moves + 1
-    local idx = math.floor(tonumber(param(idx_p)) or -1)
-    local it = find_item(ref, u)
-    local done = it and it.mother == to and tonumber(it.slot) == idx
-    local answer = ""
-    if not done then
-        M.stats.host_refused = M.stats.host_refused + 1
-        answer = " - " .. send_failed(mcomp, ref, g)
-    end
-    host_move_log(string.format("containers: %s moved %s (uid %s) inside %s to slot %d: %s%s", ue.short(mover),
-        it and it.name or "?", u, comp_name(ref), idx, done and "done" or (it and ("NOT moved (still at slot " ..
-        tostring(it.slot) .. ")") or "NOT moved (not there)"), answer), not done)
-end
-
--- SERVER_RequestMoveItemToAnotherComp(From, To, ItemUID, FinalRotation, ToIndex, ToContainer, ...)
-local function on_comp_move(mcomp, mover, from_p, to_p, uid_p, _, idx_p)
-    local from, to = param(from_p), param(to_p)
-    local g = param(uid_p)
-    local u = g and ue.try(guid_str, g)
-    if not u or not ue.valid(from) or not ue.valid(to) then return end
-    M.note_view(mover, from)
-    M.note_view(mover, to)
-    M.stats.host_moves = M.stats.host_moves + 1
-    if is_vendor(from) or is_vendor(to) then return end
-    local in_to, in_from = find_item(to, u), find_item(from, u)
-    local done = in_to ~= nil and in_from == nil
-    local answer = ""
-    if not done and in_from and not in_to then
-        M.stats.host_refused = M.stats.host_refused + 1
-        answer = " - " .. send_failed(mcomp, to, g)
-    end
-    host_move_log(string.format("containers: %s moved %s x%s (uid %s) from %s to %s slot %s: %s%s", ue.short(mover),
-        (in_to or in_from or {}).name or "?", tostring((in_to or in_from or {}).n or "?"), u, comp_name(from),
-        comp_name(to), tostring(param(idx_p)), done and "done" or (in_from and "NOT moved" or "gone from both (merged?)"),
-        answer), not done and in_from ~= nil)
-end
-
--- SERVER_RequestStackItem(FromCom, ToComp, DroppedUID, ReceiverUID, MaxStack):
--- only the receiving component is told; a world container the dropped stack
--- came from gets its new state (gone / count) like its multicasts.
-local function on_stack(mcomp, mover, from_p, to_p, d_p, r_p)
-    local from, to = param(from_p), param(to_p)
-    local d = ue.try(guid_str, param(d_p))
-    M.note_view(mover, from)
-    M.note_view(mover, to)
-    if not d or not ue.valid(from) or addr(from) == addr(to) or not is_world_comp(from) then return end
-    local it = find_item(from, d)
-    if it then forward(from, "cnt", d, math.floor(tonumber(it.n) or 0)) else forward(from, "rm", d) end
-    host_move_log(string.format("containers: %s stacked %s from %s onto %s in %s", ue.short(mover), d,
-        comp_name(from), ue.try(guid_str, param(r_p)) or "?", comp_name(to)), false)
-end
-
 -- The item at a slot of a container in a component's server data, or nil.
 local function item_at(comp, mother, slot)
     local found = nil
@@ -503,6 +484,168 @@ local function item_at(comp, mother, slot)
         end)
     end)
     return found
+end
+
+-- The plugin's own answer to a refused move: the pending slot in `holder`
+-- stops blinking, the item stays where it is.
+local function send_failed(mover_comp, holder, g)
+    local ok, err = pcall(function() mover_comp:CLIENT_MoveToIndexFailed({ { A = g.A, B = g.B, C = g.C, D = g.D } }, holder) end)
+    M.stats.failed_sent = M.stats.failed_sent + 1
+    return ok and "the client was told (CLIENT_MoveToIndexFailed)" or ("telling the client FAILED: " .. tostring(err))
+end
+
+-- `again`: the same request again within gone.AGAIN s (a held click / fast
+-- looting sends one 6-13 times in 0.1 s): a debug line only, its first one
+-- said it all (0.8.1: 107 "gone from both" lines).
+local function host_move_log(line, bad, again)
+    if again then log.debug("%s", line)
+    elseif bad then log.warn("%s", line)
+    elseif counted("host_moves") then log.info("%s", line)
+    else log.debug("%s", line) end
+end
+
+-- The host has the item in none of the places a move could have left it: a
+-- stack merged into another one or loaded whole into a magazine (the plugin
+-- answered that itself), or a slot only the client shows (0.8.1: Rags x2 that
+-- the restore had replaced stayed in a client's pockets for 16 minutes;
+-- moving them got no answer at all). The client is told it is gone the way
+-- the game ends a stack: CLIENT_UpdateCount(holder, uid, 0, uid) removes a
+-- slot of the own inventory that shows it and ends the pending request in
+-- `holder`; the viewers of the world container it was shown in lose it there
+-- (JMC rm). Nothing when the player's inventory here holds that UID (only
+-- that container's view was old), and one answer per item in gone.AGAIN s (a
+-- held click sends the request a dozen times; the second value: a repeat).
+-- After a merge of the player's own stack the game answered there is
+-- nothing left on the client to remove. A world container's stack merged
+-- into one of the player's (looting onto a stack: no snapshot of the
+-- container, so not told apart) gets the answer too, harmless: the client's
+-- own inventory has no such UID (ClientUpdateCount finds nothing there, the
+-- game's answer ended the pending request first: same connection, sent
+-- before) and the container's viewers lose it as the host's copy did.
+local gone = { told = {}, AGAIN = 2 }   -- told: ["pawn address|uid"] = os.clock() of the answer
+local function tell_gone(mcomp, mover, holder, world, g, u, mine_checked)
+    if not mine_checked and find_item(mcomp, u) then return " - it is in their inventory here: nothing sent" end
+    local k = tostring(addr(mover)) .. "|" .. u
+    local now = os.clock()
+    if now - (gone.told[k] or -100) < gone.AGAIN then return " - the client was told a moment ago", true end
+    gone.told[k] = now
+    if world then forward(world, "rm", u) end
+    local ok, err = pcall(function()
+        mcomp:CLIENT_UpdateCount(holder, { A = g.A, B = g.B, C = g.C, D = g.D }, 0, { A = g.A, B = g.B, C = g.C, D = g.D })
+    end)
+    M.stats.gone_sent = M.stats.gone_sent + 1
+    return ok and " - the client was told it is gone (CLIENT_UpdateCount 0)" or (" - telling the client FAILED: " .. tostring(err))
+end
+
+-- The count of an item in the mover's inventory before the request
+-- (`before`: sdc_consume's snapshot, [uid] = { n = count }), when `comp` is
+-- that inventory; nil = not known.
+local function count_before(before, comp, mcomp, u)
+    if not before or addr(comp) ~= addr(mcomp) then return nil end
+    local pre = before[u]
+    return pre and (tonumber(pre.n) or 0) or false
+end
+
+-- SERVER_SameContainer_MoveToIndex(JigMPCompRef, ItemUID, ToContainerUID,
+-- ToIndex, Rotated?, InContainerIndex); `before`: see count_before. Ammo
+-- dropped on a magazine (a capacity container) stays where it was with fewer
+-- rounds, or goes whole into the magazine's stack; the plugin answers both
+-- itself (CLIENT_UpdateCounts / CLIENT_UpdateCount; a full magazine: its own
+-- CLIENT_MoveToIndexFailed). 0.8.1 called a loaded magazine "NOT moved" and
+-- sent a failure on top.
+local function on_same_move(mcomp, mover, before, ref_p, uid_p, to_p, idx_p)
+    local ref = param(ref_p)
+    local g, to = param(uid_p), ue.try(guid_str, param(to_p))
+    local u = g and ue.try(guid_str, g)
+    if not ue.valid(ref) or not u or not to then return end
+    M.note_view(mover, ref)
+    M.stats.host_moves = M.stats.host_moves + 1
+    local idx = math.floor(tonumber(param(idx_p)) or -1)
+    local it = find_item(ref, u)
+    local was = count_before(before, ref, mcomp, u)
+    local n = it and tonumber(it.n)
+    local result, answer, bad, again = "done", "", false, false
+    if it and it.mother == to and tonumber(it.slot) == idx then
+        result = "done"
+    elseif it and was and n and n < was then
+        M.stats.host_partial = M.stats.host_partial + 1
+        result = string.format("done (%d of %d went in, the rest stays at slot %s)", was - n, was, tostring(it.slot))
+    elseif it then
+        M.stats.host_refused = M.stats.host_refused + 1
+        local at = item_at(ref, to, idx)
+        result = string.format("NOT moved (still at slot %s, x%s; slot %d there holds %s)", tostring(it.slot),
+            tostring(it.n), idx, at and string.format("%s x%s", at.name, tostring(at.n)) or "nothing")
+        answer, bad = " - " .. send_failed(mcomp, ref, g), true
+    elseif was then
+        result = "done (merged whole into a stack there: the plugin answered)"
+    else
+        -- the host's snapshot of the inventory did not have it before either: a
+        -- slot only the client shows
+        bad = was == false
+        result = bad and "NOT there (not in their inventory before either: shown only on the client)"
+            or "NOT there (merged, or shown only on the client)"
+        answer, again = tell_gone(mcomp, mover, ref, is_world_comp(ref) and ref or nil, g, u, addr(ref) == addr(mcomp))
+    end
+    host_move_log(string.format("containers: %s moved %s (uid %s) inside %s to slot %d: %s%s", ue.short(mover),
+        it and it.name or "?", u, comp_name(ref), idx, result, answer), bad, again)
+end
+
+-- SERVER_RequestMoveItemToAnotherComp(From, To, ItemUID, FinalRotation,
+-- ToIndex, ToContainer, ...); `before`: see count_before.
+local function on_comp_move(mcomp, mover, before, from_p, to_p, uid_p, _, idx_p)
+    local from, to = param(from_p), param(to_p)
+    local g = param(uid_p)
+    local u = g and ue.try(guid_str, g)
+    if not u or not ue.valid(from) or not ue.valid(to) then return end
+    M.note_view(mover, from)
+    M.note_view(mover, to)
+    M.stats.host_moves = M.stats.host_moves + 1
+    if is_vendor(from) or is_vendor(to) then return end
+    local in_to, in_from = find_item(to, u), find_item(from, u)
+    local was = count_before(before, from, mcomp, u)
+    local n = in_from and tonumber(in_from.n)
+    local result, answer, bad, again = "NOT moved", "", false, false
+    if in_to ~= nil and in_from == nil then
+        result = "done"
+    elseif in_from and not in_to and was and n and n < was then
+        -- part of a stack went (a magazine there took what it had room for)
+        M.stats.host_partial = M.stats.host_partial + 1
+        result = string.format("done (%d of %d went in, the rest stays)", was - n, was)
+    elseif in_from and not in_to then
+        M.stats.host_refused = M.stats.host_refused + 1
+        answer, bad = " - " .. send_failed(mcomp, to, g), true
+    elseif not in_from and not in_to then
+        if was then
+            result = "gone from both: merged into a stack there (the plugin answered)"
+        else
+            bad = was == false
+            result = bad and "gone from both, and not in their inventory before either (shown only on the client)"
+                or "gone from both (merged, or shown only on the client)"
+            answer, again = tell_gone(mcomp, mover, to, is_world_comp(from) and from or nil, g, u,
+                addr(from) == addr(mcomp) or addr(to) == addr(mcomp))
+        end
+    else
+        -- in both (one component as From and To): a WARN without an answer, as before
+        bad = true
+    end
+    host_move_log(string.format("containers: %s moved %s x%s (uid %s) from %s to %s slot %s: %s%s", ue.short(mover),
+        (in_to or in_from or {}).name or "?", tostring((in_to or in_from or {}).n or "?"), u, comp_name(from),
+        comp_name(to), tostring(param(idx_p)), result, answer), bad, again)
+end
+
+-- SERVER_RequestStackItem(FromCom, ToComp, DroppedUID, ReceiverUID, MaxStack):
+-- only the receiving component is told; a world container the dropped stack
+-- came from gets its new state (gone / count) like its multicasts.
+local function on_stack(mcomp, mover, from_p, to_p, d_p, r_p)
+    local from, to = param(from_p), param(to_p)
+    local d = ue.try(guid_str, param(d_p))
+    M.note_view(mover, from)
+    M.note_view(mover, to)
+    if not d or not ue.valid(from) or addr(from) == addr(to) or not is_world_comp(from) then return end
+    local it = find_item(from, d)
+    if it then forward(from, "cnt", d, math.floor(tonumber(it.n) or 0)) else forward(from, "rm", d) end
+    host_move_log(string.format("containers: %s stacked %s from %s onto %s in %s", ue.short(mover), d,
+        comp_name(from), ue.try(guid_str, param(r_p)) or "?", comp_name(to)), false)
 end
 
 -- SERVER_RequestSplitItem(FromComp, ToComp, ItemUID, ToContainerUID, ToIndex,
@@ -531,16 +674,19 @@ local function on_split(mcomp, mover, from_p, to_p, uid_p, cont_p, idx_p, amount
 end
 
 -- Host: the post-hook of an inventory RPC of a remote player (sdc_consume
--- holds the one hook per function and calls this).
-function M.host_rpc(rpc, c, ...)
+-- holds the one hook per function and calls this). `before`: that player's
+-- inventory as sdc_consume had it just before the request ([uid] = { n =
+-- count, ... }), or nil.
+function M.host_rpc(rpc, c, before, ...)
     if S.role ~= "host" or not on() then return end
     local mcomp = c and c:get()
     local mover = ue.valid(mcomp) and owner_of(mcomp)
     if not is_remote_character(mover) then return end
+    if type(before) ~= "table" then before = nil end
     if rpc == "SERVER_SameContainer_MoveToIndex" then
-        on_same_move(mcomp, mover, ...)
+        on_same_move(mcomp, mover, before, ...)
     elseif rpc == "SERVER_RequestMoveItemToAnotherComp" then
-        on_comp_move(mcomp, mover, ...)
+        on_comp_move(mcomp, mover, before, ...)
     elseif rpc == "SERVER_RequestStackItem" then
         on_stack(mcomp, mover, ...)
     elseif rpc == "SERVER_RequestSplitItem" then
@@ -735,9 +881,8 @@ local function apply_done(comp, f)
         ue.short(owner_of(comp)), ok and "" or " - FAILED"))
 end
 
--- net JMC|<op>|<container key>|<args...>, host -> client.
-local function on_jmc_msg(f)
-    if S.role ~= "client" or not on() then return end
+-- One op: { op, container key, args... }.
+local function jmc_op(f)
     local op, key = f[1], f[2] or ""
     if op == "add" then
         if resolve(key) then apply_added(key, f) end
@@ -755,6 +900,21 @@ local function on_jmc_msg(f)
     elseif op == "cnt" then apply_count(comp, f)
     elseif op == "dur" then apply_durability(comp, f)
     elseif op == "done" then apply_done(comp, f) end
+end
+
+-- net JMC|*|<container key>|<op,args...>|<op,args...>|... (the ops of one
+-- host tick for one container, in order), or JMC|<op>|<container key>|<args...>
+-- (one op, as before 0.7.3), host -> client.
+local function on_jmc_msg(f)
+    if S.role ~= "client" or not on() then return end
+    if f[1] ~= "*" then return jmc_op(f) end
+    local key = f[2] or ""
+    for i = 3, #f do
+        local one = {}
+        for part in (f[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = part end
+        table.insert(one, 2, key)
+        jmc_op(one)
+    end
 end
 
 -- BP_JigComponent.Jig_UnhandledEvent(FromContainer, ToContainer, ToIndex,
@@ -834,7 +994,14 @@ function M.host_tick()
         try_hook(JIG_FN .. "MC_UpdateDurability", "mc-dur", on_mc_dur)
         try_hook(JIG_FN .. "MC_OnPendingDone", "mc-done", on_mc_done)
     end
+    -- (a delayed send that never ran)
+    if jmc.due then jmc_flush() end
     for k, v in pairs(views) do
+        -- viewers that left or went too long ago (up to 0.7.3 only a forward
+        -- dropped them: a view nobody forwarded to stayed for good)
+        for pk, e in pairs(v.by) do
+            if not viewer_live(e, now) then v.by[pk] = nil end
+        end
         if not ue.valid(v.comp) or next(v.by) == nil then
             views[k] = nil
             if by_key[v.key] == k then by_key[v.key] = nil end
@@ -843,6 +1010,9 @@ function M.host_tick()
     for k, t in pairs(resend_at) do
         if now - t > 10 then resend_at[k] = nil end
     end
+    for k, t in pairs(gone.told) do
+        if now - t > 10 then gone.told[k] = nil end
+    end
     deathbox.host_tick()
 end
 
@@ -850,7 +1020,8 @@ function M.client_tick()
     local now = os.clock()
     if now - hook_at >= 5 then
         hook_at = now
-        try_hook(JIG_FN .. "Jig_UnhandledEvent", "move-asked", on_drop)
+        -- (log only: this player's own move requests; with config debug)
+        if log.debug_enabled then try_hook(JIG_FN .. "Jig_UnhandledEvent", "move-asked", on_drop) end
     end
     if on() then check_stuck(now) end
     deathbox.client_tick()
@@ -858,13 +1029,16 @@ end
 
 function M.reset()
     views, by_key, resend_at = {}, {}, {}
+    gone.told = {}
+    jmc.q, jmc.order, jmc.due = {}, {}, false
     opened, waiting, logged = {}, {}, {}
     hook_at = -100
     deathbox.reset()
 end
 
 function M.register_handlers()
-    -- host -> client: JMC|<mv|rm|add|stk|cnt>|<container key>|<args>   (a world container's multicast, reliably)
+    -- host -> client: JMC|*|<container key>|<op,args>|...  (a world container's multicasts of one tick, reliably;
+    -- op mv|rm|add|stk|cnt|dur|done; the old single form JMC|<op>|<container key>|<args> is still read)
     net.on("JMC", on_jmc_msg)
     -- client -> host: JADD|<container key>|<uid>   (an added item the open container does not show)
     net.on("JADD", on_add_request)

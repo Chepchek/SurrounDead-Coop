@@ -147,6 +147,7 @@ package.preload["sdc_ue"] = function()
     local U = {}
     U.valid = function(o) return type(o) == "table" and o._valid == true end
     U.prop = function(o, k) if not U.valid(o) then return nil end return o[k] end
+    U.missing = function(v) return v == nil end   -- (no TrivialObject in this mock)
     U.set_prop = function(o, k, v) if not U.valid(o) then return false end o[k] = v; return true end
     U.short = function(o) return U.valid(o) and o._name or "<none>" end
     U.str = function(v) if type(v) == "string" then return v end return tostring(v or "") end

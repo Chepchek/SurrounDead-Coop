@@ -184,7 +184,6 @@ local miss = new_char("Sneaky")          -- constructed without a notification
 local l7 = ue.find_all_recent(CLS)
 check(scans[CLS] == s6 + 1 and names(l7) == "Client2,Host,Sneaky", "found by the 1 s scan")
 check(count_lines("without a new%-object notification") == 1, "watch distrust logged")
-check(ue.watch_state(CLS).ok == false and ue.watch_state(CLS).missed == 1, "watch not trusted any more")
 advance(0.3)
 ue.find_all_recent(CLS)
 check(scans[CLS] == s6 + 2, "back to 0.25 s")
@@ -199,13 +198,22 @@ ue.find_all_recent(CLS)
 check(count_lines("without a new%-object notification") == 1, "logged once only")
 
 out("== no NotifyOnNewObject")
+-- a class that is not watched keeps the plain 0.25 s list (a watched one: 1 s)
+-- (2026-11-13: ue.watch_state, unused by the mod, is gone; read the behaviour)
+local function not_watched(cls)
+    ue.find_all_recent(cls)
+    local n0 = scans[cls] or 0
+    advance(0.3)
+    ue.find_all_recent(cls)
+    return (scans[cls] or 0) == n0 + 1
+end
 local saved = NotifyOnNewObject
 NotifyOnNewObject = nil
 local okn = ue.watch_new("BP_Other_C", "/Game/X.BP_Other_C")
-check(okn == false and ue.watch_state("BP_Other_C") == nil, "unavailable: not watched")
+check(okn == false and not_watched("BP_Other_C"), "unavailable: not watched")
 NotifyOnNewObject = function() error("boom") end
 local okf = ue.watch_new("BP_Other_C", "/Game/X.BP_Other_C")
-check(okf == false and ue.watch_state("BP_Other_C") == nil and count_lines("FAILED") >= 1, "registration error: not watched, logged")
+check(okf == false and not_watched("BP_Other_C") and count_lines("FAILED") >= 1, "registration error: not watched, logged")
 NotifyOnNewObject = saved
 
 out("== empty world")

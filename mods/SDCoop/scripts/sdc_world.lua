@@ -51,7 +51,8 @@
 --                     way. The harvestable's Mesh / Material do not replicate:
 --                     on a client the host's tree had no mesh (invisible, no
 --                     collision), so the client dresses it from the foliage
---                     component it came from. Its hits count on the host only
+--                     component it came from (a rock's Static mesh component
+--                     made Movable first). Its hits count on the host only
 --                     (MaxHits, the fall and the grant are the host's): the
 --                     host's replay of a client's swing practically never hits
 --                     (sdc_combat), so the client sends its own hits (WHHIT)
@@ -100,12 +101,26 @@
 --                     replicated children (stations, containers come from the
 --                     host) and builds only the visual ones. The prefab's own
 --                     AI volume copy on a client must not spawn AI
---                     (SpawnAIFromClass pre-hook).
+--                     (SpawnAIFromClass pre-hook); at its first try it is
+--                     switched off (its loop would retry for good; [PERF]
+--                     world counts). A camp's discovery XP (its
+--                     spawner's DistanceToPrefab, player 0 = the host only):
+--                     a client within its radius gets the same once (WCAMPXP).
 --   world_resource_to_inventory  the host-side adds above use the game's
 --                     JigTryAddItemSomewhere, which on the host finds no
 --                     inventory widget for a remote player and drops the item
---                     at that player's feet; the drop is turned into the
---                     plugin's server-side add (AddNewItemSomewhere).
+--                     at that player's feet; the drop is turned into an add
+--                     where that client's own screen put the resource (its
+--                     WSPOT: grid / stack / no room - then the drop stays;
+--                     a word that comes a moment after the host's grant is
+--                     waited for, up to 1 s), and the game's note says so.
+--                     No usable word (an item that screen does not name: a
+--                     picked-up buildable; no word in time): the drop waits
+--                     at the feet and that screen is asked where it goes
+--                     (HV.ask_screen -> sdc_place), never the plugin's
+--                     AddNewItemSomewhere (any grid: a wallet, a med bag).
+--                     Salvaged scrap with no room on that screen is dropped
+--                     at the player's feet.
 --
 -- Rules: no object wrapper is kept beyond the call that got it (paths,
 -- addresses and numbers only); hook callbacks never throw and return nothing;
@@ -129,13 +144,19 @@ local M = {
         prefab_blocked = 0, prefab_ai_blocked = 0, prefab_replicated = 0, prefab_removed = 0,
         hits_sent = 0, hits_host = 0, hits_dup = 0, dressed = 0, fol_idx = 0, fol_ovl = 0, fol_miss = 0,
         moves = 0, moves_applied = 0,
-        rinf = 0, rinf_shown = 0, moon = 0, jets = 0, waves_blocked = 0,
+        rinf = 0, rinf_shown = 0, moon = 0, jets = 0, waves_blocked = 0, wave_targets = 0,
         pw_steps = 0, pw_host = 0, pw_sent = 0, pw_applied = 0, pw_tries = 0, pw_tries_ok = 0, pw_restored = 0,
         ad_rolls = 0, ad_planes = 0, ad_crates = 0, crate_sent = 0, crate_snapped = 0,
         lk_counts = 0, lk_breaks = 0, lk_unlocks = 0, lk_tools = 0, lk_keypads = 0, inf_shared = 0, inf_unlocked = 0,
         -- landmines: host explosions sent / a client's set off on the host / client own sent,
         -- shown here by the copy's Event_Explode / by the effects at the host's point / already here
         mines = 0, mines_host = 0, mines_sent = 0, mines_copy = 0, mines_fx = 0, mines_dup = 0,
+        -- camp discovery XP (host: sent to clients; client: paid here); sirens re-aligned;
+        -- horde bosses gone with their player's death (and of those, with other players near)
+        camp_xp = 0, siren_aligned = 0, horde_lost = 0, horde_lost_fight = 0,
+        -- client: camp AI volumes switched off at their first blocked spawn (PF.stop_volume),
+        -- spawns blocked again after that (the switch-off did not hold)
+        prefab_ai_stopped = 0, prefab_ai_again = 0,
     },
 }
 
@@ -251,6 +272,21 @@ local HV = {
     rate = {},             -- host: [pc address] = { t, n } WHHIT per second
     logged = {},           -- [address] = count of info lines for that harvestable
     last_add = nil,        -- client: { name, n, t } the last JigTryAddItemSomewhere here (salvage roll)
+    -- Where a client's own screen puts a world resource (WSPOT, see HV.place)
+    SPOT_ITEMS = { DA_WoodenLog = true, DA_Rock = true, DA_ScrapMetal = true },
+    SPOT_S = 30,           -- host: a client's word this old still counts (its own copy of the rock can
+                           -- break at its first hit, the host's after all of them)
+    SPOT_MAX = 4,          -- host: words kept per player and item (the first one in is used first)
+    SPOT_WAIT = 1.0,       -- host: a grant with no word yet waits this long for it (the host's replay
+                           -- of the swing can fell it first; a tree grants 0.2 s after its fall on
+                           -- both machines: the word comes a moment after the host's grant)
+    spot = nil,            -- client: { name, kind, cont, uid, where, t } this add's place (pending-ref hook)
+    spots = {},            -- host: [controller address] = { [item name] = { { kind, cont, uid, t }, ... } }
+    spot_sent = {},        -- client: [stack uid] = clock: a stack this screen grows (CLIENT_UpdateCount log)
+    spot_logged = 0,       -- info lines so far (then debug)
+    into = nil,            -- host: { t, k = character address, name }: this add went into the inventory
+    pend = {},             -- host: { { k, name, n, da, pawn, drop, t, who } } grants waiting for their word
+    own_drop = false,      -- host: inside HV.drop_at (that JigMP_OnRequestDropItem is no game drop)
 }
 -- Random infestations (one table, same reason): the host's runtime
 -- BP_Infestation_C replicate; clients dress their copies (WRINF).
@@ -310,6 +346,7 @@ local IX = {
     got = {},      -- host: [nest key] = controller address whose own copy died (WINFD): the game paid it there
     own = {},      -- client: [nest key] = true: this machine's own copy died (the game paid it here)
     recv = {},     -- client: [nest key] = true: the host's share arrived
+    wave = {},     -- host: [nest address] = { name, t }: a wave member is being placed (LocToSpawn)
     SKULL = "/Game/UI/Textures/Survival-UI-Bundle/Rhombus_Solid/512x512/Skul.Skul",
 }
 -- Locks, keys and tools of a client (one table, same reason; see the LK section).
@@ -322,6 +359,7 @@ local LK = {
     break_host = {}, tool_host = {}, key_host = {},   -- host: [controller address] = clock (rate)
     aim = {},                         -- host: [object address] = { pc, t } the remote player at it
     redir = {},                       -- host: [object address] = clock of its last scope answer
+    door_in = nil,                    -- the door path door_one applies right now (on_door: no echo)
 }
 PATH.JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 PATH.BREAK_OPEN_CUE = "/Game/Audio/BreakOpen_Cue.BreakOpen_Cue"
@@ -373,14 +411,13 @@ local hooked = {}          -- [path] = true (never reset: hooks stay registered)
 local hook_try_at = -100
 local applying = 0         -- > 0 while this module calls into the game (client: no echo)
 local cls_cache, cls_cache_at = {}, 0   -- [address] = kind | false (resolver)
-local hitters = {}         -- host: [address] = { name =, pc = controller | false, t = }
+local hitters = {}         -- host: [address] = { name =, pc = controller | false (the host) | nil (unknown, no player), t = }
 local grant_until = {}     -- host: [controller address] = clock: a resource add for that player
 local fol_removed = {}     -- host: [ism path] = { "x,y,z", ... } this session
 local fol_seen = {}        -- host: ["ism|x|y|z"] = true
 local pending_harv = nil   -- { t, loc, kind, block } from the spawn pre-hook
 local pending_dmg = {}     -- client: { { path, dmg, t } } object damage waiting for its Trace_Impact
 local loot_sent = {}       -- [path] = true: this machine already reported / applied it
-local door_state = {}      -- host: [path] = { ev, want, unlocked } for the snapshot
 local rdoor_toggled = {}   -- client: [path] = clock of the last local toggle
 local pending = {}         -- client: { kind, path, args, until } objects not found yet
 local snap_asked = {}      -- client: [world key] = clock
@@ -389,7 +426,7 @@ local build = {}           -- host: [controller address] = { rep = bool, at = cl
 local last_role = nil
 local prev_resolver = nil
 local in_resolver = false
-local cache = { block_cls = nil, harvest_cls = {}, scrap = nil, cue = nil, menu_cls = nil }
+local cache = { block_cls = nil, harvest_cls = {}, scrap = nil, cue = nil }
 
 local function on(key)
     if cfg.get("world_sync") == false then return false end
@@ -662,9 +699,14 @@ end
 -- ===========================================================================
 -- sdc_ctx asks ctx.scope_resolver(world context) for every player-0 call while
 -- remote players are connected. Kinds:
---   harvest / trash / infest: the last player who hit it (hook records);
+--   harvest / trash / infest: the last player who hit it (hook records); a
+--     living infestation only for its wave members (IX.wave_target);
+--   beacon: a horde beacon (sdc_horde's ctx.beacon_scope: its running horde's
+--     new waves while the presser is dead), else as build;
 --   build / container: its CurrentActor, set by OnServerExecuteInteract (build)
---     or by the searching player's own interaction (container).
+--     or by the searching player's own interaction (container);
+--   spawn: AI / prefab spawners' "player within 25 m?" checks, answered by
+--     sdc_ai_spawnnear (ctx.spawn_scope) with the player nearest the point.
 -- Called very often (containers' DistanceOutline every 0.5 s): one address
 -- lookup, a class name once per address and 2 s.
 
@@ -673,13 +715,15 @@ local KIND_PREFIX = {
     { "BP_HarvestableObject", "harvest" },
     { "TrashObject", "trash" },
     { "BP_Infestation", "infest" }, { "BP_PrimaryInfestation", "infest" },
-    { "Buildable_", "build" },
+    { "Buildable_HordeBeacon", "beacon" }, { "Buildable_", "build" },
     { "Container_", "container" }, { "BP_LootContainer", "container" }, { "PicklockContainer_", "container" },
     { "BP_ToolRequired_", "container" }, { "BP_MASTER_PicklockContainer", "container" },
     { "BP_MASTER_ToolRequiredContainer", "container" }, { "BP_KeycardBriefcaseContainer", "container" },
     -- their server path asks for player 0 for a client's use (XP, notes): LK
     { "BP_BunkerScanner", "aim" }, { "BP_KeycardDoor", "aim" }, { "BP_KeypadDoor", "aim" },
     { "BP_HangarDoor", "aim" },
+    -- TraceForPlayer / CheckSurroundingArea compare their 25 m query with player 0
+    { "BP_AISpawner_", "spawn" }, { "BP_AISpawningVolume_", "spawn" }, { "BP_PrefabSpawner", "spawn" },
 }
 local GRANT_KINDS = { harvest = true, trash = true, build = true }
 
@@ -730,7 +774,7 @@ local function nearest_player(a)
     local l = ue.location(a)
     if not l then return nil end
     local best, bestd = nil, math.huge
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    for _, p in ipairs(ue.player_chars()) do
         if ue.valid(p) and ue.valid(ue.prop(p, "Controller")) then
             local pl = ue.location(p)
             if pl then
@@ -761,6 +805,35 @@ local function resolve_horde(wco, a)
         return b.pc
     end
     return nil
+end
+
+-- <horde boss>.Event_PlayerDead (post, host): the player it is bound to died
+-- and the game kills it (DeathEvent(None): no loot, no XP; gone 5 s later),
+-- even while other players fight it. Not changed (keeping it alive needs a
+-- "no player" answer of sdc_ctx's scope at its BeginPlay, then a death check
+-- of this module's own): logged with the living players still near it, to see
+-- how often a fight is lost that way.
+IX.HORDE = "/Game/AI/Zombies/Boss/Types/Horde/"
+IX.HORDE_NEAR_CM = 5000
+function IX.on_horde_dead(c)
+    if not is_host() then return end
+    local b = c and c:get()
+    if not ue.valid(b) then return end
+    local at = ue.location(b)
+    local near = {}
+    if at then
+        for _, e in ipairs(ctx.live_players()) do
+            local d = d2(e.loc, at)
+            if d <= IX.HORDE_NEAR_CM * IX.HORDE_NEAR_CM then
+                near[#near + 1] = string.format("%s %.0f m", e.remote and ue.short(e.pc) or "the host", math.sqrt(d) / 100)
+            end
+        end
+    end
+    M.stats.horde_lost = M.stats.horde_lost + 1
+    if #near > 0 then M.stats.horde_lost_fight = M.stats.horde_lost_fight + 1 end
+    log.info("world: horde boss %s dies with the player it was bound to (the game: no loot, no XP)%s", ue.short(b),
+        #near > 0 and string.format("; %d living player(s) within %.0f m of it: %s", #near, IX.HORDE_NEAR_CM / 100,
+            table.concat(near, ", ")) or "; no living player near it")
 end
 
 -- The swing in progress: a melee weapon asks GetPlayerController(self, 0) for
@@ -803,18 +876,35 @@ local function own_resolve(wco, a0)
     if not k then return nil end
     if k == "weapon" then note_swing(wco, a) return nil end
     if k == "horde" then return resolve_horde(wco, a) end
+    if k == "beacon" then
+        -- a horde beacon: a running horde whose presser has no living
+        -- character -> sdc_horde's answer (ctx.beacon_scope), else a buildable
+        local f = ctx.beacon_scope
+        local r = f and f(wco, a)
+        if r ~= nil then
+            M.stats.scopes = M.stats.scopes + 1
+            return r
+        end
+        k = "build"
+    end
     if k == "aim" then
         if not on("world_doors") then return nil end
         return LK.aim_who(wco, a)
     end
+    if k == "spawn" then
+        local f = ctx.spawn_scope
+        if not f then return nil end
+        return f(wco, a)
+    end
     if k == "harvest" or k == "trash" or k == "infest" then
         -- an infestation asks for player 0 also while alive (health bar, its
         -- waves): only its destruction (XP, InfestationsDestroyed @9868-10911,
-        -- after IsDestroyed? @11090) belongs to who destroyed it
+        -- after IsDestroyed? @11090) belongs to who destroyed it, and a wave
+        -- member's target to IX.wave_target
         -- (the context object is alive - a non-zero address, running a
         -- Blueprint now -: ue.prop_live skips ue.prop's validity check)
         if k == "infest" and (math.type(a) == "integer" and a ~= 0 and ue.prop_live or ue.prop)(wco, "IsDestroyed?") ~= true then
-            return nil
+            return IX.wave_target(wco, a)
         end
         local who = hitter_of(wco, a)
         if who == false then return false end
@@ -882,7 +972,7 @@ end
 -- ActorRef), post, host: JigTryAddItemSomewhere found no widget slot for a
 -- remote player and dropped the item at the character.
 local function on_player_drop(c, info_p, _, actor_p)
-    if not is_host() or not on("world_resource_to_inventory") then return end
+    if HV.own_drop or HV.foreign_drop() or not is_host() or not on("world_resource_to_inventory") then return end
     local pawn = c and c:get()
     if not is_player_character(pawn) then return end
     local pc = ue.prop(pawn, "Controller")
@@ -895,34 +985,82 @@ local function on_player_drop(c, info_p, _, actor_p)
     local drop = obj(actor_p)
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
     if not ue.valid(da) or not ue.valid(comp) or n < 1 then return end
-    local added, dropped, uid, to = {}, {}, {}, {}
-    local ok, err = pcall(function()
-        comp:AddNewItemSomewhere(da, n, nil, 1, false, FName("None"), added, dropped, uid, to)
-    end)
     local name = ue.short(da)
-    if ok and added.Added == true then
-        M.stats.grants = M.stats.grants + 1
-        local dpath = drop and path_of(drop)
-        if dpath then
-            -- the game still sets the drop's count right after this returns;
-            -- the pickup goes a moment later, found again by its name
-            ue.delay("world-grant", 50, function()
-                local p = find(dpath)
-                if p then pcall(function() p:K2_DestroyActor() end) end
-            end)
-        end
-        log.info("world: %s x%d for %s went to its inventory (not dropped)", name, n, ue.short(pawn))
-    else
-        M.stats.grant_drops = M.stats.grant_drops + 1
-        log.info("world: %s x%d for %s stays on the ground at its feet (add=%s%s)", name, n, ue.short(pawn),
-            tostring(added.Added), ok and "" or (" " .. tostring(err)))
+    -- no word yet from that player's screen (its copy's grant often comes a
+    -- moment after this one): the game's drop waits for it (HV.pend, HV.settle);
+    -- the game's answer is "added", as it nearly always will be
+    local wpath = drop and path_of(drop)
+    if HV.SPOT_ITEMS[name] and wpath and not HV.has_word(pc, name) then
+        HV.pend[#HV.pend + 1] = { k = addr(pc), name = name, n = n, da = path_of(da), pawn = path_of(pawn), drop = wpath,
+                                  t = clock(), who = ue.short(pawn) }
+        M.stats.grants = M.stats.grants + 1   -- (inside the game's call: sdc_consume leaves it to this module)
+        HV.into = { t = clock(), k = addr(pawn), name = name }
+        HV.cnt.wait = HV.cnt.wait + 1
+        HV.say(string.format("world: %s x%d for %s: no word from its screen yet; its drop waits up to %.1f s for it",
+            name, n, ue.short(pawn), HV.SPOT_WAIT))
+        return
     end
+    -- first where that player's own screen put it (HV.place); the plugin's
+    -- AddNewItemSomewhere would pick any grid of the server data, also one the
+    -- client's widget refuses for this item (0.10.0: rocks in a med bag;
+    -- 2026-11-13: a picked-up gun locker in a med bag, never shown)
+    local how, what = HV.place(pc, comp, da, n)
+    if how == "none" then
+        M.stats.grant_drops = M.stats.grant_drops + 1
+        log.info("world: %s x%d for %s stays on the ground at its feet: %s", name, n, ue.short(pawn), what)
+        return
+    end
+    if not how then
+        -- no usable word (an item its screen does not name - a picked-up
+        -- buildable -, or an old word): that screen is asked now (HV.ask_screen)
+        if HV.ask_screen(pawn, da, n, wpath, what or "not a resource its screen names") then
+            M.stats.grants = M.stats.grants + 1   -- (inside the game's call: sdc_consume leaves it to this module)
+            HV.into = { t = clock(), k = addr(pawn), name = name }
+        else
+            M.stats.grant_drops = M.stats.grant_drops + 1
+        end
+        return
+    end
+    M.stats.grants = M.stats.grants + 1
+    HV.into = { t = clock(), k = addr(pawn), name = name }
+    if wpath then
+        -- the game still sets the drop's count right after this returns;
+        -- the pickup goes a moment later, found again by its name
+        ue.delay("world-grant", 50, function()
+            local p = find(wpath)
+            if p then pcall(function() p:K2_DestroyActor() end) end
+        end)
+    end
+    log.info("world: %s x%d for %s went to its inventory where its screen put it: %s", name, n, ue.short(pawn), what)
 end
 
--- Host: an item straight into a remote player's inventory (salvage).
-local function grant(pawn, da, n)
+-- Host: an item straight into a remote player's inventory (salvage): where
+-- its screen put it (pc given: HV.place); no room on its screen: dropped at
+-- its feet (as single player; the plugin's add would pick any grid, also one
+-- that screen does not show); no usable word: dropped at its feet and that
+-- screen asked where it goes (HV.ask_screen); the drop failing: the plugin's
+-- add as the last way (its own drop at the player's feet when full).
+local function grant(pawn, da, n, pc)
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
     if not ue.valid(comp) or not ue.valid(da) then return false end
+    local how, what = nil, nil
+    if pc then how, what = HV.place(pc, comp, da, n) end
+    if how == "stack" or how == "slot" then
+        log.info("world: %s gets %s x%d where its screen put it: %s", ue.short(pawn), ue.short(da), n, what)
+        return true
+    end
+    local dropped_ok, drop_actor = HV.drop_at(pawn, da, n)
+    if dropped_ok and how == "none" then
+        log.info("world: %s gets %s x%d dropped at its feet: its screen has no room for it", ue.short(pawn), ue.short(da), n)
+        return true
+    end
+    if dropped_ok then
+        HV.ask_screen(pawn, da, n, path_of(drop_actor), what or "no word from its screen")
+        return true
+    end
+    what = (how == "none" and "its screen has no room for it" or what or "no word from its screen")
+        .. ", and the drop at its feet FAILED"
+    log.info("world: %s gets %s x%d: %s; the plugin's add", ue.short(pawn), ue.short(da), n, what)
     local added, dropped, uid, to = {}, {}, {}, {}
     local ok, err = pcall(function()
         comp:AddNewItemSomewhere(da, n, nil, 1, true, FName("None"), added, dropped, uid, to)
@@ -941,9 +1079,9 @@ local function looted_of(c)
 end
 
 local function unlocked_of(c)
-    -- BP_LockPickObject children only; nil elsewhere
+    -- BP_LockPickObject children only; a TrivialObject elsewhere (ue.missing)
     local v = ue.prop(c, "IsLocked?")
-    if v == nil then return false end
+    if ue.missing(v) then return false end
     return v == false
 end
 
@@ -1467,10 +1605,18 @@ end
 -- ===========================================================================
 
 -- What a BP_LockedDoor is doing: "o" opening/open, "c" closing/closed.
+-- While its timeline plays: IsReversing, which Play / Reverse set at once.
+-- Not the Direction variable: PlayFromStart / ReverseFromEnd write it from
+-- the previous move and the next tick the new one, so read in the same frame
+-- as a move (Event_Door's hook, a WDOOR applied right after another) it said
+-- the opposite of every move but a door's first (2026-11-13). Direction only
+-- if IsReversing cannot be read.
 local function locked_door_target(d)
     local tl = ue.prop(d, "Timeline_OpenDoor")
     local playing = ue.valid(tl) and ue.try(function() return tl:IsPlaying() end) == true
     if playing then
+        local rev = ue.try(function() return tl:IsReversing() end)
+        if type(rev) == "boolean" then return rev and "c" or "o" end
         return num(ue.prop(d, LD_DIR), 0) == 0 and "o" or "c"
     end
     return ue.prop(d, "Closed?") == false and "o" or "c"
@@ -1491,12 +1637,27 @@ local function on_door(c, ev)
     if S.role == "client" and applying > 0 then return end
     local p = path_of(d)
     if not p then return end
-    local want = (ev == "d") and locked_door_target(d) or "o"
+    -- host: the door this module is moving for a client's WDOOR right now
+    -- (door_one) - nothing back to that client, and door_msg passes the
+    -- sender's word on to the others. Read inside the call, the door's state
+    -- was not settled yet: 2026-11-13 the echo of a client's "open" said
+    -- "closed", or came before the unlock was set (no "u"), and the other
+    -- clients got the change twice. Other host-side calls still report.
+    if applying > 0 and LK.door_in == p then return end
+    local want = "o"
+    if ev == "d" then
+        -- the move this press made (Event_Door @4256): Closed? opens
+        -- (PlayFromStart), not Closed? closes (ReverseFromEnd). Closed? changes
+        -- only when the timeline finishes (@4587), so it names the move before
+        -- and after the call alike (2026-11-13: the host's own open went out
+        -- as "c", a client's close as "o", and the doors ran opposite)
+        local cl = ue.prop(d, "Closed?")
+        if type(cl) == "boolean" then want = cl and "o" or "c" else want = locked_door_target(d) end
+    end
     local unlocked = ue.prop(d, "IsLocked?") == false and "u" or ""
     if S.role == "client" then
         if to_host("WDOOR", pack(p), ev, want, unlocked) then M.stats.doors_sent = M.stats.doors_sent + 1 end
     elseif is_host() then
-        door_state[p] = { ev = ev, want = want, unlocked = unlocked }
         to_clients("WDOOR", pack(p), ev, want, unlocked)
         M.stats.doors_sent = M.stats.doors_sent + 1
     end
@@ -1518,39 +1679,58 @@ local function apply_door(d, ev, want, unlocked)
     return did
 end
 
-local function door_msg(f, pc)
-    if not on("world_doors") then return end
-    local p = unpack_path(f[1])
-    local ev, want, unlocked = f[2] or "d", f[3] or "o", f[4] or ""
+-- One door here as the sender has it (client: one not found yet waits).
+local function door_one(p, ev, want, unlocked)
     local d = find(p)
     if not d then
         if S.role == "client" then later("door", p, { ev, want, unlocked }) end
-        return
+        return false
     end
-    if apply_door(d, ev, want, unlocked) then
+    LK.door_in = p   -- (on_door: this door's own post-hook stays quiet)
+    local okd, did = pcall(apply_door, d, ev, want, unlocked)
+    LK.door_in = nil
+    if not okd then log.err_throttled("world.door", "world: door %s: %s", ue.short(d), tostring(did)) end
+    if okd and did then
         M.stats.doors_applied = M.stats.doors_applied + 1
         log.debug("world: door %s %s/%s applied", ue.short(d), ev, want)
     end
+    return true
+end
+
+-- WDOOR|door|ev|want|unlocked (one door, both ways) or, host -> client (the
+-- join snapshot), WDOOR|door!want[u];door!want[u];... (Event_Door doors).
+local function door_msg(f, pc)
+    if not on("world_doors") then return end
+    if f[2] == nil then
+        if S.role ~= "client" then return end
+        for _, e in ipairs(split(f[1], ";")) do
+            local p, want, u = e:match("^([^!]+)!([oc])(u?)$")
+            if p then door_one(unpack_path(p), "d", want, u) end
+        end
+        return
+    end
+    local p = unpack_path(f[1])
+    local ev, want, unlocked = f[2] or "d", f[3] or "o", f[4] or ""
+    if not door_one(p, ev, want, unlocked) then return end
     if is_host() then
-        door_state[p] = { ev = ev, want = want, unlocked = unlocked }
-        -- the post-hook already told everyone when the host's door moved;
-        -- unlocking alone does not move it
+        -- the sender's word to the other clients, once: the post-hook of the
+        -- host's door moved here says nothing (on_door), and unlocking alone
+        -- does not move it
         to_others(pc, "WDOOR", pack(p), ev, want, unlocked)
     end
 end
 
+-- Join: the open / unlocked locked doors (WDOOR list) and every replicated
+-- door's state variable (WRDOOR list), in messages of at most CHUNK characters.
 local function snapshot_doors(pc)
-    local n = 0
+    local doors, rdoors = {}, {}
     for _, d in ipairs(ue.find_all("BP_LockedDoor_C")) do
         if level_actor(d) then
             local open = locked_door_target(d) == "o"
             local unl = ue.prop(d, "IsLocked?") == false
             if open or unl then
                 local p = path_of(d)
-                if p then
-                    Q.send(pc, "WDOOR", pack(p), "d", open and "o" or "c", unl and "u" or "")
-                    n = n + 1
-                end
+                if p then doors[#doors + 1] = pack(p) .. "!" .. (open and "o" or "c") .. (unl and "u" or "") end
             end
         end
     end
@@ -1560,14 +1740,13 @@ local function snapshot_doors(pc)
             if level_actor(d) then
                 local v = ue.prop(d, rd[3])
                 local p = path_of(d)
-                if p and type(v) == "boolean" then
-                    Q.send(pc, "WRDOOR", pack(p), v and "1" or "0")
-                    n = n + 1
-                end
+                if p and type(v) == "boolean" then rdoors[#rdoors + 1] = pack(p) .. "!" .. (v and "1" or "0") end
             end
         end
     end
-    return n
+    send_list(pc, "WDOOR", doors)
+    send_list(pc, "WRDOOR", rdoors)
+    return #doors + #rdoors
 end
 
 -- ---------------------------------------------------------------------------
@@ -1633,12 +1812,30 @@ local function rdoor_check(p, want, second)
     end
 end
 
+-- WRDOOR|door|1/0 (the settled state of one door) or WRDOOR|door!1;door!0;...
+-- (the join snapshot): compared here a moment later (one delay per message).
 local function rdoor_msg(f)
     if S.role ~= "client" or not on("world_doors") then return end
-    local p = unpack_path(f[1])
-    local want = f[2] == "1"
-    if not find(p) then later("rdoor", p, want) return end
-    ue.delay("world-rdoor1", RDOOR_CHECK_MS, function() rdoor_check(p, want, false) end)
+    local list = {}
+    if f[2] == nil then
+        for _, e in ipairs(split(f[1], ";")) do
+            local p, v = e:match("^([^!]+)!([01])$")
+            if p then list[#list + 1] = { unpack_path(p), v == "1" } end
+        end
+    else
+        list[1] = { unpack_path(f[1]), f[2] == "1" }
+    end
+    local now = {}
+    for _, e in ipairs(list) do
+        if find(e[1]) then now[#now + 1] = e else later("rdoor", e[1], e[2]) end
+    end
+    if #now == 0 then return end
+    ue.delay("world-rdoor1", RDOOR_CHECK_MS, function()
+        for _, e in ipairs(now) do
+            local ok, err = pcall(rdoor_check, e[1], e[2], false)
+            if not ok then log.err_throttled("world.rdoor", "world: door check: %s", tostring(err)) end
+        end
+    end)
 end
 
 -- ===========================================================================
@@ -1698,6 +1895,10 @@ end
 --   * Join: the host's objects that differ from the level's start.
 --   * The host's save: those states go to <slot>_SDCoop_World.txt next to the
 --     slot on every save of the game and come back when the world is loaded.
+--   * The list follows the game's level (sdc_puzzlelist): made in the world,
+--     dropped in the host's main menu, made again after the game's load; the
+--     level's start states are kept per path; an empty list never saved over
+--     the slot's file.
 
 PW.PATHS = {
     pgen = "/Game/Blueprints/Other/Power/BP_PowerGenerator.BP_PowerGenerator_C",
@@ -1726,9 +1927,9 @@ PW.PATHS = {
 -- FindAllOf per class (BP_LaboratoryMaster_C: every laboratory class at once)
 PW.FIND = { "BP_LaboratoryMaster_C", "BP_PowerGenerator_C", "BP_Lever_C", "BP_BunkerScanner_C",
     "BP_DoubleBunkerDoor_C", "BP_LargeBunkerEntrance_C", "BP_Siren_C", "BP_Radio_C" }
-PW.NOTE_MSG = "Message_6_EED8ECA340EFC5752E4CA6B7B32FABBE"   -- S_NotificationDetails.Message
 PW.FILE_TAG = "_SDCoop_World.txt"
 PW.dir = nil   -- tests: the folder of the state files (else the game's SaveGames)
+PW.list = require("sdc_puzzlelist")
 
 function PW.b01(v) return v == true and "1" or "0" end
 
@@ -1988,6 +2189,9 @@ PW.kind_def("siren", 13, {
         local on_ = want == "1"
         if (ue.prop(o, "Playing") == true) ~= on_ then PW.call(o, on_ and "ActivateSiren" or "DeactivateSiren") end
     end,
+    -- not saved, not restored (sdc_puzzlelist): its own random start plays
+    -- 138 s; ActivateSiren at a load would play until a player stops it
+    no_save = true,
 })
 -- radio: playing (its volume: OnExecuteInteract @514-659 sets 0.5 / 0)
 PW.kind_def("radio", 14, {
@@ -2042,7 +2246,8 @@ function PW.build_step()
 end
 
 function PW.obj(e)
-    if ue.valid(e.o) then return e.o end
+    -- (its path too: a gone level's object memory can hold another live object)
+    if ue.valid(e.o) and raw_path(e.o) == e.p then return e.o end
     e.o = find(e.p)
     return e.o
 end
@@ -2086,12 +2291,13 @@ function PW.mark_dirty()
 end
 
 function PW.host_tick(now)
+    if PW.list.host_tick(PW, now, S) then return end
     if not PW.world_at then PW.world_at = now end
     if not PW.objs then
         if now - PW.world_at < 5 or not PW.build_step() then return end
         for _, e in ipairs(PW.objs) do
             local s = PW.state_of(e)
-            PW.base[e.p], PW.sent[e.p] = s, s
+            PW.base[e.p], PW.sent[e.p] = PW.list.start_of(e.p, s), s
         end
         log.info("world: %d puzzle / power object(s) tracked (generators, levers, circuit boxes, switches, lights, laboratory and bunker doors, scanners, sirens, radios)",
             #PW.objs)
@@ -2190,7 +2396,7 @@ end
 
 function PW.save(why)
     PW.save_pending = false
-    if not is_host() or not PW.objs or not on("world_doors") then return end
+    if not is_host() or not PW.objs or not on("world_doors") or not PW.list.may_save(PW) then return end
     local slot = ue.ems_current_slot()
     local f = PW.file_of(slot)
     if not f then
@@ -2200,7 +2406,7 @@ function PW.save(why)
     local lines, n = { "# SDCoop: puzzle / power states of slot " .. slot .. " that differ from the level's start" }, 0
     for _, e in ipairs(PW.objs) do
         local s = PW.state_of(e)
-        if s and PW.base[e.p] ~= nil and s ~= PW.base[e.p] then
+        if s and PW.base[e.p] ~= nil and s ~= PW.base[e.p] and not PW.K[e.k].no_save then
             lines[#lines + 1] = pack(e.p) .. "=" .. s
             n = n + 1
         end
@@ -2216,36 +2422,10 @@ function PW.save(why)
         ok and "" or (": rename FAILED " .. tostring(err)))
 end
 
--- Host, once per world after the start states were read.
+-- Host, once per world after the start states were read: every listed object
+-- to the save's state, else to the level's start (sdc_puzzlelist.restore).
 function PW.restore()
-    PW.restored = true
-    local slot = ue.ems_current_slot()
-    local f = PW.file_of(slot)
-    local h = f and io.open(f, "rb")
-    if not h then return end
-    local data = h:read("a")
-    h:close()
-    local list, miss = {}, 0
-    for line in tostring(data):gmatch("[^\r\n]+") do
-        local pk, s = line:match("^([^#=][^=]*)=(.+)$")
-        if pk then
-            local e = PW.idx[unpack_path(pk)]
-            if e then list[#list + 1] = { e = e, s = s } else miss = miss + 1 end
-        end
-    end
-    table.sort(list, function(a, b) return PW.K[a.e.k].order < PW.K[b.e.k].order end)
-    local n = 0
-    for _, it in ipairs(list) do
-        local o = PW.obj(it.e)
-        if o and PW.state_of(it.e) ~= it.s then
-            local ok, err = pcall(PW.K[it.e.k].set, o, it.s, nil)
-            if ok then n = n + 1 else log.warn("world: restore %s: %s", ue.short(o), tostring(err)) end
-        end
-    end
-    M.stats.pw_restored = n
-    log.info("world: %d puzzle / power state(s) restored from the save of slot %s (%d in the file, %d unknown here)",
-        n, tostring(slot), #list + miss, miss)
-    PW.mark_dirty()
+    PW.list.restore(PW, unpack_path, M.stats)
 end
 
 -- BP_PlayerController.SaveGameToSlot (post): every save of the game. The
@@ -2344,21 +2524,16 @@ function PW.client_tick(now)
 end
 
 -- The newest notification with this text goes (the game's note of a check
--- this machine cannot make; the host answers instead). Notes are appended
--- (NotificationParentWidget @740 AddChildToVerticalBox).
+-- this machine cannot make; the host answers instead): sdc_notes.take_off.
 function PW.unnote(text)
-    local pc = ue.local_pc()
-    local hud = pc and ue.try(function() return pc:GetHUD() end)
-    local vb = ue.prop(ue.prop(hud, "NotificationUI"), "VerticalBox_31")
-    if not ue.valid(vb) then return false end
-    local n = tonumber(ue.try(function() return vb:GetChildrenCount() end)) or 0
-    for i = n - 1, math.max(0, n - 6), -1 do
-        local w = ue.try(function() return vb:GetChildAt(i) end)
-        local det = ue.prop(w, "NotificationDetailsStruct")
-        local msg = det and ue.try(function() return ue.str(det[PW.NOTE_MSG]) end)
-        if msg == text then return (pcall(function() w:RemoveFromParent() end)) end
+    local n = PW.notes()
+    if not n then
+        local ok, m = pcall(require, "sdc_notes")
+        n = ok and type(m) == "table" and m or nil
     end
-    return false
+    if not (n and n.take_off) then return false end
+    local ok, r = pcall(n.take_off, text)
+    return ok and r == true
 end
 
 -- The game's own note (GameFunctionLibrary.CreateNotificationUI).
@@ -2409,8 +2584,10 @@ end
 -- <class>.OnExecuteInteract(InteractingActor, Option) (post), also the
 -- circuit box's Damage_Object: this machine's player used it.
 function PW.on_exec(c, _, opt_p)
-    if not on("world_doors") then return end
     local o = c and c:get()
+    -- every press of a siren here: its flip-flop noted, whatever the settings
+    if ue.valid(o) and ue.class_name(o) == "BP_Siren_C" then PW.siren_pressed(o) end
+    if not on("world_doors") then return end
     if not level_actor(o) then return end
     local p = path_of(o)
     if not p then return end
@@ -2573,7 +2750,7 @@ function PW.xp_msg(f)
     -- a keycard door whose own check here passed (all-access) gave it already
     local mult, with_note = tonumber(f[2]) or 400, f[3] ~= "0"
     if f[2] and d and ue.prop(d, "XPGiven?") == true then return end
-    if d and ue.prop(d, "XPGiven?") ~= nil then ue.set_prop(d, "XPGiven?", true) end
+    if d and ue.has_prop(d, "XPGiven?") then ue.set_prop(d, "XPGiven?", true) end
     if f[2] and with_note and d and PW.is_card_door(d) then
         -- its own copy's check (@3077, hangar @3409) could not see the card the host took
         PW.unnote("No Keycard Available")
@@ -2592,13 +2769,72 @@ function PW.xp_msg(f)
     log.info("world: XP for %s: %d", d and ue.short(d) or "?", given)
 end
 
+-- A siren's press is a flip-flop of its own on each machine (BP_Siren @675
+-- Temp_bool = not Temp_bool; @463 true -> ActivateSiren, false -> Event_Siren
+-- + DeactivateSiren) that nothing else turns: after a change this machine's
+-- press did not make (another player's press applied here, the host's random
+-- timer, its 138 s end) the next press repeated the state (Activate on a
+-- playing siren) and did nothing - a client's first press after the host had
+-- switched it on (world.md 1.17). Right after any press the flip-flop equals
+-- Playing (the press ends in ActivateSiren / DeactivateSiren, both set
+-- Playing synchronously), so this machine notes Playing after each of its
+-- presses (PW.on_exec; a new actor starts at false). After a change that
+-- leaves the noted flip-flop out of step with Playing, one press of this
+-- module's own puts it back in step without changing anything (no player: no
+-- montage; Activate on a playing / Deactivate on a silent siren does
+-- nothing), so a player's next press toggles it. Should that press switch
+-- the siren after all (a press this machine did not see: before its hooks),
+-- a second one switches it back, and the flip-flop is in step either way.
+-- [path] = { a = actor address, v = flip-flop }. Forgotten with the world
+-- (PW.reset "world:..."): a reloaded level's siren starts at false and may
+-- get the old one's address; kept over a role change (the same actors).
+PW.flip = {}
+
+function PW.siren_flip(o, p)
+    local a = addr(o)
+    local f = PW.flip[p]
+    if not f or f.a ~= a then
+        f = { a = a, v = false }
+        PW.flip[p] = f
+    end
+    return f
+end
+
+-- OnExecuteInteract (post): the flip-flop is where Playing is now.
+function PW.siren_pressed(o)
+    local p = path_of(o)
+    if not p then return end
+    PW.siren_flip(o, p).v = ue.prop(o, "Playing") == true
+end
+
+-- After a change of that siren (any machine): its flip-flop back in step.
+function PW.siren_align(p)
+    if not on("world_doors") then return end
+    local s = find(p)
+    if not s then return end
+    local f = PW.siren_flip(s, p)
+    local playing = ue.prop(s, "Playing") == true
+    if f.v == playing then return end
+    local was = PW.pressed[p]
+    PW.call(s, "OnExecuteInteract", nil, PW.option1())
+    local twice = (ue.prop(s, "Playing") == true) ~= playing
+    if twice then PW.call(s, "OnExecuteInteract", nil, PW.option1()) end
+    PW.pressed[p] = was   -- (no player's press: the client's checks go on)
+    M.stats.siren_aligned = M.stats.siren_aligned + 1
+    log.debug("world: %s's press here back in step with its state (%s%s): the next press switches it %s", ue.short(s),
+        playing and "on" or "off", twice and "; its flip-flop was elsewhere, two presses" or "", playing and "off" or "on")
+end
+
 -- BP_Siren.ActivateSiren / DeactivateSiren (post). Host: its random timer or
 -- a press: a change to send. Client: its own random timer (one per machine,
 -- @190) or its 138 s end: back to the host's state (a press is sent instead).
+-- Both: the press's flip-flop in step afterwards (PW.siren_align).
 function PW.on_siren(c)
     if not on("world_doors") then return end
     local o = c and c:get()
     if not level_actor(o) then return end
+    local p0 = path_of(o)
+    if p0 then ue.delay("world-siren-align", 300, function() PW.siren_align(p0) end) end
     if is_host() then PW.mark_dirty() return end
     if S.role ~= "client" or applying > 0 then return end
     local p = path_of(o)
@@ -2621,11 +2857,12 @@ function PW.on_scan(c, actor_p)
     LK.on_scan(c, actor_p)
 end
 
-function PW.reset()
+function PW.reset(why)
     PW.objs, PW.idx, PW.todo, PW.found = nil, {}, nil, nil
     PW.base, PW.sent, PW.world_at, PW.dirty, PW.cursor, PW.idle_at = {}, {}, nil, {}, 1, 0
     PW.want, PW.checks, PW.pressed, PW.restored, PW.save_pending, PW.resync = {}, {}, {}, false, false, {}
     PW.xp_timer = nil
+    if tostring(why):sub(1, 6) == "world:" then PW.flip = {} end
 end
 
 -- ===========================================================================
@@ -3042,6 +3279,12 @@ end
 -- Material); Mesh and Material do not replicate, UserConstructionScript gave
 -- the client's copy no mesh at all. Returns true, mesh | nil (try later) |
 -- false, why.
+-- A rock: BP_HarvestableObject_Rocks makes its root and mesh component
+-- Static (Mobility override; a tree's construction script sets its root
+-- Movable), and the engine refuses SetStaticMesh on a registered Static
+-- component once play has begun. The host's rock stayed without a mesh here:
+-- gone at the first hit (the swing removed the foliage instance), no
+-- collision, the client could not hit it again. Movable first, as the tree.
 function HV.dress(a, r)
     local ism = find(r.ip)
     if not ism then return nil, "foliage component not loaded here" end
@@ -3050,8 +3293,21 @@ function HV.dress(a, r)
     local sm = ue.prop(a, "StaticMesh")
     if not ue.valid(sm) then return false, "no mesh component" end
     ue.set_prop(a, "Mesh", mesh)
+    local rock = harvest_kind_of(a) == "r"
+    if rock then
+        pcall(function() a:K2_GetRootComponent():SetMobility(2) end)   -- 2 = Movable (children follow)
+        pcall(function() sm:SetMobility(2) end)
+    end
     local ok, err = pcall(function() sm:SetStaticMesh(mesh) end)
     if not ok then return false, "SetStaticMesh: " .. tostring(err) end
+    if rock then
+        local held = ue.prop(sm, "StaticMesh")
+        if not ue.valid(held) or ue.path(held) ~= ue.path(mesh) then
+            return false, string.format("its mesh component did not take %s (mobility %s)", ue.short(mesh),
+                tostring(ue.prop(sm, "Mobility")))
+        end
+        return true, ue.short(mesh) .. ", made movable"
+    end
     if harvest_kind_of(a) == "t" then
         local okm, mat = pcall(function() return ism:GetMaterial(0) end)
         if okm and ue.valid(mat) then
@@ -3098,7 +3354,9 @@ function HV.dress_pass(now)
                         M.stats.dressed = M.stats.dressed + 1
                         local line = string.format("world: the host's %s %s at %s shown here (mesh %s)",
                             e.kind == "r" and "rock" or "tree", ue.short(a), loc_str(l), tostring(what))
-                        if M.stats.dressed <= 5 then log.info("%s", line) else log.debug("%s", line) end
+                        local first_rock = e.kind == "r" and not HV.rock_shown
+                        if first_rock then HV.rock_shown = true end
+                        if M.stats.dressed <= 5 or first_rock then log.info("%s", line) else log.debug("%s", line) end
                     else
                         open = open + 1
                         if ok == false and not e.warned then
@@ -3121,14 +3379,509 @@ function HV.dress_pass(now)
     end
 end
 
--- BP_JigComponent.JigTryAddItemSomewhere (post), client: the amount single
--- player code just rolled here (a scrap pile's salvage, @866-1094: 12-20, x2
--- with this player's Harvest Master), sent with WSALV.
-function HV.on_try_add(_, _, item_p, count_p)
-    if not S or S.role ~= "client" then return end
+-- ---------------------------------------------------------------------------
+-- A world resource into a client's inventory where ITS screen puts it
+-- ---------------------------------------------------------------------------
+-- The host's add for a remote player (on_player_drop, salvage's grant: the
+-- plugin's AddNewItemSomewhere) walks the server data of that inventory -
+-- every grid, also those of items inside items - and checks only the item
+-- settings of the grid's owner, never what the grid's WIDGET takes. A med
+-- bag in a backpack pocket lists no item types (= any), so a rock went into
+-- it (0.10.0); the client's widget of that grid (SC_MedicalBag: medical items)
+-- refused the plugin's CLIENT_AddNewItem (HandleAddNewItem: its
+-- AddNewInventoryItem false -> nothing), and the next rocks were counted onto
+-- that unseen stack (CLIENT_UpdateCounts found no slot). The stones were gone
+-- for that player. The game's own client-chosen adds (pickup, craft: the
+-- client's widgets pick grid / slot / stack, the server adds there) are the
+-- model: the client's own copy of the rock / tree / scrap pile runs the same
+-- grant on that machine first (its hit comes before the host's), and its
+-- JigTryAddGetPendingRef reserves the slot its widgets take, names the stack
+-- it would grow, or finds no room. The client sends that (WSPOT, ahead of the
+-- hit that fells it: same ordered channel, NOW class like WHHIT) and the
+-- host's add uses it:
+--   stack  ServerUpdateCountByUID(uid, count) (the game's server count
+--          change: two parameters, OldCount is its local) and the plugin's
+--          CLIENT_UpdateCount to the owner; that stack full: a new stack in
+--          its grid
+--   grid   Generate_AddNewItemToContainer(grid, item, count) (the plugin's add
+--          into one grid, first free slot) and CLIENT_AddNewItem with the new
+--          item as the server has it (as sdc_consume's RESEND)
+--   none   no room on that screen: the game's drop at the player's feet stays
+--          (its "... dropped on ground" is true then), as in single player
+-- The words of a player queue per item (first in, first used: two rocks one
+-- swing broke). A grant with no word yet does not guess: the host's replay
+-- of the client's swing can fell the object before that client's own hit
+-- arrives, and a tree grants 0.2 s after its fall on both machines, so the
+-- word often comes a moment AFTER the host's grant (11-11 trees: 8 of 10 by
+-- 7-52 ms). The game's drop waits for it (HV.pend, SPOT_WAIT); the word
+-- settles it (HV.settle) the moment it comes. No word in time, an old one
+-- (SPOT_S) or one the server data cannot take (that grid full here, the stack
+-- gone): that screen is asked now (HV.ask_screen, sdc_place: the drop waits
+-- at the feet for the answer). An add that went (or goes) into the
+-- inventory also sets the game's own answer right: its JigTryAddItemSomewhere
+-- gives Added? = true, not the drop branch's false, so the object's note
+-- reads "Rocks added to inventory" (sdc_notes relays it).
+-- Values only (uid strings, paths): no object kept beyond the call.
+HV.F = {
+    ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B",
+    REP = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332",
+    INC = "InContainerUID_24_D1504ED7438699C73EA046AD734E79BF",
+    USID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68",
+    INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7",
+    SLOT = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD",
+    PENDING = "Pending?_31_C3AE39044666796C0FA128BA521590CB",
+}
+HV.ZERO = { A = 0, B = 0, C = 0, D = 0 }
+HV.cnt = { sent = 0, heard = 0, stack = 0, slot = 0, none = 0, miss = 0, wait = 0, late = 0 }
+
+function HV.gs(g) return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D) end
+
+function HV.gt(s)
+    local a, b, c, d = tostring(s or ""):match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
+    if not a then return nil end
+    return { A = math.tointeger(tonumber(a)), B = math.tointeger(tonumber(b)), C = math.tointeger(tonumber(c)),
+             D = math.tointeger(tonumber(d)) }
+end
+
+function HV.say(line, warn)
+    HV.spot_logged = HV.spot_logged + 1
+    if warn then log.warn("%s", line)
+    elseif HV.spot_logged <= 30 then log.info("%s", line)
+    else log.debug("%s", line) end
+end
+
+-- Host: a player's server data (MainJigContainers): its items { item = the
+-- live struct (this call only), uid, grid, slot, n, name } and its grids
+-- { uid, owner = uid of the item the grid belongs to }; ok = false: unread.
+function HV.walk(comp)
+    local items, grids = {}, {}
+    local F = HV.F
+    local ok = pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            local cont = c:get()
+            local g = { uid = HV.gs(cont[F.REP]), owner = ue.try(HV.gs, cont[F.INC]) }
+            grids[#grids + 1] = g
+            cont[F.ITEMS]:ForEach(function(_, e)
+                local item = e:get()
+                local info = item[F.INFO]
+                items[#items + 1] = { item = item, uid = HV.gs(item[F.USID]), grid = g.uid, slot = item[F.SLOT],
+                                      n = math.floor(num(info[F_COUNT], 0)), name = ue.short(info[F_ITEMID]) }
+            end)
+        end)
+    end)
+    return items, grids, ok
+end
+
+-- Host: "grid <uid> in <the item it belongs to>" for log lines.
+function HV.grid_desc(comp, u)
+    if not u then return "?" end
+    if u == "0:0:0:0" then return "a stack it had" end
+    local items, grids = HV.walk(comp)
+    for _, g in ipairs(grids) do
+        if g.uid == u then
+            if not g.owner or g.owner == "0:0:0:0" then return "grid " .. u .. " (a top grid)" end
+            for _, it in ipairs(items) do
+                if it.uid == g.owner then return string.format("grid %s in %s", u, it.name) end
+            end
+            return string.format("grid %s in item %s", u, g.owner)
+        end
+    end
+    return "grid " .. u .. " (not in its inventory)"
+end
+
+-- Host: n of `da` for the character of remote player `pc` (its component
+-- `comp`) where that player's screen put it. Returns "stack" | "slot", what
+-- (added, the client told) | "none", what (no room on its screen: the
+-- caller leaves the drop) | nil, what (no usable word: the caller's add).
+function HV.place(pc, comp, da, n)
+    local name = ue.short(da)
+    if not HV.SPOT_ITEMS[name] then return nil, nil end
+    -- its oldest word still young enough (older ones go)
+    local hs = HV.spots[addr(pc) or -1]
+    local list = hs and hs[name]
+    local h, old
+    while list and list[1] and not h do
+        local x = table.remove(list, 1)
+        if clock() - x.t <= HV.SPOT_S then h = x else old = x end
+    end
+    if hs and list and not list[1] then hs[name] = nil end
+    if not h then
+        HV.cnt.miss = HV.cnt.miss + 1
+        if old then return nil, string.format("its screen's word is %.0f s old", clock() - old.t) end
+        return nil, "no word from its screen"
+    end
+    if h.kind == "n" then
+        HV.cnt.none = HV.cnt.none + 1
+        return "none", "its screen has no room for it (the game's drop stays, as in single player)"
+    end
+    local items, _, read = HV.walk(comp)
+    if not read then
+        HV.cnt.miss = HV.cnt.miss + 1
+        return nil, "its inventory here could not be read"
+    end
+    local grid = h.cont
+    if h.kind == "s" then
+        local st
+        for _, it in ipairs(items) do if it.uid == h.uid then st = it break end end
+        if not st or st.name ~= name then
+            HV.cnt.miss = HV.cnt.miss + 1
+            return nil, string.format("the stack its screen chose (%s) is not in its inventory here", h.uid)
+        end
+        local want = st.n + n
+        if want <= math.floor(num(ue.prop(da, "MaxStack"), 0)) then
+            local g = HV.gt(h.uid)
+            -- (ItemUID, NewCount: UE4SS refuses any other number of arguments)
+            local oku, erru = pcall(function() comp:ServerUpdateCountByUID(g, want) end)
+            local now_n
+            local after, _, read2 = HV.walk(comp)
+            for _, it in ipairs(after) do if it.uid == h.uid then now_n = it.n break end end
+            if not read2 and oku then now_n = want end   -- (unread: taken as done - never a second add)
+            if now_n and now_n ~= st.n then
+                local ok, err = pcall(function() comp:CLIENT_UpdateCount(comp, g, now_n, HV.ZERO) end)
+                HV.cnt.stack = HV.cnt.stack + 1
+                return "stack", string.format("onto its stack %s in %s (%d -> %d)%s", h.uid, HV.grid_desc(comp, st.grid),
+                    st.n, now_n, ok and ", the client was told (CLIENT_UpdateCount)" or (", telling the client FAILED: " .. tostring(err)))
+            end
+            if not oku then
+                HV.say(string.format("world: counting %s's stack %s up to %d FAILED (%s): a new stack in its grid",
+                    ue.short(pc), h.uid, want, tostring(erru)), true)
+            end
+        end
+        grid = st.grid   -- that stack is full: a new one in its grid
+    end
+    local g = HV.gt(grid)
+    if not g then
+        HV.cnt.miss = HV.cnt.miss + 1
+        return nil, "no grid in its word"
+    end
+    local before = {}
+    for _, it in ipairs(items) do before[it.uid] = true end
+    local res = {}
+    local ok, err = pcall(function() comp:Generate_AddNewItemToContainer(g, da, n, {}, res) end)
+    local new
+    for _, it in ipairs(HV.walk(comp)) do
+        if not before[it.uid] and it.grid == grid and it.name == name then new = it break end
+    end
+    if not new then
+        if res["Added?"] == true then
+            -- added, but not found to tell the client: no second add
+            HV.cnt.slot = HV.cnt.slot + 1
+            return "slot", string.format("added to %s, but the new stack was not found here: the client was NOT told",
+                HV.grid_desc(comp, grid))
+        end
+        HV.cnt.miss = HV.cnt.miss + 1
+        return nil, string.format("%s has no room for it here (%s)", HV.grid_desc(comp, grid),
+            ok and ("added=" .. tostring(res["Added?"])) or ("add FAILED: " .. tostring(err)))
+    end
+    local okc, errc = pcall(function() comp:CLIENT_AddNewItem(new.item, {}, comp, HV.ZERO) end)
+    HV.cnt.slot = HV.cnt.slot + 1
+    return "slot", string.format("new stack %s x%d in %s slot %s%s", new.uid, new.n, HV.grid_desc(comp, grid),
+        tostring(new.slot), okc and ", the client was told (CLIENT_AddNewItem)" or (", telling the client FAILED: " .. tostring(errc)))
+end
+
+-- WSPOT|item|c|grid uid  |  WSPOT|item|s|stack uid  |  WSPOT|item|n   (client -> host)
+function HV.spot_msg(f, pc)
+    if not is_host() then return end
+    local name, kind = f[1], f[2]
+    if not HV.SPOT_ITEMS[name] then return end
+    local now = clock()
+    local h = { kind = kind, t = now }
+    if kind == "c" then
+        h.cont = HV.gt(f[3]) and f[3]
+        if not h.cont then return end
+    elseif kind == "s" then
+        h.uid = HV.gt(f[3]) and f[3]
+        if not h.uid then return end
+    elseif kind ~= "n" then
+        return
+    end
+    for k, hs in pairs(HV.spots) do   -- (words nobody used: players who left, the host's swings)
+        for nm, list in pairs(hs) do
+            local keep = {}
+            for _, x in ipairs(list) do if now - x.t <= HV.SPOT_S then keep[#keep + 1] = x end end
+            hs[nm] = keep[1] and keep or nil
+        end
+        if next(hs) == nil then HV.spots[k] = nil end
+    end
+    local k = addr(pc) or -1
+    HV.spots[k] = HV.spots[k] or {}
+    local list = HV.spots[k][name] or {}
+    HV.spots[k][name] = list
+    list[#list + 1] = h
+    if #list > HV.SPOT_MAX then table.remove(list, 1) end
+    HV.cnt.heard = HV.cnt.heard + 1
+    log.debug("world: %s's screen puts %s: %s", ue.short(pc), name,
+        kind == "c" and ("grid " .. h.cont) or kind == "s" and ("onto stack " .. h.uid) or "nowhere (no room)")
+    -- the host's grant came first and waits for this word: now
+    for i, p in ipairs(HV.pend) do
+        if p.k == k and p.name == name then
+            table.remove(HV.pend, i)
+            HV.cnt.late = HV.cnt.late + 1
+            HV.settle(p, true)
+            break
+        end
+    end
+end
+
+-- Host: a young word of remote player `pc` for item `name` is there.
+function HV.has_word(pc, name)
+    local hs = HV.spots[addr(pc) or -1]
+    local now = clock()
+    for _, h in ipairs(hs and hs[name] or {}) do
+        if now - h.t <= HV.SPOT_S then return true end
+    end
+    return false
+end
+
+-- Host: a grant that waited for its player's word (HV.pend): the word came
+-- (word = true) or did not in time (that screen is asked now: HV.ask_screen).
+-- Outside the game's call: the module's grant counters stay as they are
+-- (sdc_consume compares them per call of the game's add); the drop goes once
+-- the item is in. Its drop gone meanwhile (picked up - destroyed, which
+-- UE4SS's IsValid does not tell: HV.pickup_live): nothing added; the character dead:
+-- the drop stays.
+function HV.settle(p, word)
+    local pawn, drop = find(p.pawn), find(p.drop)
+    local who = pawn and ue.short(pawn) or p.who
+    local when = word and string.format("its word came %.2f s after the grant", clock() - p.t)
+        or string.format("no word from its screen within %.1f s", HV.SPOT_WAIT)
+    if not HV.pickup_live(drop) then
+        HV.say(string.format("world: %s x%d for %s: its drop was picked up meanwhile, nothing added (%s)", p.name, p.n,
+            who, when))
+        return
+    end
+    local da = find(p.da)
+    local comp = pawn and ue.prop(pawn, "BP_JigMultiplayer")
+    local pc = HV.pc_of(p.k)
+    if not ue.valid(da) or not ue.valid(comp) or not pc or ctx.is_dead_player(pawn) then
+        log.info("world: %s x%d for %s stays on the ground at its feet (the player or its inventory is gone, or it is dead)",
+            p.name, p.n, who)
+        return
+    end
+    local how, what = HV.place(pc, comp, da, p.n)
+    if how == "none" then
+        log.info("world: %s x%d for %s stays on the ground at its feet: %s; %s", p.name, p.n, who, what, when)
+        return
+    end
+    if not how then
+        if what == "no word from its screen" then what = when end
+        HV.ask_screen(pawn, da, p.n, p.drop, what)
+        return
+    end
+    pcall(function() drop:K2_DestroyActor() end)
+    log.info("world: %s x%d for %s went to its inventory where its screen put it (%s): %s", p.name, p.n, who, when, what)
+end
+
+-- Host: n of `da` for remote player `pawn` lies at its feet as pickup
+-- `drop_path` and no word of its screen can place it: that screen is asked
+-- where it goes (sdc_place.ask: WHERE; the answer puts it there and only
+-- then removes the pickup; no room / no answer: it stays at the feet). Never
+-- the plugin's AddNewItemSomewhere, which picks any grid of the data - a
+-- wallet, a med bag - whose window refuses it. true when asked.
+function HV.ask_screen(pawn, da, n, drop_path, why)
+    local pl = package.loaded["sdc_place"]
+    local ok, asked = false, false
+    if type(pl) == "table" and type(pl.ask) == "function" and drop_path then
+        ok, asked = pcall(pl.ask, pawn, da, n, drop_path, why)
+    end
+    if ok and asked == true then
+        HV.say(string.format("world: %s x%d for %s lies at its feet (%s): its screen is asked where it goes", ue.short(da),
+            n, ue.short(pawn), tostring(why)))
+        return true
+    end
+    log.info("world: %s x%d for %s stays on the ground at its feet (%s; its screen could not be asked%s)", ue.short(da), n,
+        ue.short(pawn), tostring(why), ok and "" or (": " .. tostring(asked)))
+    return false
+end
+
+-- Host: a pickup still in the world - not destroyed: UE4SS's IsValid stays
+-- true for a destroyed actor until the garbage collector (sdc_place.live asks
+-- the engine).
+function HV.pickup_live(a)
+    if not a then return false end
+    local pl = package.loaded["sdc_place"]
+    if type(pl) == "table" and type(pl.live) == "function" then
+        local ok, v = pcall(pl.live, a)
+        if ok then return v == true end
+    end
+    return ue.valid(a)
+end
+
+-- Host: inside a drop of sdc_place / sdc_consume (a hidden item to the feet,
+-- IGLOST, a gain's drop): a real pickup with its contents, no fresh resource
+-- of a grant (on_player_drop leaves it alone).
+function HV.foreign_drop()
+    local pl = package.loaded["sdc_place"]
+    return type(pl) == "table" and pl.dropping == true
+end
+
+-- Host, each tick: grants whose word did not come in time.
+function HV.pend_pass(now)
+    if #HV.pend == 0 then return end
+    local keep, due = {}, {}
+    for _, p in ipairs(HV.pend) do
+        if now - p.t >= HV.SPOT_WAIT then due[#due + 1] = p else keep[#keep + 1] = p end
+    end
+    HV.pend = keep
+    for _, p in ipairs(due) do HV.settle(p, false) end
+end
+
+-- Host: n of `da` dropped at `pawn`'s feet, as the game's no-room branch drops
+-- it (JigMP_OnRequestDropItem, then SetPickupCount: the plugin's own drop, as
+-- sdc_stations); true and the pickup when it is there. Not a game drop for
+-- on_player_drop.
+function HV.drop_at(pawn, da, n)
+    local out = {}
+    HV.own_drop = true
+    local ok = pcall(function()
+        pawn:JigMP_OnRequestDropItem({ [F_ITEMID] = da, [F_COUNT] = n, [HV.F.PENDING] = -1 }, FName("None"), out)
+    end)
+    HV.own_drop = false
+    local a = out.ActorRef
+    if not ok or not ue.valid(a) then return false end
+    pcall(function() a:SetPickupCount(n, {}) end)
+    return true, a
+end
+
+-- BP_JigComponent.JigTryAddGetPendingRef(Info, CheckStacking, out OutputPin,
+-- out Stack?), post, client: where this screen puts a world resource the
+-- game adds here (the slot it reserved, the stack it would grow, or no room).
+-- Read now as values; HV.on_try_add sends it.
+function HV.on_pending_ref(_, info_p, _, out_p, stack_p)
+    if not S or S.role ~= "client" or not on("world_harvest") then return end
+    local info = get(info_p)
+    local da = info and ue.try(function() return info[F_ITEMID] end)
+    local name = ue.valid(da) and ue.short(da) or nil
+    if not name or not HV.SPOT_ITEMS[name] then return end
+    HV.spot = nil
+    local s = { name = name, t = clock(), kind = "n", where = "nowhere (no room)" }
+    local slot = obj(out_p)
+    if slot then
+        local cont = ue.prop(slot, "ContainerMother")
+        local cname = ue.str(ue.prop(cont, "ContainerName"))
+        if cname == "" then cname = ue.short(cont) end
+        if get(stack_p) == true then
+            s.kind, s.uid = "s", ue.try(HV.gs, ue.prop(slot, "ItemUniqueID"))
+            s.where = string.format("onto its stack in %s slot %s", cname, tostring(ue.prop(slot, "SlotIndex")))
+        else
+            s.kind, s.cont = "c", ue.try(HV.gs, ue.prop(cont, "ContainerID"))
+            s.where = string.format("in %s slot %s", cname, tostring(ue.prop(slot, "SlotIndex")))
+        end
+        if not s.uid and not s.cont then return end
+    end
+    HV.spot = s
+end
+
+-- BP_JigComponent.JigTryAddItemSomewhere(LocalComp, ItemID, Count, out
+-- Added?, out UID), post.
+-- Client: the amount single player code just rolled here (a scrap pile's
+-- salvage, @866-1094: 12-20, x2 with this player's Harvest Master), sent with
+-- WSALV; a world resource added to the own inventory: where this screen put
+-- it, to the host (WSPOT).
+-- Host: on_player_drop put this add for a remote player into its inventory
+-- (inside this call): Added? = true, the game's own answer for an add.
+function HV.on_try_add(c, _, item_p, count_p, added_p)
+    if not S then return end
     local da = obj(item_p)
     if not da then return end
-    HV.last_add = { name = ue.short(da), n = math.floor(num(get(count_p), 0)), t = clock() }
+    local name = ue.short(da)
+    if S.role == "host" then
+        local i = HV.into
+        if not i or i.name ~= name or clock() - i.t > GRANT_WINDOW then return end
+        HV.into = nil
+        local comp = c and c:get()
+        if addr(ue.try(function() return comp:GetOwner() end)) ~= i.k then return end
+        if get(added_p) ~= true then pcall(function() added_p:set(true) end) end
+        return
+    end
+    if S.role ~= "client" then return end
+    local n = math.floor(num(get(count_p), 0))
+    HV.last_add = { name = name, n = n, t = clock() }
+    local s = HV.spot
+    HV.spot = nil
+    if not s or s.name ~= name or clock() - s.t > 0.2 then return end
+    local comp = c and c:get()
+    local owner = ue.try(function() return comp:GetOwner() end)
+    if not is_player_character(owner) or not locally_controlled(owner) then return end
+    local ok
+    if s.kind == "c" then
+        ok = to_host("WSPOT", name, "c", s.cont)
+    elseif s.kind == "s" then
+        ok = to_host("WSPOT", name, "s", s.uid)
+        for u, t in pairs(HV.spot_sent) do if clock() - t > HV.SPOT_S then HV.spot_sent[u] = nil end end
+        HV.spot_sent[s.uid] = clock()
+    else
+        ok = to_host("WSPOT", name, "n")
+    end
+    if not ok then return end
+    HV.cnt.sent = HV.cnt.sent + 1
+    HV.say(string.format("world: %s x%d added here by the game: this screen puts it %s; the host is told (it adds its own count)",
+        name, n, s.where))
+end
+
+-- Client: where this screen shows item `u` ("<grid> slot N, xM"), or nil
+-- (the own inventory's widgets and those inside its items, as
+-- JigTryAddGetPendingRef walks them).
+function HV.shown(comp, u)
+    local found, seen = nil, {}
+    local function scan(w, depth)
+        if found or depth > 4 or not ue.valid(w) then return end
+        local k = addr(w)
+        if not k or seen[k] then return end
+        seen[k] = true
+        pcall(function()
+            ue.prop(w, "ArrayOfItems"):ForEach(function(_, e)
+                if found then return end
+                local slot = e:get()
+                if not ue.valid(slot) then return end
+                if ue.try(HV.gs, ue.prop(slot, "ItemUniqueID")) == u then
+                    local cname = ue.str(ue.prop(w, "ContainerName"))
+                    found = string.format("%s slot %s, x%s", cname ~= "" and cname or ue.short(w),
+                        tostring(ue.prop(slot, "SlotIndex")), tostring(ue.prop(slot, "ItemCount")))
+                    return
+                end
+                local sp = ue.prop(slot, "SpecialContainerRef")
+                if ue.valid(sp) then
+                    pcall(function() ue.prop(sp, "AllContainers"):ForEach(function(_, x) scan(x:get(), depth + 1) end) end)
+                end
+                scan(ue.prop(slot, "SlotContainer"), depth + 1)
+            end)
+        end)
+    end
+    pcall(function() ue.prop(comp, "LocalJSIContainers"):ForEach(function(_, w) scan(w:get(), 0) end) end)
+    return found
+end
+
+-- BP_JigComponent.CLIENT_AddNewItem(ItemInfo, Content, Comp, PendingUID),
+-- post, client: a world resource the host added to this inventory - on this
+-- screen now? (the in-game check of the above)
+function HV.on_client_add(c, info_p, _, comp_p)
+    if not S or S.role ~= "client" then return end
+    local comp = c and c:get()
+    if addr(get(comp_p)) ~= addr(comp) then return end   -- (a world container's item, sdc_containers)
+    local it = get(info_p)
+    local name = it and ue.try(function() return ue.short(it[HV.F.INFO][F_ITEMID]) end)
+    if not name or not HV.SPOT_ITEMS[name] then return end
+    local u = ue.try(function() return HV.gs(it[HV.F.USID]) end)
+    local n = ue.try(function() return it[HV.F.INFO][F_COUNT] end)
+    local shown = u and HV.shown(comp, u)
+    HV.say(string.format("world: the host added %s x%s (uid %s) to this inventory: on this screen %s", name, tostring(n),
+        tostring(u), shown and ("yes (" .. shown .. ")") or "NO"), not shown)
+end
+
+-- BP_JigComponent.CLIENT_UpdateCount(TargetComp, ItemUID, NewCount,
+-- RemovedPending), post, client: the count of a stack this screen chose for a
+-- world resource (WSPOT s).
+function HV.on_client_count(c, _, uid_p, count_p)
+    if not S or S.role ~= "client" or next(HV.spot_sent) == nil then return end
+    local u = ue.try(function() return HV.gs(get(uid_p)) end)
+    local t = u and HV.spot_sent[u]
+    if not t then return end
+    HV.spot_sent[u] = nil
+    if clock() - t > HV.SPOT_S then return end
+    local shown = HV.shown(c and c:get(), u)
+    HV.say(string.format("world: the host counted a world resource onto stack %s: x%s; on this screen %s", u,
+        tostring(get(count_p)), shown and ("yes (" .. shown .. ")") or "NO"), not shown)
 end
 
 -- ---------------------------------------------------------------------------
@@ -3374,7 +4127,7 @@ local function salv_msg(f, pc)
     if pawn and cache.scrap then
         log.info("world: %s salvaged %s: scrap metal x%d (%s)", ue.short(pc), ue.short(s), n,
             rolled and "the client's roll" or "rolled here")
-        grant(pawn, cache.scrap, n)
+        grant(pawn, cache.scrap, n, pc)
     end
     M.stats.salvage = M.stats.salvage + 1
     to_others(pc, "WSALV", pack(p))
@@ -4041,14 +4794,12 @@ function EV.crate_track(a)
     return c
 end
 
--- Host: its mesh's transform to the clients (or one client).
-function EV.crate_send(c, flag, pc)
+-- Host: its mesh's transform to the clients.
+function EV.crate_send(c, flag)
     local loc, rot = EV.crate_tf(c.o)
     if not loc then return false end
-    local r = string.format("%.1f,%.1f,%.1f", rot.Pitch, rot.Yaw, rot.Roll)
-    if pc then Q.send(pc, "WCRATE", c.key, loc_str(loc), r, flag)
-    else to_clients("WCRATE", c.key, loc_str(loc), r, flag) end
-    if not pc then c.sent = loc end
+    to_clients("WCRATE", c.key, loc_str(loc), string.format("%.1f,%.1f,%.1f", rot.Pitch, rot.Yaw, rot.Roll), flag)
+    c.sent = loc
     M.stats.crate_sent = M.stats.crate_sent + 1
     return true, loc
 end
@@ -4094,14 +4845,22 @@ function EV.crate_pass(now)
     end
 end
 
--- Join: every crate (FindAllOf once per join).
+-- Join: every crate (FindAllOf once per join), one list:
+-- WCRATE|root!mesh x,y,z!pitch,yaw,roll!flag;...
 function EV.crate_snapshot(pc)
-    local n = 0
+    local items = {}
     for _, a in ipairs(ue.find_all("Master_AirdropContainer_C")) do
         local c = ue.valid(a) and EV.crate_track(a)
-        if c and EV.crate_send(c, c.st == "fall" and "f" or "s", pc) then n = n + 1 end
+        local loc, rot
+        if c then loc, rot = EV.crate_tf(c.o) end
+        if loc then
+            items[#items + 1] = table.concat({ c.key, loc_str(loc),
+                string.format("%.1f,%.1f,%.1f", rot.Pitch, rot.Yaw, rot.Roll), c.st == "fall" and "f" or "s" }, "!")
+        end
     end
-    return n
+    send_list(pc, "WCRATE", items)
+    M.stats.crate_sent = M.stats.crate_sent + #items
+    return #items
 end
 
 -- Client: the host's copy of a crate, by its root (the drop point), within 1.5 m.
@@ -4143,15 +4902,24 @@ function EV.crate_apply(a, w, why)
     return ok
 end
 
--- WCRATE|root|mesh x,y,z|pitch,yaw,roll|l/s/f   (host -> clients)
-function EV.crate_msg(f)
-    if S.role ~= "client" or not on("world_prefabs") then return end
-    local key, loc = f[1], parse_loc(f[2])
+-- One crate of the host here (or later, when its copy comes).
+function EV.crate_one(key, loc, rot, flag)
     if not key or not loc then return end
-    local w = { loc = loc, rot = MV.parse_rot(f[3]), flag = f[4] or "s" }
+    local w = { loc = loc, rot = MV.parse_rot(rot), flag = flag or "s" }
     EV.ccrates[key] = w
     local a = EV.crate_find(key)
     if a then EV.crate_apply(a, w, nil) else later("crate", key, w, 60) end
+end
+
+-- WCRATE|root|mesh x,y,z|pitch,yaw,roll|l/s/f   (host -> clients), or the
+-- join snapshot's list WCRATE|root!mesh!rot!flag;...
+function EV.crate_msg(f)
+    if S.role ~= "client" or not on("world_prefabs") then return end
+    if f[2] ~= nil then return EV.crate_one(f[1], parse_loc(f[2]), f[3], f[4]) end
+    for _, e in ipairs(split(f[1], ";")) do
+        local key, loc, rot, flag = e:match("^([^!]+)!([^!]+)!([^!]*)!([lsf])$")
+        if key then EV.crate_one(key, parse_loc(loc), rot, flag) end
+    end
 end
 
 -- Client (2 s): a placed copy stays at the host's place.
@@ -4257,14 +5025,21 @@ end
 -- Barrels and infestations: Damage_Object(Damage, Damage Causer, Event Instigator), post.
 -- Client: remembered until the Trace_Impact that caused it ends (a firearm
 -- hit; a melee hit also runs on the host's copy of the swing).
--- Host: who hurt it.
+-- Host: who hurt it: a remote player's controller, false for the host's own
+-- character, nil (unknown) for a causer that is no player's character: not
+-- the host, so a nest's wave goes for the player nearest to it
+-- (IX.wave_target), not for the host. In the game that is a grenadier
+-- zombie's death blast (BP_MasterZombie @3740: PhysicsBody actors within
+-- 6 m, a nest among them -> @4465 Damage_Object(dmg, self, None)). Landmines
+-- (@1035) and explosive barrels look for Characters only and never hit a
+-- nest; player weapons pass the player's character.
 local function on_damage_object(c, dmg_p, causer_p)
     if not on("world_objects") then return end
     local o = c and c:get()
     if not ue.valid(o) then return end
     local causer = obj(causer_p)
     if is_host() then
-        if causer then remember_hit(o, player_of_character(causer) or false) end
+        if causer then remember_hit(o, player_of_character(causer)) end
         return
     end
     if S.role ~= "client" or applying > 0 then return end
@@ -4341,15 +5116,21 @@ local function on_explode(c)
     end
 end
 
+-- WBOOM|p1;p2;...[|s]   host -> client: these blew up on the host (a live
+-- explosion: the object's own Event_Explode / MC_Explode here). "s" (the join
+-- snapshot): they blew up earlier, so they only go - no emitter, explosion
+-- sound, AI noise or camera shake at the join (Event_Explode @163-1605 does
+-- all of that before its K2_DestroyActor; its scorch decal lives 30 s).
+-- WBOOM|path   client -> host: its shot / blast.
 local function boom_msg(f, pc)
     if not on("world_objects") then return end
     if S.role == "client" then
+        local silent = f[2] == "s"
         for _, e in ipairs(split(f[1], ";")) do
             local b = find(unpack_path(e))
-            -- not found: gone here already. The nuke of a snapshot (f[2] "s")
-            -- only goes: no blast, shake and noise at the join.
-            if b and not short_class(b):find("Nuke", 1, true) then apply(function() b:Event_Explode(nil) end)
-            elseif b and f[2] == "s" then apply(function() b:K2_DestroyActor() end)
+            -- not found: gone here already
+            if b and silent then apply(function() b:K2_DestroyActor() end)
+            elseif b and not short_class(b):find("Nuke", 1, true) then apply(function() b:Event_Explode(nil) end)
             elseif b then apply(function() b:MC_Explode(nil) end) end
         end
         return
@@ -4366,18 +5147,13 @@ local function boom_msg(f, pc)
     log.info("world: %s exploded by %s, on the host too", ue.short(b), ue.short(pc))
 end
 
+-- Join: every barrel / nuke that blew up this session, silent ("s").
 local function snapshot_barrels(pc)
-    local items, n = {}, 0
-    for p in pairs(exploded) do
-        if p:find("BP_EasterEgg_Nuke", 1, true) then
-            Q.send(pc, "WBOOM", pack(p), "s")
-            n = n + 1
-        else
-            items[#items + 1] = pack(p)
-        end
-    end
-    send_list(pc, "WBOOM", items)
-    return #items + n
+    local items = {}
+    for p in pairs(exploded) do items[#items + 1] = pack(p) end
+    table.sort(items)
+    for _, b in ipairs(Q.batches(items)) do Q.send(pc, "WBOOM", b, "s") end
+    return #items
 end
 
 -- ---------------------------------------------------------------------------
@@ -4772,6 +5548,9 @@ local function infest_msg(f)
         if not i then
             if not RI.is_key(e) then later("infest", unpack_path(e)) end
         elseif ue.prop(i, "IsDestroyed?") ~= true then
+            -- a primary the host destroyed live (now "l", before this join "s"):
+            -- its secondaries stay here as there (IX.spare_secondaries)
+            if f[2] == "l" or f[2] == "s" then IX.spare_secondaries(i, f[2] == "s" and " before this join" or "") end
             -- the game's load path: destroyed look, no XP / notification here
             apply(function() i:Event_OnDestroyed(nil, true) end)
         end
@@ -4949,16 +5728,110 @@ function IX.unlock_primaries(live, why)
     return n
 end
 
+-- A primary's load path (Event_OnDestroyed(None, true): @11016 -> @9752 ->
+-- @9688 -> @3980, @3573-3735) K2_DestroyActor()s every valid one of its
+-- SecondaryInfestations and then empties the list (@9713): a save loaded with
+-- the primary down has no secondaries (the host's own load removes them too).
+-- Its live path (@9767) leaves them standing - the wreck and its loot - until
+-- the next load. A client applies the host's live kill (WINF "l") by the load
+-- path (no XP / note here), which made its secondaries vanish while the host
+-- still had them: the list is emptied first, the load path then removes none.
+-- A join: a destroyed primary whose secondaries the host still has (killed
+-- live in this run) comes as "s" (snapshot_infest), the same here; one the
+-- host loaded destroyed (its list emptied there) keeps the game's load result.
+
+-- A primary's secondaries still on this machine (valid ones in its list).
+function IX.standing_secondaries(o)
+    if ue.prop(o, "PrimaryInfestation?") ~= true then return 0 end
+    local arr = ue.prop(o, "SecondaryInfestations")
+    local n = 0
+    for _, s in ipairs(PF.list_of(arr)) do
+        if ue.valid(s) then n = n + 1 end
+    end
+    return n, arr
+end
+
+function IX.spare_secondaries(o, why)
+    local n, arr = IX.standing_secondaries(o)
+    if n == 0 then return 0 end
+    local ok = pcall(function() arr:Empty() end)
+    log.info("world: primary infestation %s destroyed on the host%s: its %d secondary infestation(s) stay here as there%s",
+        ue.short(o), why or "", n, ok and "" or " - FAILED (the game's load path removes them)")
+    return ok and n or 0
+end
+
+-- Infestation waves (world_infest_wave_target, host). Each wave member:
+-- LocToSpawn (@273, @476), FinishSpawningActor (@499), then
+-- SetBB_LockOnTarget(GetPlayerCharacter(self, 0).Location) (@629-756): the
+-- host's place. That GetPlayerCharacter call of a nest that is not destroyed,
+-- right after its LocToSpawn, gets the nest's last hitter while that player
+-- is alive within 150 m of it, else the living player nearest to the nest
+-- (also when the last hit came from no player: a grenadier zombie's blast).
+-- The nest's other player-0 calls (health bar, minimap, its destruction) stay
+-- as they were.
+IX.WAVE_FRESH_S = 0.5
+IX.WAVE_HITTER_CM = 15000
+
+-- BP_Infestation.LocToSpawn, post (all machines; acts on the host).
+function IX.on_wave_loc(c)
+    if not is_host() or not on("world_infest_wave_target") then return end
+    local i = c and c:get()
+    if not ue.valid(i) then return end
+    local a = addr(i)
+    if a then IX.wave[a] = { name = ue.short(i), t = clock() } end
+end
+
+function IX.wave_note(i, pawn, why, d)
+    M.stats.wave_targets = M.stats.wave_targets + 1
+    local line = string.format("world: infestation %s sends its wave member at %s (%s, %.0f m from the nest)",
+        ue.short(i), ue.short(pawn), why, d / 100)
+    if M.stats.wave_targets <= 10 then log.info("%s", line) else log.debug("%s", line) end
+end
+
+-- The scope of a living nest's player-0 call: a remote controller, false
+-- (the host) or nil (not a wave member's target).
+function IX.wave_target(wco, a)
+    local m = a and IX.wave[a]
+    if not m or ctx.call_fn ~= "GetPlayerCharacter" then return nil end
+    IX.wave[a] = nil
+    if clock() - m.t > IX.WAVE_FRESH_S or m.name ~= ue.short(wco) then return nil end
+    if not on("world_infest_wave_target") then return nil end
+    local at = ue.location(wco)
+    if not at then return nil end
+    local h = hitters[a]
+    if h and h.name == m.name then
+        local pawn = nil
+        if h.pc == false then pawn = ue.local_pawn() elseif remote_pc(h.pc) then pawn = ue.pawn_of(h.pc) end
+        local l = pawn and not ctx.is_dead_player(pawn) and ue.location(pawn)
+        if l and d2(l, at) <= IX.WAVE_HITTER_CM * IX.WAVE_HITTER_CM then
+            IX.wave_note(wco, pawn, "the last to hit it", math.sqrt(d2(l, at)))
+            return h.pc
+        end
+    end
+    local e, d = ctx.nearest_live_player(at)
+    if not e then return nil end
+    IX.wave_note(wco, e.pawn, "the nearest living player", d)
+    if e.remote then return e.pc end
+    return false
+end
+
 local function snapshot_infest(pc)
-    local items = {}
+    local items, spared = {}, {}
     for _, i in ipairs(ue.find_all("BP_Infestation_C")) do
         if level_actor(i) and ue.prop(i, "IsDestroyed?") == true then
             local p = path_of(i)
-            if p then items[#items + 1] = pack(p) end
+            -- a primary destroyed live in this run: its secondaries are still here ("s")
+            if p and IX.standing_secondaries(i) > 0 then spared[#spared + 1] = pack(p)
+            elseif p then items[#items + 1] = pack(p) end
         end
     end
     send_list(pc, "WINF", items)
-    return #items
+    for _, p in ipairs(spared) do Q.send(pc, "WINF", p, "s") end
+    if #spared > 0 then
+        log.info("world: snapshot for %s: %d destroyed primary infestation(s) still have their secondaries here: sent so",
+            ue.short(pc), #spared)
+    end
+    return #items + #spared
 end
 
 -- ===========================================================================
@@ -5206,7 +6079,15 @@ local function built_msg(f)
     end
     M.stats.build_tails = M.stats.build_tails + 1
     local pr = ue.prop(bc, "PickupRef")
-    if ue.valid(pr) then apply(function() pr:PickupBuildFromGround() end) end
+    if ue.valid(pr) then
+        -- (game 0.8.0: no Blueprint sets PickupRef - only Event_StopBuildMode
+        -- clears it - and both pickups' PickupBuildFromGround are empty, so this
+        -- never happens; were a game update to place from a ground pickup, the
+        -- host's copy of that pickup is not removed by this call: said loudly)
+        log.warn("world: placed from the ground pickup %s: the host's pickup stays (placing from the ground is not mirrored)",
+            ue.short(pr))
+        apply(function() pr:PickupBuildFromGround() end)
+    end
     -- FGuid as a plain table (a struct read from one call is not passed to another)
     local uid = parse_guid(guid_str(ue.prop(bc, "BuildUID")))
     local menu = ue.prop(pawn, "JigContextMenuComp")
@@ -5247,6 +6128,8 @@ end
 -- (native pre), client: the AI volume of a host camp's copy is a local,
 -- non-replicated child actor here, authority of itself, and would spawn its
 -- own bandits (BP_AISpawningVolume_Prefab @1836); the host's come replicated.
+-- The spawn is blocked and, at the first one, the volume switched off
+-- (PF.stop_volume): a blocked spawn alone left its loop running for good.
 function PF.on_spawn_ai(_, wco_p, class_p)
     if not wco_p or not class_p or not on("world_prefabs") then return end
     local wco = get(wco_p)
@@ -5259,6 +6142,79 @@ function PF.on_spawn_ai(_, wco_p, class_p)
             log.info("world: AI spawn of the camp volume %s blocked on this client (the host's AI comes replicated)", ue.short(wco))
         end
     end
+    PF.stop_volume(wco)
+end
+
+-- The camp volume's spawn loop never ends while every spawn is blocked
+-- (2026-11-13, a client: 17 blocked spawns a second at first, 316 at the
+-- end; near a settlement up to 21000 GetPlayerCharacter calls a second, ~80
+-- per try). A failed SpawnAIFromClass leaves Remaining Spawning AI as it was
+-- (its count goes down only after a spawn, @3168); Spawn Location Trace
+-- makes Spawn Retries + 1 tries, each with Find Spawn Location and
+-- TraceForPlayer (a 25 m sphere, GetPlayerCharacter per body hit); after
+-- SpawnCount rounds Restart Spawning (@3910) starts over, every Spawn Time.
+-- Its first blocked spawn switches the volume off its own way: Spawn Retries
+-- -1 (the try loop @142 ends now, with the tries left of this very call),
+-- Enable Spawn AI false (a BeginPlay still waiting stops @760), Respawn AI
+-- false (no respawn timer @3786) and both spawn lists emptied (Spawn
+-- Location Trace returns at once @98, the loop over them @2908 ends; a
+-- refill @3915 copies the empty Spawning AI). The volume itself stays (a
+-- child actor of the camp's copy). Once per volume (address and name); a
+-- blocked spawn of a volume already switched off counts as "again" (the
+-- switch-off did not hold), logged once per volume.
+PF.STOP_PROPS = { { "Spawn Retries", -1 }, { "Enable Spawn AI", false }, { "Respawn AI", false } }
+PF.STOP_LISTS = { "Remaining Spawning AI", "Spawning AI" }
+PF.VOLS_MAX = 512
+PF.vols, PF.nvols = {}, 0   -- client: ["address|name"] = blocked spawns since its switch-off
+
+function PF.empty(arr) arr:Empty() end
+
+function PF.stop_volume(wco)
+    local name = ue.short(wco)
+    local key = tostring(addr(wco)) .. "|" .. name
+    local again = PF.vols[key]
+    if again then
+        PF.vols[key] = again + 1
+        M.stats.prefab_ai_again = M.stats.prefab_ai_again + 1
+        if again == 0 then
+            log.warn("world: camp AI volume %s still tries to spawn after it was switched off on this client", name)
+        end
+        return false
+    end
+    if PF.nvols >= PF.VOLS_MAX then PF.vols, PF.nvols = {}, 0 end
+    PF.vols[key], PF.nvols = 0, PF.nvols + 1
+    local props, lists = 0, 0
+    for _, kv in ipairs(PF.STOP_PROPS) do
+        if ue.set_prop(wco, kv[1], kv[2]) then props = props + 1 end
+    end
+    for _, ln in ipairs(PF.STOP_LISTS) do
+        local arr = ue.prop(wco, ln)
+        if not ue.missing(arr) and pcall(PF.empty, arr) then lists = lists + 1 end
+    end
+    M.stats.prefab_ai_stopped = M.stats.prefab_ai_stopped + 1
+    local line = string.format("world: camp AI volume %s switched off on this client (%d/%d settings, %d/%d spawn lists emptied):"
+        .. " its loop would retry the blocked spawn for good", name, props, #PF.STOP_PROPS, lists, #PF.STOP_LISTS)
+    if M.stats.prefab_ai_stopped <= 8 or props < #PF.STOP_PROPS then log.info("%s", line) else log.debug("%s", line) end
+    return true
+end
+
+-- [PERF] world (client, every perf_report seconds; only a window with any):
+-- camp AI spawns blocked here, volumes switched off, and spawns blocked again
+-- after a switch-off (more than a handful: the 2026-11-13 loop is back).
+PF.perf = { at = nil, b = 0, s = 0, a = 0 }
+
+function PF.perf_tick(now)
+    local every = tonumber(cfg.get("perf_report")) or 60
+    if every <= 0 then return end
+    local P, st = PF.perf, M.stats
+    P.at = P.at or now
+    if now - P.at < every then return end
+    local dt = now - P.at
+    local b, s, a = st.prefab_ai_blocked - P.b, st.prefab_ai_stopped - P.s, st.prefab_ai_again - P.a
+    P.at, P.b, P.s, P.a = now, st.prefab_ai_blocked, st.prefab_ai_stopped, st.prefab_ai_again
+    if b <= 0 and s <= 0 and a <= 0 then return end
+    log.info("[PERF] world %.0fs: camp AI spawns blocked on this client %d (%.1f/s), camp AI volumes switched off %d,"
+        .. " blocked again after a switch-off %d (%.1f/s)", dt, b, b / dt, s, a, a / dt)
 end
 
 function PF.list_of(arr)
@@ -5367,14 +6323,26 @@ function PF.on_new_loot(o)
 end
 
 -- Client (every 5 s): spawner leftovers that exist only here (authority,
--- runtime-spawned): a prefab goes with its child actors.
+-- runtime-spawned): a prefab goes with its child actors. A destroyed actor
+-- stays findable, and UE4SS's IsValid true, until the engine's garbage
+-- collection (up to a minute): one destroyed here is remembered (address and
+-- name, PF.GONE_S) and not destroyed, counted and logged again (2026-11-13:
+-- the same camp "removed" 10 times, every 5-6 s for a minute).
+PF.GONE_S = 300
+PF.gone = {}   -- client: ["address|name"] = clock of its K2_DestroyActor here
+
 function PF.client_only_pass()
-    local n = 0
+    local n, now = 0, clock()
+    for k, t in pairs(PF.gone) do
+        if now - t > PF.GONE_S or now < t then PF.gone[k] = nil end
+    end
     for _, cls in ipairs(PF.CLIENT_ONLY_CLASSES) do
         for _, a in ipairs(ue.find_all(cls)) do
             if ue.valid(a) and ue.role(a) == ue.ROLE_AUTHORITY and ue.is_runtime_spawned(a) then
                 local name = ue.short(a)
-                if pcall(function() a:K2_DestroyActor() end) then
+                local key = tostring(addr(a)) .. "|" .. name
+                if not PF.gone[key] and pcall(function() a:K2_DestroyActor() end) then
+                    PF.gone[key] = now
                     n = n + 1
                     M.stats.prefab_removed = M.stats.prefab_removed + 1
                     log.info("world: removed client-only %s (%s, spawned by this client's own copy of the level)", name, cls)
@@ -5392,6 +6360,129 @@ function PF.host_prefab_pass()
     for _, a in ipairs(ue.find_all("PrefabMaster_C")) do
         if ue.valid(a) and ue.prop(a, "bReplicates") ~= true then pcall(PF.replicate_prefab, a, "late") end
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Camp discovery XP for every player (0.7.3)
+-- ---------------------------------------------------------------------------
+-- The game (BP_PrefabSpawner, the placed camps / trucks / crashes): once its
+-- camp spawned (@440-515) a looping 2-6 s timer runs DistanceToPrefab:
+-- GetPlayerCharacter(self, 0) closer than DistanceToDiscoverPrefab (class
+-- default 20 m) -> its map marker goes, the timer stops and
+-- GetLevellingComponent(self).AddXP(XpMultiplierCalc(40, 60)) = CurrentLevel
+-- x Random(40, 60) x MultiplyValue, no note (@313-461). Player 0 there is the
+-- host: only the host was ever paid; a client's own spawner goes at the spawn
+-- block above (its camp is the host's, replicated).
+-- Here: the host notes every spawner whose timer runs (DistanceToPrefab,
+-- post: its place and radius; kept after the host's own discovery stopped
+-- the timer) and every 2 s gives each living client within that radius of
+-- one the same payment once per camp (WCAMPXP: the client pays itself the
+-- game's way, on its own progression). Paid per player (PF.player_key: its
+-- SteamID, the id its saved character goes by, else its name): a rejoin in
+-- the same world is not paid again, and two players of the same name (two
+-- "User"s: no player_name, no Steam link helper) are two players. Dynamic
+-- events (BP_PrefabSpawner_Dynamic) set no such timer (sdc_events). Only
+-- paths, places, names and ids are kept.
+PF.CAMP_FN = "/Game/Prefabs/BP_PrefabSpawner.BP_PrefabSpawner_C:DistanceToPrefab"
+PF.CAMP_R = 2000              -- cm: DistanceToDiscoverPrefab's class default
+-- host: [spawner path] = { loc, r, name, paid = { [player key] = session key of the paid connection } }
+PF.camps, PF.ncamps = {}, 0
+PF.camp_got = {}              -- client: [spawner key] = true: paid here this world
+PF.camp_seen = {}             -- host: [spawner address] = true: noted (its timer's next calls end at once)
+
+-- BP_PrefabSpawner.DistanceToPrefab (post), host: this spawner's camp stands.
+function PF.on_camp_timer(c)
+    if not is_host() or not on("world_prefabs") then return end
+    local sp = c and c:get()
+    local a = addr(sp)
+    if a and PF.camp_seen[a] then return end
+    if not level_actor(sp) then return end
+    local p = path_of(sp)
+    if not p then return end
+    if PF.camps[p] then
+        if a then PF.camp_seen[a] = true end
+        return
+    end
+    local l = ue.location(sp)
+    if not l then return end
+    local r = num(ue.prop(sp, "DistanceToDiscoverPrefab"), PF.CAMP_R)
+    if a then PF.camp_seen[a] = true end
+    PF.camps[p] = { loc = l, r = r, name = ue.short(sp), paid = {} }
+    PF.ncamps = PF.ncamps + 1
+    local line = string.format("world: camp of %s at %s: its discovery XP goes to every player who comes within %.0f m",
+        ue.short(sp), loc_str(l), r / 100)
+    if PF.ncamps <= 8 then log.info("%s", line) else log.debug("%s", line) end
+end
+
+-- A connected player's name (a rejoin keeps it), else its controller's.
+function PF.player_name(pc)
+    local r = S and S.remote and S.remote[ue.name(pc)]
+    if type(r) == "table" and type(r.name) == "string" and r.name ~= "" then return r.name end
+    return ue.name(pc)
+end
+
+-- A connected player's lasting key and its session key (the controller's
+-- name, new on each join): "s"..SteamID when the host has it (sdc_persist,
+-- from the player's id message: the game's own Steam user, no helper
+-- needed), else "n"..its name (no Steam: the name is all there is here).
+function PF.player_key(pc)
+    local k = ue.name(pc)
+    local ps = package.loaded["sdc_persist"]
+    if type(ps) == "table" and type(ps.steam_of) == "function" then
+        local ok, sid = pcall(ps.steam_of, k)
+        if ok and sid ~= nil and tostring(sid) ~= "" then return "s" .. tostring(sid), k end
+    end
+    return "n" .. tostring(PF.player_name(pc)), k
+end
+
+-- This camp paid that player already: under its key, or - its SteamID came
+-- after its payment - under its name by this same connection.
+function PF.camp_paid(cp, who, sk, pc)
+    if cp.paid[who] then return true end
+    return sk ~= nil and who:sub(1, 1) == "s" and cp.paid["n" .. tostring(PF.player_name(pc))] == sk
+end
+
+-- Host (every 2 s): living clients at a camp they have not discovered yet.
+function PF.camp_pass()
+    if PF.ncamps == 0 then return end
+    for _, e in ipairs(ctx.live_players()) do
+        if e.remote then
+            local who, sk = nil, nil
+            for p, cp in pairs(PF.camps) do
+                local d = d2(e.loc, cp.loc)
+                if d < cp.r * cp.r then
+                    if not who then who, sk = PF.player_key(e.pc) end
+                    if not PF.camp_paid(cp, who, sk, e.pc) then
+                        cp.paid[who] = sk or true
+                        Q.send(e.pc, "WCAMPXP", pack(p))
+                        M.stats.camp_xp = M.stats.camp_xp + 1
+                        log.info("world: %s discovered the camp of %s (%.0f m): the game's discovery XP to that player (kept by its %s)",
+                            ue.short(e.pc), cp.name, math.sqrt(d) / 100, who:sub(1, 1) == "s" and "Steam id" or "name")
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- WCAMPXP|spawner key   (host -> client): this player reached a host camp
+-- first: DistanceToPrefab's payment (@342-461) on its own progression.
+function PF.camp_xp_msg(f)
+    if S.role ~= "client" or not on("world_prefabs") then return end
+    local key = tostring(f[1] or "")
+    if key == "" or PF.camp_got[key] then return end
+    PF.camp_got[key] = true
+    local comp = ue.prop(ue.local_pc(), "LevellingComponent")
+    if not ue.valid(comp) then return end
+    -- the XP bar's timer (moves the added XP into the bar; PW.xp_msg, sdc_ai_kills)
+    if not PW.xp_timer then PW.xp_timer = ue.call(comp, "Event_LevelBarTimer") end
+    local xp = (tonumber(ue.prop(comp, "CurrentLevel")) or 1) * (40 + math.random() * 20)
+        * (tonumber(ue.prop(comp, "MultiplyValue")) or 1)
+    local out = {}
+    if not pcall(function() comp:AddXP(xp, false, out) end) then return end
+    M.stats.camp_xp = M.stats.camp_xp + 1
+    log.info("world: discovered the host's camp %s here: +%d XP (the game's discovery bonus)",
+        key:match("([^%.~]+)$") or key, math.floor(tonumber(out.XPOutput) or xp))
 end
 
 -- ===========================================================================
@@ -5539,7 +6630,7 @@ end
 -- The count on the minigame's screen. LockpickTxt.Text is bound (the widget's
 -- Bindings) to GetLockpickAmountText, whose only parameter is its return
 -- value: UE4SS gives a Blueprint hook the parameters without it (LuaMod
--- script_hook skips ReturnValue), so LK.on_amount_text never got it and the
+-- script_hook skips ReturnValue), so a hook there cannot answer it and the
 -- binding showed the game's own count over the client's empty
 -- MainJigContainers - "Lockpicks: 0" while the gate (out Lockpicks) had the
 -- real count. UTextBlock.SetText shows this count and unbinds that binding
@@ -5555,8 +6646,8 @@ function LK.show(w, n)
     if not ue.valid(tb) then return end
     local changed = k ~= LK.shown_w or n ~= LK.shown_n
     LK.shown_w, LK.shown_n = k, n
-    local want = string.format("Lockpicks: %d", n)
     local was = ue.str(ue.try(LK.text_of, tb))
+    local want = LK.text_for(was, n)
     if was == want then return end
     local ok = pcall(LK.set_text, tb, want)
     if changed and M.stats.lk_counts < LK.LOGS then
@@ -5566,31 +6657,36 @@ function LK.show(w, n)
     end
 end
 
+-- The screen's text with this count: the game's own text with only its
+-- number changed. The game formats "Lockpicks: {A}" (GetLockpickAmountText
+-- @1269) in its own language - a Russian game showed its own word (logged as
+-- 'Otmychki: 0'), which the fixed English "Lockpicks: 2" replaced
+-- (2026-11-13). The number is from the
+-- first digit to the last (a grouped "1 000" too); a text without one
+-- (unreadable) gets the last text seen with one, else the game's source text.
+function LK.text_for(was, n)
+    local num = string.format("%d", math.floor(tonumber(n) or 0))
+    local s = type(was) == "string" and was or ""
+    local i, j = s:find("%d"), s:find("%d%D*$")
+    if i and j then
+        LK.fmt = { s:sub(1, i - 1), s:sub(j + 1) }
+    end
+    local f = LK.fmt or { "Lockpicks: ", "" }
+    return f[1] .. num .. f[2]
+end
+
 function LK.text_of(tb) return tb:GetText() end
 function LK.set_text(tb, s) tb:SetText(FText(s)) end
 
 -- LockpickUI.GetLockpickAmount(out Lockpicks) -> Text (post, client; from
 -- its Tick @576 every frame): the count (the out parameter is the minigame's
--- gate @617) and the same count on the screen.
-function LK.on_amount(c, a_p, b_p)
+-- gate @617; a Blueprint hook gets no return value) and the same count on the
+-- screen.
+function LK.on_amount(c, n_p)
     if S.role ~= "client" or not on("world_containers") then return end
     local n = LK.count()
-    for _, p in ipairs({ a_p, b_p }) do
-        local v = get(p)
-        if type(v) == "number" then pcall(function() p:set(n) end)
-        elseif v ~= nil and FText then pcall(function() p:set(FText(string.format("Lockpicks: %d", n))) end) end
-    end
+    if type(get(n_p)) == "number" then pcall(function() n_p:set(n) end) end
     LK.show(get(c), n)
-end
-
--- LockpickUI.GetLockpickAmountText -> Text (post, client: its text binding).
--- A Blueprint hook gets no return value (r_p is nil in UE4SS 3.0.1): only
--- for a hook that passes one. The text is LK.show's; never set it from here
--- (this runs while Slate reads that very binding).
-function LK.on_amount_text(_, r_p)
-    if S.role ~= "client" or not on("world_containers") or r_p == nil or not FText then return end
-    local n = LK.count()
-    pcall(function() r_p:set(FText(string.format("Lockpicks: %d", n))) end)
 end
 
 -- LockpickUI.BreakLockpick (post, client; its timer every 0.1 s of a wrong
@@ -5730,18 +6826,17 @@ end
 -- Keypad doors
 -- ---------------------------------------------------------------------------
 
--- Join: the host's codes (door and its note).
+-- Join: the host's codes (door and its note), one list:
+-- WKEYCODE|door!code;door!code;...
 function LK.snapshot(pc)
-    local n = 0
+    local items = {}
     for _, d in ipairs(ue.find_all("BP_KeypadDoor_C")) do
         local code = level_actor(d) and tonumber(ue.prop(d, "Code"))
         local p = code and path_of(d)
-        if p then
-            Q.send(pc, "WKEYCODE", pack(p), string.format("%d", code))
-            n = n + 1
-        end
+        if p then items[#items + 1] = pack(p) .. "!" .. string.format("%d", code) end
     end
-    return n
+    send_list(pc, "WKEYCODE", items)
+    return #items
 end
 
 function LK.set_code(d, code)
@@ -5750,39 +6845,92 @@ function LK.set_code(d, code)
     if ue.valid(note) then ue.set_prop(note, "Code", code) end
 end
 
--- WKEYCODE|door|code   (host -> client)
+-- One door's code here: the door when it changed.
+function LK.code_one(p, code)
+    local d = find(unpack_path(p))
+    code = tonumber(code)
+    if not d or not code or tonumber(ue.prop(d, "Code")) == code then return nil end
+    LK.set_code(d, code)
+    return d
+end
+
+-- WKEYCODE|door|code or WKEYCODE|door!code;...   (host -> client)
 function LK.keycode_msg(f)
     if S.role ~= "client" or not on("world_doors") then return end
-    local d = find(unpack_path(f[1]))
-    local code = tonumber(f[2])
-    if not d or not code then return end
-    if tonumber(ue.prop(d, "Code")) ~= code then
-        LK.set_code(d, code)
-        log.info("world: keypad code of %s as on the host (its note too)", ue.short(d))
+    if f[2] ~= nil then
+        local d = LK.code_one(f[1], f[2])
+        if d then log.info("world: keypad code of %s as on the host (its note too)", ue.short(d)) end
+        return
     end
+    local n, total = 0, 0
+    for _, e in ipairs(split(f[1], ";")) do
+        local p, code = e:match("^([^!]+)!(%d+)$")
+        if p then
+            total = total + 1
+            if LK.code_one(p, code) then n = n + 1 end
+        end
+    end
+    log.info("world: keypad codes from the host: %d of %d set here (door and note)", n, total)
+end
+
+-- The KeypadUI widgets of door `da` (address) on this screen. FindAllOf does
+-- not see UMG widgets: WidgetBlueprintLibrary.GetAllWidgetsOfClass (top level
+-- only = in the viewport), as sdc_charcreate's on_screen.
+function LK.keypads_here(da)
+    local out = {}
+    local wbl, wc = ue.widget_lib(), ue.local_pc() or ue.game_instance()
+    local cls = ue.find_object(LK.PATHS.keypad_ui)
+    if not (wbl and wc and cls and da) then return out end
+    local arr = {}
+    if not pcall(function() wbl:GetAllWidgetsOfClass(wc, arr, cls, true) end) then return out end
+    for _, v in ipairs(arr) do
+        local w = v
+        if type(v) == "userdata" and not ue.valid(v) then w = ue.try(function() return v:get() end) end
+        if ue.valid(w) and addr(ue.prop(w, "DoorRef")) == da and ue.try(function() return w:IsInViewport() end) == true then
+            out[#out + 1] = w
+        end
+    end
+    return out
+end
+
+-- The door's server path made the keypad for this press (@1710-2016, @584,
+-- @622): the presser within 5 m, in front of the door (GetBehindObject?:
+-- the door's forward vector . the direction to it >= 0), and the door not
+-- opened by its code yet in this world (OpenedInThisInstance?: then the press
+-- only toggles it, MC_OpenDoor). Unreadable parts count as "made".
+function LK.keypad_made(d, ch)
+    if ue.prop(d, "OpenedInThisInstance?") == true then return false end
+    local dl, cl = ue.location(d), ue.location(ch)
+    if not (dl and cl) then return true end
+    if d2(dl, cl) >= 500 * 500 then return false end
+    local fw = v3(ue.try(function() return d:GetActorForwardVector() end))
+    if not fw then return true end
+    return (cl.X - dl.X) * fw.X + (cl.Y - dl.Y) * fw.Y + (cl.Z - dl.Z) * fw.Z >= 0
 end
 
 -- BP_KeypadDoor.OnServerExecuteInteract(Option, ByActor, Payload) (post,
--- host): a remote player's press opened the keypad here, on the host's screen.
+-- host): a remote player's press opened the keypad here, on the host's screen
+-- (@622 Create for player 0). It is closed here the widget's own way and the
+-- presser opens the game's keypad on its own screen (WKEYUI) - also when the
+-- host's widget is not found, as long as the door's path made one.
 function LK.on_keypad_server(c, _, by_p)
     if not is_host() or not on("world_doors") then return end
     local d = c and c:get()
-    local pc = player_of_character(get(by_p))
+    local ch = get(by_p)
+    local pc = player_of_character(ch)
     if not pc or not level_actor(d) then return end
-    local da = addr(d)
     local closed = 0
-    for _, w in ipairs(ue.find_all("KeypadUI_C")) do
-        if ue.valid(w) and addr(ue.prop(w, "DoorRef")) == da and ue.try(function() return w:IsInViewport() end) == true then
-            -- the widget's own close (@868: off the screen, the host's input back)
-            if pcall(function() w:PausePressed() end) then closed = closed + 1 end
-        end
+    for _, w in ipairs(LK.keypads_here(addr(d))) do
+        -- the widget's own close (@868: off the screen, the host's input back)
+        if pcall(function() w:PausePressed() end) then closed = closed + 1 end
     end
-    if closed == 0 then return end
+    if closed == 0 and not LK.keypad_made(d, ch) then return end
     LK.aim_set(d, pc)
     local p = path_of(d)
     Q.now(pc, "WKEYUI", pack(p), string.format("%d", tonumber(ue.prop(d, "Code")) or 0))
     M.stats.lk_keypads = M.stats.lk_keypads + 1
-    log.info("world: %s pressed the keypad of %s: opened on that player's screen, not the host's", ue.short(pc), ue.short(d))
+    log.info("world: %s pressed the keypad of %s: opened on that player's screen, not the host's (host's widget %s)",
+        ue.short(pc), ue.short(d), closed > 0 and "closed" or "not found")
 end
 
 -- WKEYUI|door|code   (host -> the presser): the game's keypad, here.
@@ -6002,11 +7150,15 @@ local HOOKS = {
     { MN.CLS.w .. ":Event_Explode", "mine", function(c) MN.on_explode(c, "w") end },
     { MN.CLS.b .. ":Event_Explode", "mine", function(c) MN.on_explode(c, "b") end },
     { PATH.INFEST .. ":Event_OnDestroyed", "infest", on_infest_destroyed },
+    { PATH.INFEST .. ":LocToSpawn", "infest-wave", IX.on_wave_loc },
     { PATH.BUILDING .. ":Event_LaunchBuildMode", "build", on_launch_build },
     { PATH.BUILDING .. ":SpawnBuild", "build", on_spawn_build },
     { PATH.BUILDABLE .. ":ReplacingObject", "build", on_replacing },
     { PATH.PLAYER .. ":JigMP_OnRequestDropItem", "grant", on_player_drop },
     { PATH.JIG .. ":JigTryAddItemSomewhere", "salvage-roll", HV.on_try_add },
+    { PATH.JIG .. ":JigTryAddGetPendingRef", "resource-spot", HV.on_pending_ref },
+    { PATH.JIG .. ":CLIENT_AddNewItem", "resource-shown", HV.on_client_add },
+    { PATH.JIG .. ":CLIENT_UpdateCount", "resource-shown", HV.on_client_count },
     { EV.MANAGER .. ":SetBloodMoon", "bloodmoon", EV.on_blood_moon },
     { EV.MANAGER .. ":AirdropSpawn", "airdrop", EV.on_airdrop_timer },
     { EV.MANAGER .. ":SpawnAirdrop", "airdrop", EV.on_airdrop_roll },
@@ -6014,7 +7166,6 @@ local HOOKS = {
     { EV.MANAGER .. ":SpawnJet", "jets", EV.on_jet_roll },
     { EV.CRATE .. ":ReceiveHit", "airdrop", EV.on_crate_hit },
     { LK.PATHS.ui .. ":GetLockpickAmount", "lockpick", LK.on_amount },
-    { LK.PATHS.ui .. ":GetLockpickAmountText", "lockpick", LK.on_amount_text },
     { LK.PATHS.ui .. ":BreakLockpick", "lockpick", LK.on_break },
     { PATH.LOCKED_DOOR .. ":LockpickSuccessful", "lockpick", LK.on_picked },
     { PATH.PICKLOCK .. ":LockpickSuccessful", "lockpick", LK.on_picked },
@@ -6034,6 +7185,7 @@ local HOOKS = {
     { PW.PATHS.nuke .. ":MC_Explode", "explode", on_explode },
     { PW.PATHS.save, "power-save", PW.on_save },
     { PW.PATHS.delete, "power-delete", PW.on_delete, native = true },
+    { PW.list.LOAD_FN, "power-load", function(_, wco_p) PW.list.on_load(PW, S, wco_p) end, native = true },
 }
 for _, d in ipairs(RDOORS) do HOOKS[#HOOKS + 1] = { d[1] .. ":MC_OpenDoor", "rdoor", on_rdoor } end
 -- the player at a scanner / keycard / hangar / keypad door (the host's scope, LK)
@@ -6045,6 +7197,12 @@ end
 for _, k in ipairs({ "pgen", "lgen", "lever", "cbox", "sw", "ssw", "sdoor", "secure", "entr", "scan", "siren", "radio", "kdoor",
                      "hangar" }) do
     HOOKS[#HOOKS + 1] = { PW.PATHS[k] .. ":OnExecuteInteract", "power", PW.on_exec }
+end
+-- a camp's discovery timer (PF: its XP for every player)
+HOOKS[#HOOKS + 1] = { PF.CAMP_FN, "camp-xp", PF.on_camp_timer }
+-- a horde boss gone with its player's death (IX: logged)
+for _, b in ipairs({ "BP_ZombieBossHorde_Infestation", "BP_ZombieBossHorde_Military", "BP_ZombieBossHorde_Military_Small" }) do
+    HOOKS[#HOOKS + 1] = { IX.HORDE .. b .. "." .. b .. "_C:Event_PlayerDead", "horde", IX.on_horde_dead }
 end
 
 HOOKS.missed = {}   -- [path] = true: its "not ready" was logged once
@@ -6295,6 +7453,7 @@ local function tick()
     if role == "host" then
         Q.host_pump()
         if on("world_harvest") then HV.wait_pass(now) end
+        HV.pend_pass(now)
         if on("world_objects") then
             RI.host_pass(now)
             EV.host_pass()
@@ -6321,14 +7480,17 @@ local function tick()
         for a, h in pairs(hitters) do if now - h.t > HIT_KEEP_S then hitters[a] = nil end end
         for a, t in pairs(grant_until) do if now > t then grant_until[a] = nil end end
         for a, b in pairs(horde_bind) do if now - b.t > 10 then horde_bind[a] = nil end end
+        for a, w in pairs(IX.wave) do if now - w.t > 5 then IX.wave[a] = nil end end
         for k, t in pairs(HV.replay) do if now - t > 5 then HV.replay[k] = nil end end
         for k, r in pairs(HV.rate) do if now - r.t > 5 then HV.rate[k] = nil end end
         for k, mv in pairs(MV.moving) do if now - mv.at > 600 then MV.moving[k] = nil end end
+        if on("world_prefabs") then PF.camp_pass() end
     else
         if #pending_dmg > 0 and now - pending_dmg[#pending_dmg].t > 1 then pending_dmg = {} end
         retry_pending()
         if on("world_objects") then EV.client_pass() end
         if on("world_prefabs") then EV.crate_check() end
+        PF.perf_tick(now)
         if client_ready() and ue.local_pawn() then
             local cs = S.client
             local key = tostring(S.map) .. "|" .. tostring(cs.pc_key)
@@ -6354,7 +7516,7 @@ function M.reset(why)
     hitters, grant_until = {}, {}
     fol_removed, fol_seen = {}, {}
     pending_harv, pending_dmg = nil, {}
-    loot_sent, door_state, rdoor_toggled = {}, {}, {}
+    loot_sent, rdoor_toggled = {}, {}
     pending, snap_asked, build = {}, {}, {}
     exploded, horde_bind = {}, {}
     MN.reset()
@@ -6362,21 +7524,25 @@ function M.reset(why)
     Q.cref, Q.cref_set, Q.cref_head, Q.cwave = {}, {}, 1, nil
     -- (CB.live stays, like HV.live: gone ones drop out when looked up)
     CB.keys, CB.nkeys, CB.fresh = {}, 0, next(CB.live) ~= nil
-    cache = { block_cls = nil, harvest_cls = {}, scrap = nil, cue = nil, menu_cls = nil }
+    cache = { block_cls = nil, harvest_cls = {}, scrap = nil, cue = nil }
     world_since = nil
     -- (HV.live stays: harvestables seen by the watch around a role change;
     -- gone ones drop out when looked up)
     HV.recs, HV.out, HV.replay, HV.wait, HV.rate, HV.logged = {}, {}, {}, {}, {}, {}
     HV.dress_due, HV.last_add = 0, nil
+    HV.spot, HV.spots, HV.spot_sent, HV.into, HV.pend = nil, {}, {}, nil, {}
     MV.moving, MV.marked = {}, {}
     -- (RI.live stays, like HV.live)
     RI.host, RI.recs, RI.dressed, RI.due, RI.scan_at = {}, {}, {}, 0, -100
     EV.moon, EV.shown, EV.manager_path, EV.jets, EV.next_try = false, nil, nil, {}, 0
     EV.ad = { landed = {}, seen = {}, last = "none yet" }
     EV.crates, EV.ccrates, EV.crate_at = {}, {}, 0
-    PW.reset()
+    PW.reset(why)
     LK.reset()
-    IX.got, IX.own, IX.recv = {}, {}, {}
+    IX.got, IX.own, IX.recv, IX.wave = {}, {}, {}, {}
+    PF.camps, PF.ncamps, PF.camp_got, PF.camp_seen = {}, 0, {}, {}
+    -- (addresses of another world's actors mean nothing here)
+    PF.vols, PF.nvols, PF.gone = {}, 0, {}
     log.info("world: reset (%s)", tostring(why))
 end
 
@@ -6403,6 +7569,10 @@ function M.register_handlers()
     net.on("WBMODE", bmode_msg)
     net.on("WBUILT", built_msg)
     net.on("WHHIT", HV.hit_msg)
+    net.on("WSPOT", HV.spot_msg)
+    -- (sent past the send queue like WHHIT: it must reach the host before the
+    -- hit that fells the rock / tree)
+    if type(net.NOW) == "table" then net.NOW.WSPOT = true end
     net.on("WMOVE", MV.move_msg)
     net.on("WRINF", RI.msg)
     net.on("WBMOON", EV.moon_msg)
@@ -6419,6 +7589,7 @@ function M.register_handlers()
     net.on("WPTRY", PW.try_msg)
     net.on("WPNOTE", PW.note_msg)
     net.on("WPXP", PW.xp_msg)
+    net.on("WCAMPXP", PF.camp_xp_msg)
 end
 
 -- main.lua, right after sdc_respawn.install and before sdc_vehicles.install:
@@ -6500,7 +7671,7 @@ function M.status_line()
         .. "trash=%d booms=%d infest=%d xp shared=%d primaries unlocked=%d dmg=%d/%d | "
         .. "mines host=%d set off for clients=%d own sent=%d shown copy=%d fx=%d already=%d | "
         .. "build modes=%d placed=%d tails=%d moves=%d/%d | camps blocked=%d ai=%d replicated=%d removed=%d | "
-        .. "random nests=%d shown=%d moon=%d jets=%d waves blocked=%d airdrop rolls=%d planes=%d crates=%d placed=%d/%d | "
+        .. "random nests=%d shown=%d moon=%d jets=%d waves blocked=%d wave targets=%d airdrop rolls=%d planes=%d crates=%d placed=%d/%d | "
         .. "locks picked=%d breaks=%d tools=%d keypads=%d | "
         .. "puzzle objs=%d steps=%d host=%d sent=%d applied=%d tries=%d/%d restored=%d | "
         .. "scopes=%d grants=%d left=%d | snapshots=%d pending=%d",
@@ -6510,10 +7681,17 @@ function M.status_line()
         s.trash, s.booms, s.infest, s.inf_shared, s.inf_unlocked, s.dmg_sent, s.dmg_host,
         s.mines, s.mines_host, s.mines_sent, s.mines_copy, s.mines_fx, s.mines_dup, s.build_modes, s.builds,
         s.build_tails, s.moves, s.moves_applied, s.prefab_blocked, s.prefab_ai_blocked, s.prefab_replicated, s.prefab_removed,
-        s.rinf, s.rinf_shown, s.moon, s.jets, s.waves_blocked, s.ad_rolls, s.ad_planes, s.ad_crates, s.crate_sent, s.crate_snapped,
+        s.rinf, s.rinf_shown, s.moon, s.jets, s.waves_blocked, s.wave_targets, s.ad_rolls, s.ad_planes, s.ad_crates, s.crate_sent, s.crate_snapped,
         s.lk_unlocks, s.lk_breaks, s.lk_tools, s.lk_keypads,
         PW.objs and #PW.objs or -1, s.pw_steps, s.pw_host, s.pw_sent, s.pw_applied, s.pw_tries_ok, s.pw_tries, s.pw_restored,
         s.scopes, s.grants, s.grant_drops, s.snapshots, s.pending)
+        .. string.format(" | camp discovery xp=%d sirens in step=%d horde bosses lost=%d (with players near %d)",
+            s.camp_xp, s.siren_aligned, s.horde_lost, s.horde_lost_fight)
+        .. string.format(" | camp AI volumes switched off=%d blocked again=%d", s.prefab_ai_stopped, s.prefab_ai_again)
+        .. string.format(" | resource places from clients' screens sent=%d heard=%d stacked=%d new stack=%d no room=%d "
+            .. "plugin's add=%d grants that waited for the word=%d (word came late=%d)", HV.cnt.sent, HV.cnt.heard,
+            HV.cnt.stack, HV.cnt.slot, HV.cnt.none, HV.cnt.miss, HV.cnt.wait, HV.cnt.late)
+        .. " | " .. PW.list.status_line()
 end
 
 -- main.lua: world.register_commands(add), next to savecheck.register_commands(add).

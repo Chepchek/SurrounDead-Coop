@@ -55,7 +55,7 @@ local FN_SPAWN = "/Script/Engine.GameplayStatics:SpawnSoundAtLocation"
 local MAX_PER_S = 10
 
 local S
-local hooked = false
+local hooked = { guard = false, relay = false, described = false }
 local list_raw, list = nil, {}
 local paths = {}            -- asset name -> full object path (learned from the own play)
 local window, window_n = 0, 0
@@ -74,12 +74,7 @@ local function dbg(k, n, fmt, ...)
     if dbg_n[k] <= n then log.debug(fmt, ...) end
 end
 
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
+local get = ue.param
 
 local function coop() return S ~= nil and (S.role == "host" or S.role == "client") end
 local function guard_on() return cfg.get("sound_range_guard") ~= false end
@@ -281,6 +276,9 @@ local function names()
     return list
 end
 
+-- Any sound listed in relay_sounds (else OSND has nothing to do).
+local function relay_on() return next(names()) ~= nil end
+
 -- Another player's character within `range` of `at`? On a client: the copies
 -- it has (a player without one is beyond the 150 m net range anyway).
 local function anyone_near(at, range)
@@ -296,6 +294,7 @@ end
 local function on_play(wco_p, sound_p, vol_p, pitch_p)
     if not S or (S.role ~= "host" and S.role ~= "client") then return end
     if S.role == "host" and #(S.remote_pcs or {}) == 0 then return end
+    if not relay_on() then return end
     local s = sound_p and sound_p:get()
     if not ue.valid(s) then return end
     local sname = ue.try(function() return s:GetFName():ToString() end)
@@ -451,26 +450,35 @@ local function describe()
         tostring(guard_on()), listed, DEFAULT_ATT, r(DEFAULT_ATT))
 end
 
+-- PlaySoundAtLocation / SpawnSoundAtLocation(WorldContext, Sound, Location,
+-- Rotation, Volume, Pitch, StartTime, AttenuationSettings, ...), pre:
+-- subscribers of sdc_ue.hook_native (each in its own pcall there), only for
+-- what is on: the guard (sound_range_guard) on both, the OSND relay (sounds
+-- listed in relay_sounds) on PlaySoundAtLocation. A subscriber stays once in
+-- (sdc_ue keeps it); turned off later, it returns at once.
+local function guard_play(_, wco, sound, _, _, _, _, _, att) guard("PlaySoundAtLocation", wco, sound, att) end
+local function guard_spawn(_, wco, sound, _, _, _, _, _, att) guard("SpawnSoundAtLocation", wco, sound, att) end
+local function relay_play(_, wco, sound, _, _, vol, pitch) on_play(wco, sound, vol, pitch) end
+
+local function subscribe(path, key, fn, what)
+    local ok, err = ue.hook_native(path, key, fn)
+    log.info("ownsounds: %s hook (%s) %s%s", path:match(":([%w_]+)$") or path, what, ok and "ok" or "FAILED ",
+        ok and "" or tostring(err))
+    return true
+end
+
 function M.tick()
-    if hooked or not S or (S.role ~= "host" and S.role ~= "client") then return end
-    -- PlaySoundAtLocation / SpawnSoundAtLocation(WorldContext, Sound, Location,
-    -- Rotation, Volume, Pitch, StartTime, AttenuationSettings, ...)
-    local ok, err = ue.hook_native(FN, "ownsounds", function(_, wco, sound, _, _, vol, pitch, _, att)
-        if not S or (S.role ~= "host" and S.role ~= "client") then return end
-        local okg, eg = pcall(guard, "PlaySoundAtLocation", wco, sound, att)
-        if not okg then log.err_throttled("ownsounds.guard", "ownsounds: guard: %s", tostring(eg)) end
-        local okc, e = pcall(on_play, wco, sound, vol, pitch)
-        if not okc then log.err_throttled("ownsounds.hook", "ownsounds: hook: %s", tostring(e)) end
-    end)
-    local ok2, err2 = ue.hook_native(FN_SPAWN, "ownsounds", function(_, wco, sound, _, _, _, _, _, att)
-        if not S or (S.role ~= "host" and S.role ~= "client") then return end
-        local okg, eg = pcall(guard, "SpawnSoundAtLocation", wco, sound, att)
-        if not okg then log.err_throttled("ownsounds.guard", "ownsounds: guard: %s", tostring(eg)) end
-    end)
-    hooked = true
-    log.info("ownsounds: PlaySoundAtLocation hook %s%s, SpawnSoundAtLocation hook %s%s", ok and "ok" or "FAILED ",
-        ok and "" or tostring(err), ok2 and "ok" or "FAILED ", ok2 and "" or tostring(err2))
-    describe()
+    if not S or (S.role ~= "host" and S.role ~= "client") then return end
+    local g, r = guard_on(), relay_on()
+    if g and not hooked.guard then
+        hooked.guard = subscribe(FN, "ownsounds.guard", guard_play, "sound range guard")
+        subscribe(FN_SPAWN, "ownsounds.guard", guard_spawn, "sound range guard")
+    end
+    if r and not hooked.relay then hooked.relay = subscribe(FN, "ownsounds.relay", relay_play, "OSND relay") end
+    if not hooked.described then   -- the sound relays of every module, once in co-op
+        hooked.described = true
+        describe()
+    end
 end
 
 -- World change: sound and attenuation objects of the old world may go.

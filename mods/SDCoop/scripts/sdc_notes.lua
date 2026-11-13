@@ -52,11 +52,16 @@
 --          A notice the host's screen showed for a client's action is taken
 --          off it and sent to that client: raised inside that client's
 --          BP_JigComponent.SERVER_ForwardInteract on the object it used, inside
---          BP_Infestation.Damage_Object with that client as the causer, or
---          inside M.for_player(pc, fn) (a module running the game's function
---          for that player).
+--          its SERVER_RequestMoveItemToAnotherComp on the container it moved
+--          an item into or out of (the battery charger's "Generator needed to
+--          charge battery"), inside BP_Infestation.Damage_Object with that
+--          client as the causer, or inside M.for_player(pc, fn) (a module
+--          running the game's function for that player).
 --          BP_PlayerCharacter.CreateNotificationUI (post) of a client's
 --          character: sent to that client.
+--          Diagnostics only: a bite on the host's copy of a client's fishing
+--          rod (each machine rolls its own bite timer; the host's copy ends
+--          that player's fishing if the bite is not reeled in) is logged.
 --   client NOTE: the game's own CreateNotificationUI on the own controller
 --          (text, icon if it is in memory - never loaded -, colour, delay),
 --          HOLD_S later and only if this screen did not show the same text
@@ -85,13 +90,14 @@ local ctx = require("sdc_ctx")
 
 local M = {
     stats = { relayed = 0, got = 0, shown = 0, deduped = 0, throttled = 0, skipped = 0, taken_off = 0,
-              kept = 0, quieted = 0 },
+              kept = 0, quieted = 0, moved = 0, fish_bites = 0 },
 }
 
 local P = {
     gfl = "/Game/Blueprints/GameFunctionLibrary.GameFunctionLibrary_C:CreateNotificationUI",
     char = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:CreateNotificationUI",
     forward = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_ForwardInteract",
+    move = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestMoveItemToAnotherComp",
     infest = "/Game/Infestation/BP_Infestation.BP_Infestation_C:Damage_Object",
     gfl_cdo = "/Game/Blueprints/GameFunctionLibrary.Default__GameFunctionLibrary_C",
 }
@@ -126,6 +132,8 @@ local OWN_CLASSES = {
 M.OWN_CLASSES = OWN_CLASSES
 -- the infestation's lock note (BP_Infestation @7946, forced)
 local NEST_NOTE = "Secondary Infestations Not Destroyed In Surrounding Area."
+-- FishingComponent @3916: the bite (Event_Fish?, a random timer each machine runs for each rod)
+local FISH_BITE = "You feel a tug on the line"
 
 local S = nil
 local st = {
@@ -241,13 +249,20 @@ local function shown_here(text, delay, force)
     local now = clock()
     local r = st.recent[text]
     local fresh = force or not r or now >= r.till
-    st.recent[text] = { t = now, till = now + (tonumber(delay) or 2) + 1 }
+    st.recent[text] = { t = now, till = now + (tonumber(delay) or 2) + 1, fresh = fresh }
     return fresh
 end
 
 local function seen_within(text, s)
     local r = st.recent[text]
     return r ~= nil and clock() - r.t <= s
+end
+
+-- True when this screen showed `text` within `s` seconds and the game really
+-- added a widget for it then (sdc_shower: take off only a note that call added).
+function M.shown_fresh(text, s)
+    local r = st.recent[text]
+    return r ~= nil and r.fresh == true and clock() - r.t <= (tonumber(s) or 0.25)
 end
 
 -- Host: a notice the host's own screen showed (nobody else's), for modules
@@ -533,6 +548,16 @@ local function on_note(_, msg_p, icon_p, col_p, delay_p, force_p, wco_p)
         if reason then
             M.stats.skipped = M.stats.skipped + 1
             log.debug("notes: '%s' (%s) for %s not sent: %s", line(n.text), n.cls, ue.short(pc), reason)
+            if n.text == FISH_BITE and n.cls:find("FishingComponent", 1, true) then
+                -- (diagnostics, nothing changed) MC_CastRod starts a bite timer on
+                -- every machine; a bite of the host's copy that player does not
+                -- reel in within 1-3 s runs Svr_StopFishing here, and its
+                -- fishing ends on every machine with "You didn't catch anything"
+                M.stats.fish_bites = M.stats.fish_bites + 1
+                say("fish|" .. tostring(addr_of(pc)), "notes: %s's fishing rod got a bite on the HOST's copy (its own random "
+                    .. "timer, not shown to that player): unless it reels in within 1-3 s, the host's copy ends its "
+                    .. "fishing ('You didn't catch anything')", pc_name(pc))
+            end
             return
         end
         relay(pc, n, how == "scope" and "a scope named that player" or "that player's own object")
@@ -629,11 +654,38 @@ local function on_nest_hit(c, _, causer_p, inst_p)
     claim_pending(addr_of(nest), pc, "its hit on the nest", NEST_NOTE)
 end
 
+-- BP_JigComponent.SERVER_RequestMoveItemToAnotherComp(From, To, ...) (post,
+-- host): a player moved an item between its inventory and a container; the
+-- server's "Handle Comp to Comp Move" ran the container's own callbacks in
+-- this very call (Buildable_BatteryCharger.JigMP_OnMainContainerItemAdded
+-- @134 "Generator needed to charge battery", `self` = the charger). The
+-- build scope gives such a notice to the client only while the charger's
+-- CurrentActor is that client; otherwise it was shown on the host's screen
+-- (notifications.md #27): claimed here for the player who moved the item.
+local function comp_owner(p)
+    local comp = pget(p)
+    if not ue.valid(comp) then return nil end
+    return ue.try(function() return comp:GetOwner() end)
+end
+
+local function on_move(c, from_p, to_p)
+    if role() ~= "host" or #st.pending == 0 then return end
+    local comp = pget(c)
+    local e = ue.valid(comp) and ctx.player_for(comp) or nil
+    if not e or not remote_pc(e.pc) then return end
+    local n = claim_pending(addr_of(comp_owner(to_p)), e.pc, "its item moved into that container")
+    n = n + claim_pending(addr_of(comp_owner(from_p)), e.pc, "its item taken out of that container")
+    M.stats.moved = M.stats.moved + n
+end
+
+-- { function path, callback, name, host only }: the host-only ones are
+-- registered once this machine is the host (a client never needs them).
 local HOOKS = {
     { P.gfl, on_note, "notes" },
-    { P.char, on_char_note, "char" },
-    { P.forward, on_forward, "forward" },
-    { P.infest, on_nest_hit, "nest" },
+    { P.char, on_char_note, "char", true },
+    { P.forward, on_forward, "forward", true },
+    { P.infest, on_nest_hit, "nest", true },
+    { P.move, on_move, "move", true },
 }
 
 local function safe(name, fn)
@@ -649,8 +701,9 @@ function M.try_hooks(force)
     local now = clock()
     if not force and now - st.hook_at < HOOK_RETRY_S then return end
     st.hook_at = now
+    local host = role() == "host"
     for _, h in ipairs(HOOKS) do
-        if not st.hooks[h[3]] and ue.find_object(h[1]) then
+        if not st.hooks[h[3]] and (host or not h[4]) and ue.find_object(h[1]) then
             local ok, err = pcall(RegisterHook, h[1], safe(h[3], h[2]))
             st.hooks[h[3]] = ok
             if ok then
@@ -770,12 +823,13 @@ end
 -- 1 s tick (main.lua): hooks, role change, table pruning.
 function M.tick()
     local r = role()
-    if r ~= st.role then
+    local changed = r ~= st.role
+    if changed then
         if st.role ~= nil then M.reset("role " .. tostring(st.role) .. " -> " .. tostring(r)) end
         st.role = r
     end
     if r ~= "host" and r ~= "client" then return end
-    M.try_hooks(false)
+    M.try_hooks(changed)
     local now = clock()
     for k, v in pairs(st.recent) do if now - v.t > 30 then st.recent[k] = nil end end
     for k, t in pairs(st.sent) do if now - t > 60 then st.sent[k] = nil end end
@@ -790,8 +844,8 @@ end
 
 function M.status_line()
     local s = M.stats
-    return string.format("notes relayed=%d skipped=%d throttled=%d taken_off=%d kept=%d quieted=%d got=%d shown=%d deduped=%d hooks=%s",
-        s.relayed, s.skipped, s.throttled, s.taken_off, s.kept, s.quieted, s.got, s.shown, s.deduped,
+    return string.format("notes relayed=%d skipped=%d throttled=%d taken_off=%d kept=%d quieted=%d got=%d shown=%d deduped=%d moved=%d host-copy bites=%d hooks=%s",
+        s.relayed, s.skipped, s.throttled, s.taken_off, s.kept, s.quieted, s.got, s.shown, s.deduped, s.moved, s.fish_bites,
         (function()
             local t = {}
             for _, h in ipairs(HOOKS) do t[#t + 1] = h[3] .. (st.hooks[h[3]] and "+" or "-") end
@@ -816,6 +870,6 @@ end
 
 -- tests
 M._t = { on_note = on_note, on_char_note = on_char_note, on_forward = on_forward, on_nest_hit = on_nest_hit,
-         on_note_msg = on_note_msg, set_state = function(s) S = s end, HOLD_S = HOLD_S, DEDUP_S = DEDUP_S }
+         on_move = on_move, on_note_msg = on_note_msg, set_state = function(s) S = s end, HOLD_S = HOLD_S, DEDUP_S = DEDUP_S }
 
 return M

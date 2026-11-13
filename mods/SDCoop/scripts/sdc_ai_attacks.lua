@@ -12,7 +12,7 @@
 -- Nothing of that replicates (no root motion), so a client's copy just slides.
 --
 -- Host: post-hooks on PlayAttackMontage and the hit event read the zombie's
--- GetCurrentMontage (the one just started); a post-hook on the proxy factory
+-- GetCurrentMontage (the one just started); a pre-hook on the proxy factory
 -- takes the montage from its parameters. The montage goes to every client
 -- whose pawn is within ~160 m (the zombie's net range) as AIM|kind|rate|path,
 -- followed by the zombie itself through ClientRepObjRef (sdc_ai core): the
@@ -128,30 +128,12 @@ local function forward(z, montage, rate, kind)
     end
 end
 
-local function current_montage(z)
-    local m = ue.try(function() return z:GetCurrentMontage() end)
-    if ue.valid(m) then return m end
-    return nil
-end
-
 -- BP_MasterZombie.PlayAttackMontage, post (host)
 local function on_attack(c)
     if not core.host.active then return end
     local z = c:get()
     if not ue.valid(z) then return end
-    forward(z, current_montage(z), 1.0, "a")
-end
-
--- The montage `z` plays if this call started it (position <= FRESH_S), or nil
--- (none, or an attack already running).
-local function fresh_montage(z)
-    local m = current_montage(z)
-    if not m then return nil end
-    local mesh = ue.prop(z, "Mesh")
-    local anim = ue.valid(mesh) and ue.try(function() return mesh:GetAnimInstance() end) or nil
-    local pos = anim and ue.try(function() return anim:Montage_GetPosition(m) end)
-    if type(pos) == "number" and pos > FRESH_S then return nil end
-    return m
+    forward(z, core.current_montage(z), 1.0, "a")
 end
 
 -- BP_ZombieBoss.MeleeAttack, post (host): the montage this call started
@@ -159,13 +141,31 @@ local function on_boss_melee(c)
     if not core.host.active then return end
     local z = c:get()
     if not ue.valid(z) then return end
-    local m = fresh_montage(z)
+    -- the montage this call started (position <= FRESH_S), not one already running
+    local m = core.fresh_montage(z, FRESH_S)
     if m then forward(z, m, 1.0, "a") end
 end
 
 -- an animal montage the engine replicates itself (root motion)
 local function engine_replicated(a)
     return ue.try(function() return a:IsPlayingNetworkedRootMotionMontage() end) == true
+end
+
+-- Does montage `m` move by root motion (the engine then replicates it to the
+-- clients itself)? Its first segment's sequence's bEnableRootMotion, cached by
+-- path; nil when that cannot be read.
+local root_motion = {}        -- [montage path] = true | false
+local function m_first_sequence(m) return m.SlotAnimTracks[1].AnimTrack.AnimSegments[1].AnimReference end
+local function montage_root_motion(m)
+    local path = ue.path(m)
+    local v = root_motion[path]
+    if v ~= nil then return v end
+    local ok, seq = pcall(m_first_sequence, m)
+    if not ok or not ue.valid(seq) then return nil end
+    v = ue.prop(seq, "bEnableRootMotion")
+    if type(v) ~= "boolean" then return nil end
+    root_motion[path] = v
+    return v
 end
 
 -- <Wolf / Bear>.AttackPlayer, post (host): the bite / claw this call started.
@@ -175,7 +175,7 @@ local function on_animal_attack(c)
     if not core.host.active then return end
     local a = c:get()
     if not ue.valid(a) or ue.prop(a, "IsDead?") == true then return end
-    local m = fresh_montage(a)
+    local m = core.fresh_montage(a, FRESH_S)
     if not m or engine_replicated(a) then return end
     local key = tostring(addr(a)) .. "|attack"
     local now = clock()
@@ -189,15 +189,17 @@ local function on_hit(c)
     if not core.host.active then return end
     local z = c:get()
     if not ue.valid(z) then return end
-    local m = current_montage(z)
+    local m = core.current_montage(z)
     local hit = ue.prop(z, "HitAnimation")
     if m and ue.valid(hit) and addr(m) == addr(hit) then forward(z, m, 1.0, "h") end
 end
 
 -- PlayMontageCallbackProxy.CreateProxyObjectForPlayMontage(Mesh, Montage,
 -- PlayRate, StartingPosition, StartingSection, bShouldStopAllMontages) -> proxy,
--- post (host): (context, return value, params...)
-local function on_proxy(_, _, mesh_p, montage_p, rate_p)
+-- pre (host): (context, params...). The montage and rate come from the
+-- parameters, so the call does not have to have run: one shared pre-only
+-- engine hook (sdc_ue.hook_native) with sdc_combat and sdc_throw.
+local function on_proxy(_, mesh_p, montage_p, rate_p)
     if not core.host.active or #core.host.viewers == 0 then return end
     local mesh = mesh_p and mesh_p:get()
     if not ue.valid(mesh) then return end
@@ -205,7 +207,13 @@ local function on_proxy(_, _, mesh_p, montage_p, rate_p)
     if not ue.valid(z) or not (core.is_zombie(z) or core.is_boss(z) or core.is_animal(z)) then return end
     local m = montage_p and montage_p:get()
     if not ue.valid(m) then return end
-    if core.is_animal(z) and engine_replicated(z) then return end
+    if core.is_animal(z) then
+        -- before the call the animal does not play `m` yet: the montage asset
+        -- says whether it will be networked root motion (else, as a fallback,
+        -- whether the animal plays such a montage now)
+        local rm = montage_root_motion(m)
+        if rm == true or (rm == nil and engine_replicated(z)) then return end
+    end
     forward(z, m, rate_p and rate_p:get() or 1.0, "o")
 end
 
@@ -266,9 +274,8 @@ local function play(z, d)
         local busy = ue.try(function() return anim:Montage_IsPlaying(montage) end) == true
         if busy or (p and p.path == d.path and now - p.t < p.len) then
             M.stats.kept = M.stats.kept + 1
-            if core.first("attacks.kept", 3) then
-                log.info("ai: attacks: %s already plays %s; not restarted", ue.short(z), ue.short(montage))
-            end
+            local say = core.line("attacks.kept", 3)
+            if say then say("ai: attacks: %s already plays %s; not restarted", ue.short(z), ue.short(montage)) end
             return
         end
     end
@@ -276,9 +283,8 @@ local function play(z, d)
     if d.kind ~= "h" then playing[key] = { path = d.path, t = now, len = play_len(montage, d.rate) * LEN_SHARE } end
     M.stats.played = M.stats.played + 1
     if d.kind == "a" then play_attack_sound(z) end
-    if core.first(core.is_animal(z) and "attacks.played.animal" or "attacks.played", 3) then
-        log.info("ai: attacks: played %s (%s) on %s", ue.short(montage), d.kind, ue.short(z))
-    end
+    local say = core.line(core.is_animal(z) and "attacks.played.animal" or "attacks.played", 3)
+    if say then say("ai: attacks: played %s (%s) on %s", ue.short(montage), d.kind, ue.short(z)) end
 end
 
 -- AnimNotify_BeginEvent.Received_NotifyBegin(MeshComp, ...), post (client):
@@ -293,9 +299,8 @@ local function on_notify_begin(c, mesh_p)
     local ksl = ue.ksl()
     if ksl and pcall(function() ksl:K2_ClearTimer(z, name) end) then
         M.stats.traces_cleared = M.stats.traces_cleared + 1
-        if core.first(core.is_animal(z) and "attacks.trace.animal" or "attacks.trace", 2) then
-            log.info("ai: attacks: %s timer on %s cleared (the host applies the hit)", name, ue.short(z))
-        end
+        local say = core.line(core.is_animal(z) and "attacks.trace.animal" or "attacks.trace", 2)
+        if say then say("ai: attacks: %s timer on %s cleared (the host applies the hit)", name, ue.short(z)) end
     end
 end
 
@@ -315,7 +320,7 @@ function M.init(c)
         core.hook({ path = path .. ":AttackPlayer", kind = "bp", role = "host", feature = "attacks",
                     name = "attacks." .. short, fn = on_animal_attack })
     end
-    core.hook({ path = PROXY_FN, kind = "post", role = "host", feature = "attacks", name = "attacks.proxy", fn = on_proxy })
+    core.hook({ path = PROXY_FN, kind = "pre", role = "host", feature = "attacks", name = "attacks.proxy", fn = on_proxy })
     core.hook({ path = NOTIFY_BEGIN, kind = "bp", role = "client", feature = "attacks", name = "attacks.notify",
                 fn = on_notify_begin })
     core.on_obj("montage", "attacks", play)

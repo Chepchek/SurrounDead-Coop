@@ -139,8 +139,9 @@ hooks["/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C
 assert(painted == "Jig.PlayerSlot.MeleeWeapon", "hotbar not repainted on event")
 print("hotbar: ok")
 
--- host module state
+-- host module state (a client connected: sdc_gearfx waits for one)
 S.role = "host"
+S.remote_pcs = { { __name = "ClientPC" } }
 gearfx.host_tick()
 local hs = hooks["/Game/JigSInventory/Jigsaw/Pickup/BP_JigPickupComponent.BP_JigPickupComponent_C:SERVER_UpdateAttachmentState"]
 local processed = 0

@@ -44,6 +44,18 @@
 -- without a real place; the client keeps the last real place of a box,
 -- ignores DBOXGONE at (0, 0, 0) and removes the marker of one box only - the
 -- nearest one, a box whose copy here has already gone first.
+--
+-- A client's copy that comes into range lies where the host has it (section
+-- FL below; 2026-11-13: a copy made again after the player came back sank
+-- under the ground at once - the box "vanished" for that player).
+--
+-- Death boxes saved with the world (config deathbox_persist, section BS
+-- below): the game saves no Container_DeadPlayerLoot, so a restart or a load
+-- lost the things of whoever had died - in co-op a client's too, whose
+-- record (sdc_persist) says "dead, the items are in the box". The host's
+-- saves now hold the boxes (<slot>_SDCoop_boxes.json + _box<gen>_<n>.sav,
+-- kept only for a save the game reports done) and a load of a save puts
+-- them back the game's own way.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -81,6 +93,11 @@ local EMPTY_GRACE_S = 2.0   -- host: empty this long before it goes
 local LEFT_SHOWN = 3        -- host: at most this many items left are listed in the log
 local MARKER_REACH = 400    -- cm: a marker of a box this close to the removed one is that box's
 local NIL_GUID = "0:0:0:0"
+
+-- the boxes saved with the world (section BS below; one table, its functions are fields)
+local BS = { LOAD_WAIT_S = 3, LOAD_GIVE_UP_S = 180, MAX = 64, SAVE_END_S = 60,
+             hooks = {}, pending = nil, save_due = false, pend = nil, early = nil,
+             stats = { saved = 0, restored = 0, removed = 0, failed = 0, dropped = 0 } }
 
 local function on() return cfg.get("deathbox_remove_empty") ~= false end
 
@@ -125,9 +142,7 @@ local function boxes()
         watch_tried = true
         pcall(ue.watch_new, CLASS, CLASS_PATH)
     end
-    local find = ue.find_all_recent or ue.find_all
-    local ok, list = false, nil
-    if type(find) == "function" then ok, list = pcall(find, CLASS, LIST_TTL) end
+    local ok, list = pcall(ue.find_all_recent, CLASS, LIST_TTL)
     local out = {}
     for _, b in ipairs((ok and type(list) == "table") and list or {}) do
         if ue.valid(b) and ue.class_name(b) == CLASS then out[#out + 1] = b end
@@ -345,6 +360,8 @@ function M.host_tick()
     if now - check_at < CHECK_S then return end
     check_at = now
     M.stats.checks = M.stats.checks + 1
+    if not (BS.hooks.save and BS.hooks.load and BS.hooks.saved) then pcall(BS.install) end
+    M.floor_install()
     for _, b in ipairs(boxes()) do
         local ok, err = pcall(check_box, b, now)
         if not ok then log.err_throttled("deathbox.check", "deathbox: check of %s: %s", ue.short(b), tostring(err)) end
@@ -361,31 +378,56 @@ end
 -- Client
 -- ===========================================================================
 
-local track = {}   -- [box address] = { name, loc, marker } boxes seen here (their markers)
+-- Boxes seen here and their markers: [box address] = { name, path, loc,
+-- mpath }. Names and paths only - no engine object is kept between ticks:
+-- up to 0.7.3 the box and marker wrappers were kept for good (one could
+-- alias another actor after the garbage collector), and the entry of a new
+-- box at a reused address kept the old box's marker, which DBOXGONE then
+-- destroyed. The box and its marker are looked up again by path, and must
+-- still have their name / class.
+local track = {}
 local track_at = -100
+local MARKER_CLASS = "BP_Marker_C"
+
+-- The tracked box, still the same one, or nil.
+local function box_of(e)
+    local b = e.path and ue.find_object(e.path)
+    if b and ue.short(b) == e.name and ue.class_name(b) == CLASS then return b end
+    return nil
+end
+
+-- Its death marker, or nil.
+local function marker_of(e)
+    local m = e.mpath and ue.find_object(e.mpath)
+    if m and ue.class_name(m) == MARKER_CLASS then return m end
+    return nil
+end
 
 function M.client_tick()
     if S == nil or S.role ~= "client" then return end
     local now = os.clock()
     if now - track_at < 2 then return end
     track_at = now
+    M.floor_install()
     for _, b in ipairs(boxes()) do
         local k = addr(b)
         if k then
-            local e = track[k] or { name = ue.short(b) }
-            e.box = b
+            local name = ue.short(b)
+            local e = track[k]
+            -- another box at a reused address: a new entry (the old one's marker is not this box's)
+            if not e or e.name ~= name then e = { name = name, path = ue.path(b) } end
             -- a copy out of network range (or being destroyed) reads (0, 0, 0):
             -- keep its last real place
             e.loc = real_loc(ue.location(b)) or e.loc
             local m = ue.prop(b, "DeathMarker")
-            if ue.valid(m) then e.marker = m end
+            if ue.valid(m) and ue.class_name(m) == MARKER_CLASS then e.mpath = ue.path(m) end
             track[k] = e
         end
     end
     -- a box out of reach is gone here but may come back: its marker is kept
     -- until the host says the box is gone (or the marker's own life span ends)
     for k, e in pairs(track) do
-        if not ue.valid(e.box) and not ue.valid(e.marker) then track[k] = nil end
+        if not box_of(e) and not marker_of(e) then track[k] = nil end
     end
 end
 
@@ -404,7 +446,8 @@ local function on_gone(f)
     for k, e in pairs(track) do
         local d = e.loc and dist2(e.loc, at) or math.huge
         if d <= MARKER_REACH * MARKER_REACH then
-            local standing = ue.valid(e.box) and real_loc(ue.location(e.box)) ~= nil
+            local b = box_of(e)
+            local standing = b ~= nil and real_loc(ue.location(b)) ~= nil
             local rank = (standing and 1 or 0) * 1e15 + d
             if best_rank == nil or rank < best_rank then best, best_k, best_rank = e, k, rank end
         end
@@ -412,7 +455,7 @@ local function on_gone(f)
     local removed, here = 0, nil
     if best then
         here = best.name
-        if remove_marker(best.marker) then removed = 1 end
+        if remove_marker(marker_of(best)) then removed = 1 end
         track[best_k] = nil
     end
     M.stats.markers = M.stats.markers + removed
@@ -422,18 +465,710 @@ local function on_gone(f)
 end
 
 -- ===========================================================================
+-- Client: a box copy that comes into range lies where the host has it
+-- ===========================================================================
+-- 2026-11-13 (logs dbox_1113_1901): the host died, a client opened the
+-- host's box (189 items), drove 190 m away and came back: the box was gone
+-- for it, while the host still had it (no destroy, no DBOXGONE). The box is
+-- spawned with no owner (BP_PlayerCharacter.SpawnDeadPlayerLoot @527, Owner
+-- None) and its class sets only bReplicates: the engine's default range,
+-- 150 m. Out of it the client's copy is closed; back in range a new copy is
+-- made (18:59:48, the same second as the new copies of the boss and zombie
+-- corpses there). Every copy runs the box's BeginPlay, which starts the
+-- looping timer "TraceForFloor" (every 0.01 s, @1083): a trace 1 cm down from
+-- the mesh (WorldStatic / WorldDynamic) and, while it hits nothing, the box
+-- 1 cm lower (TraceForFloor @0-847). The copy made at the death comes in at
+-- the body's chest and falls onto the ground. A later copy comes in where the
+-- host's box lies - on the ground, its place rounded to 0.1 cm by the
+-- engine's spawn packet: rounded down, the 1-cm trace starts under the
+-- surface, never crosses it, and the copy sinks 1 m/s for good (the client
+-- stood at the spot from 18:59:58 and looted the boss next to it, not the
+-- box). The same for the client's own box after a far respawn and for boxes
+-- put back from a save (BS.spawn).
+-- Now, on every machine with a replicated copy (a post-hook on the box's
+-- ReceiveBeginPlay): a copy whose floor trace runs is lifted LIFT cm, so the
+-- game's own trace meets the ground from above and sets it down where the
+-- host has it. It is watched for a few seconds: a copy that still falls
+-- DROP_MAX cm below where it came in (no ground for that trace under it) gets
+-- its trace stopped and is put on the ground found below that place (a trace
+-- of the same object types), else back where it came in. Each copy's outcome
+-- is one log line. Kept: names, paths and places (no engine object).
+local FL = { LIFT = 5, DROP_MAX = 300, STEP_MS = 500, CHECKS = 16, UP = 50, DOWN = 20000, TRY_S = 5,
+             FN = "/Game/Inventory/Containers/Container_DeadPlayerLoot.Container_DeadPlayerLoot_C:ReceiveBeginPlay",
+             TIMER = "TraceForFloor", NO_COLOR = { R = 0, G = 0, B = 0, A = 0 },
+             hooked = false, gave_up = false, tried_at = -100,
+             stats = { came = 0, lifted = 0, set_down = 0, sank = 0 } }
+
+-- The game's floor trace still runs on this box: true / false; nil = unknown.
+function FL.trace_on(box)
+    local ksl = ue.ksl and ue.ksl()
+    if not ksl then return nil end
+    local ok, v = pcall(function() return ksl:K2_IsTimerActive(box, FL.TIMER) end)
+    if ok and type(v) == "boolean" then return v end
+    return nil
+end
+
+-- The ground below `at` (the object types of the box's own trace), or nil.
+function FL.ground(box, at)
+    local ksl = ue.ksl and ue.ksl()
+    if not ksl then return nil end
+    local hit = {}
+    local from = { X = at.X, Y = at.Y, Z = at.Z + FL.UP }
+    local to = { X = at.X, Y = at.Y, Z = at.Z - FL.DOWN }
+    local ok, blocked = pcall(function()
+        return ksl:LineTraceSingleForObjects(box, from, to, { 0, 1 }, false, { box }, 0, hit, true, FL.NO_COLOR,
+            FL.NO_COLOR, 0.0)
+    end)
+    if not ok or blocked ~= true then return nil end
+    return real_loc(ue.vec(hit.ImpactPoint) or ue.vec(hit.Location))
+end
+
+local function where(l) return string.format("(%.0f, %.0f, %.0f)", l.X, l.Y, l.Z) end
+
+-- A replicated copy came in (the hook below, after the box's BeginPlay).
+function FL.came(box)
+    if S == nil or S.role == "host" or not ue.valid(box) then return end
+    if ue.role(box) ~= ue.ROLE_SIMULATED then return end   -- the host's own box, single player
+    local at = real_loc(ue.location(box))
+    if not at then return end
+    FL.stats.came = FL.stats.came + 1
+    local e = { name = ue.short(box), path = ue.path(box), at = { X = at.X, Y = at.Y, Z = at.Z }, lifted = false }
+    local me = ue.local_pawn and ue.try(ue.local_pawn)
+    local ml = me and real_loc(ue.location(me))
+    if ml then e.far = math.sqrt(dist2(ml, at)) / 100 end
+    if FL.trace_on(box) == true and ue.teleport(box, { X = at.X, Y = at.Y, Z = at.Z + FL.LIFT }) then
+        e.lifted = true
+        FL.stats.lifted = FL.stats.lifted + 1
+    end
+    ue.delay("deathbox-floor", FL.STEP_MS, function() FL.watch(e, 1) end)
+end
+
+-- Check n of a copy that came in: set down, still falling, or sunk.
+function FL.watch(e, n)
+    local box = box_of(e)
+    local loc = box and real_loc(ue.location(box))
+    if not loc then return end   -- out of range again, or removed
+    local on = FL.trace_on(box)
+    local drop = e.at.Z - loc.Z
+    local came = string.format("deathbox: %s came into range here at %s%s%s", e.name, where(e.at),
+        e.far and string.format(", %.0f m from this player", e.far) or "",
+        e.lifted and string.format(" (lifted %d cm for the game's floor trace)", FL.LIFT) or "")
+    if on == false or (on == nil and drop <= FL.DROP_MAX and n >= FL.CHECKS) then
+        FL.stats.set_down = FL.stats.set_down + 1
+        log.info("%s: set down at z=%.0f, %d cm below where it came in%s", came, loc.Z, math.floor(drop + 0.5),
+            on == nil and " (its floor trace is not readable here)" or "")
+        return
+    end
+    if drop <= FL.DROP_MAX and n < FL.CHECKS then
+        ue.delay("deathbox-floor", FL.STEP_MS, function() FL.watch(e, n + 1) end)
+        return
+    end
+    -- still falling: the game's trace finds no ground under it here
+    local ksl = ue.ksl and ue.ksl()
+    if ksl then pcall(function() ksl:K2_ClearTimer(box, FL.TIMER) end) end
+    local g = FL.ground(box, e.at)
+    local moved = ue.teleport(box, { X = e.at.X, Y = e.at.Y, Z = (g or e.at).Z })
+    FL.stats.sank = FL.stats.sank + 1
+    log.info("%s: it went %.0f cm below that and still fell (no ground for the game's floor trace under it here):"
+        .. " trace stopped, %s%s", came, drop,
+        g and string.format("put on the ground found below that place (z=%.0f)", g.Z)
+            or "put back where it came in (no ground found below it)",
+        moved and "" or " - moving it FAILED")
+end
+
+-- The post-hook on the box's ReceiveBeginPlay, once its class is loaded
+-- (it is with BP_PlayerCharacter; tried from the ticks and at install).
+function FL.install()
+    if FL.hooked or FL.gave_up then return end
+    local now = os.clock()
+    if now - FL.tried_at < FL.TRY_S then return end
+    FL.tried_at = now
+    if not ue.find_object(FL.FN) then return end
+    local ok, err = pcall(RegisterHook, FL.FN, function(c)
+        local okc, e2 = pcall(function() FL.came(c and c:get()) end)
+        if not okc then log.err_throttled("deathbox.floor", "deathbox: a box copy came in: %s", tostring(e2)) end
+    end)
+    FL.hooked, FL.gave_up = ok == true, ok ~= true
+    local say = ok and log.info or log.warn
+    say("deathbox: box copy hook (Container_DeadPlayerLoot ReceiveBeginPlay: a copy that comes into range lies"
+        .. " where the host has it) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+end
+function M.floor_install() pcall(FL.install) end
+
+-- ===========================================================================
+-- Death boxes saved with the world (config deathbox_persist)
+-- ===========================================================================
+-- The game saves no Container_DeadPlayerLoot (no EMSActorSaveInterface; the
+-- single-player host's own box is not saved either): after a restart or the
+-- load of a save the dead player's things were gone - in co-op a client's
+-- box too, while its record (sdc_persist) says "dead, the items are in the
+-- box". And the main menu and the world are one level here (sdc_persist,
+-- CM.LOAD_FN): a load opens no new level, so a box from after the save may
+-- stand through a load of that save while the dead player's inventory went
+-- back to it (items twice). Here the boxes are part of the save, like the
+-- actors EMS saves:
+--   save   EMS AsyncSaveActors (every save of the game), on the host and in
+--          single player (a client's own saves go to a throwaway slot):
+--          50 ms later every box with items a player can reach is written
+--          the way sdc_persist writes an inventory (the game's own SaveGame
+--          of the Jig arrays, sdc_persist.files): <slot>_SDCoop_box<gen>_<n>.sav
+--          (gen: one number per list, so a new list never overwrites the
+--          files of the one in use). The list itself (<slot>_SDCoop_boxes.json:
+--          place, name, items, file) is put in place only once the game
+--          reports this save done (BP_PlayerController's OnCompleted, the
+--          signal sdc_persist commits the clients' records on); the list
+--          before stays as .bak, the files of the one before that go. The
+--          game reports it FAILED, does not report it within SAVE_END_S,
+--          the world closes first or a newer save starts: the new files go
+--          and the slot keeps its last list (2026-11-13: a failed save had
+--          rewritten the list, so a client back with the items of the last
+--          good save found the box from after it too - items twice). No end
+--          hook here: the list is put in place at once. A save with
+--          deathbox_persist off deletes the slot's list (an older one must
+--          not come back with it).
+--   load   EMS AsyncLoadActors (every load of a save; not a respawn): the
+--          boxes standing as the load starts are noted; once the world is up
+--          (in_menu false, LOAD_WAIT_S later), host or single player, those
+--          go - they are not in this save. A box that appeared after the
+--          load started (a death in those seconds) is not the save's to
+--          remove and stays (2026-11-13: it was removed with its items).
+--          persist_follow_host_save off on a host: nothing is removed or
+--          put back - the clients' records stay live then, and a box looted
+--          empty after the save would come back full to a client who kept
+--          the items (2026-11-13); the boxes behave as before this section.
+--          A slot without a list (a save from before this, or made with the
+--          setting off): nothing is removed or added. Then each saved box is
+--          spawned as BP_PlayerCharacter.SpawnDeadPlayerLoot does it
+--          (BeginDeferredActorSpawnFromClass, FinishSpawningActor,
+--          InitializeJigComponent, MainJigContainers / MainContainersIDs,
+--          MarkPropertyDirtyFromRepIndex 3, OnRep_MainContainersIDs) at its
+--          saved place. Its BeginPlay starts "TraceForFloor" (moves the box
+--          down every 10 ms until a line trace hits): cleared at once - the
+--          saved place is where it lay, and the ground far from the players
+--          may not be loaded yet. The box replicates to the clients; its
+--          BeginPlay makes the death marker on each machine, as the game's.
+--   delete EMS DeleteAllSaveDataForSlot: that slot's box files go.
+
+BS.SAVE_FN = "/Script/EasyMultiSave.EMSAsyncSaveGame:AsyncSaveActors"
+BS.LOAD_FN = "/Script/EasyMultiSave.EMSAsyncLoadGame:AsyncLoadActors"
+BS.DELETE_FN = "/Script/EasyMultiSave.EMSFunctionLibrary:DeleteAllSaveDataForSlot"
+BS.PUSH_LIB = "/Script/Engine.Default__NetPushModelHelpers"
+-- the game's "actors saved" / "could not save" (Blueprint; sdc_persist and
+-- sdc_savecheck hook the same two)
+BS.SAVED_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:OnCompleted_9CDBA9034C950D925C1539BE037C23EF"
+BS.FAILED_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:OnFailed_9CDBA9034C950D925C1539BE037C23EF"
+
+function BS.on() return cfg.get("deathbox_persist") ~= false end
+
+-- sdc_persist's files (the same SaveGame format and folder), or nil
+function BS.files()
+    local p = package.loaded["sdc_persist"]
+    if type(p) == "table" and type(p.files) == "table" and p.savegames_dir and p.json_encode then return p.files, p end
+    return nil
+end
+
+function BS.paths(slot)
+    local F, P = BS.files()
+    local dir = F and P.savegames_dir()
+    if not dir then return nil end
+    local base = dir .. F.safe_slot(slot) .. F.TAG .. "_boxes.json"
+    return base, base .. ".bak", base .. ".tmp"
+end
+
+-- One list file: the list, false when it is damaged, nil when there is none.
+function BS.doc_at(path)
+    local F, P = BS.files()
+    local data = F and path and F.read(path)
+    if not data then return nil end
+    local d = P.json_decode(data)
+    if type(d) == "table" and type(d.boxes) == "table" then return d end
+    return false
+end
+
+-- The slot's box list ({ gen, slot, saved_at, boxes = { { key, file, x, y,
+-- z, name, items, containers, what } } }), the previous copy if the main one
+-- is damaged, or nil.
+function BS.read(slot)
+    local main, bak = BS.paths(slot)
+    if not main then return nil end
+    for _, path in ipairs({ main, bak }) do
+        local d = BS.doc_at(path)
+        if d then return d end
+        if d == false then log.warn("deathbox: %s is damaged%s", path, path == main and ", trying the previous copy" or "") end
+    end
+    return nil
+end
+
+-- The file key of box i of a list (a list without gen, the first test
+-- builds of this: box<i>).
+function BS.key_of(doc, i, e)
+    return e.key or (doc.gen == nil and ("box" .. i) or nil)
+end
+
+-- The box files of list `doc`, except those a list in `...` still names.
+function BS.del_files(F, slot, doc, ...)
+    if type(doc) ~= "table" or type(doc.boxes) ~= "table" then return 0 end
+    local used = {}
+    for j = 1, select("#", ...) do
+        local k = select(j, ...)
+        if type(k) == "table" and type(k.boxes) == "table" then
+            for i, e in ipairs(k.boxes) do
+                local key = BS.key_of(k, i, e)
+                if key then used[key] = true end
+            end
+        end
+    end
+    local n = 0
+    for i, e in ipairs(doc.boxes) do
+        local key = BS.key_of(doc, i, e)
+        if key and not used[key] then
+            F.blob_delete(slot, key)
+            n = n + 1
+        end
+    end
+    return n
+end
+
+function BS.slot_ok(slot, F)
+    return type(slot) == "string" and slot ~= "" and slot ~= F.TEMP_SLOT
+end
+
+function BS.short_list(comp)
+    local r = M.scan(comp)
+    local names = {}
+    pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            c:get()[F_ITEMS]:ForEach(function(_, it)
+                if #names < 6 then names[#names + 1] = ue.try(function() return item_name(it:get()[F_INFO][F_ITEMID]) end) or "?" end
+            end)
+        end)
+    end)
+    return r, table.concat(names, ", ") .. (r.total > #names and ", ..." or "")
+end
+
+-- The slot's box files go (the game deleted the slot; or it was saved with
+-- deathbox_persist off: an older list must not come back with this save).
+function BS.drop(F, slot)
+    local main, bak, tmp = BS.paths(slot)
+    if not main then return nil end
+    local pd = BS.pend
+    if pd and pd.slot == slot then
+        BS.pend = nil
+        BS.del_files(F, slot, pd.doc)
+    end
+    if not (F.exists(main) or F.exists(bak)) then return nil end
+    local dm, db = BS.doc_at(main), BS.doc_at(bak)
+    BS.del_files(F, slot, dm)
+    BS.del_files(F, slot, db)
+    F.remove(main)
+    F.remove(bak)
+    F.remove(tmp)
+    return dm and #dm.boxes or 0
+end
+
+-- The game saves (50 ms after its AsyncSaveActors): the boxes into its
+-- slot, as the list that waits for the game's "actors saved" (BS.saved).
+function BS.save(why)
+    BS.save_due = false
+    -- the game's end of this save, when it came before this ran (used below;
+    -- never kept for a later save)
+    local early = BS.early
+    BS.early = nil
+    if S == nil or S.role == "client" then return end
+    local F, P = BS.files()
+    if not F then
+        if BS.on() then log.warn("deathbox: the game saved, but sdc_persist's files are not here: death boxes not saved") end
+        return
+    end
+    local slot = ue.ems_current_slot()
+    if not BS.slot_ok(slot, F) then return end
+    -- the save end hooks: BP_PlayerController's class is in memory now
+    -- (a save runs in it), in single player too
+    pcall(BS.install)
+    if not BS.on() then
+        local n = BS.drop(F, slot)
+        if n then log.info("deathbox: slot %s saved with deathbox_persist off: its older list of %d death box(es) deleted", slot, n) end
+        return
+    end
+    -- an older save the game has not reported done yet: this one replaces it
+    if BS.pend then BS.discard(BS.pend, "a newer save started before it was reported done", true) end
+    local old = BS.read(slot)
+    local gen = math.floor(tonumber(old and old.gen) or 0) + 1
+    local list, failed = {}, {}
+    for _, b in ipairs(boxes()) do
+        local name = ue.short(b)
+        local loc = real_loc(ue.location(b))
+        local comp = ue.prop(b, "BP_JigMultiplayer")
+        if #list < BS.MAX and loc and not gone[name] and ue.valid(comp) then
+            local okr, r, what = pcall(BS.short_list, comp)
+            if okr and r.visible > 0 then
+                local key = string.format("box%d_%d", gen, #list + 1)
+                local src = { conts = ue.prop(comp, "MainJigContainers"), uids = ue.prop(comp, "MainContainersIDs"),
+                              weights = ue.prop(comp, "InventoryWeight") or {} }
+                local info, err = F.blob_write(slot, key, src, nil, { x = loc.X, y = loc.Y, z = loc.Z })
+                if info then
+                    list[#list + 1] = { key = key, file = info.file, x = loc.X, y = loc.Y, z = loc.Z, name = name,
+                                        items = info.items, containers = info.containers, what = what }
+                else
+                    failed[#failed + 1] = name .. " (" .. tostring(err) .. ")"
+                end
+            end
+        end
+    end
+    local doc = { format = 2, gen = gen, slot = slot, saved_at = os.date("%Y-%m-%d %H:%M:%S"), why = why, boxes = list,
+                  note = "SDCoop: dead players' loot boxes of this save (the game saves none); restored when it is loaded" }
+    local pd = { slot = slot, doc = doc, failed = failed, old_n = old and #old.boxes or 0 }
+    BS.pend = pd
+    if not BS.hooks.saved_ok then
+        BS.saved(true, "the game's save end is not hooked here: the list is put in place at once")
+        return
+    end
+    if early and os.clock() - early.at <= 5 then
+        BS.saved(early.ok, early.note)
+        return
+    end
+    ue.delay("deathbox-save-end", BS.SAVE_END_S * 1000, function()
+        if BS.pend == pd then BS.saved(false, string.format("the game did not report it done within %d s", BS.SAVE_END_S)) end
+    end)
+end
+
+-- The game's save ended (its hooks, 50 ms later): the waiting list is put
+-- in place, or dropped. An end before BS.save ran is kept for it.
+function BS.saved(ok, note)
+    local pd = BS.pend
+    if not pd then
+        if BS.save_due then BS.early = { ok = ok, note = note, at = os.clock() } end
+        return
+    end
+    BS.pend = nil
+    if ok then BS.commit(pd, note) else BS.discard(pd, note) end
+end
+
+-- The list of a save the game reported done: written, the one before kept as
+-- .bak, the files of the one before that deleted.
+function BS.commit(pd, note)
+    local F, P = BS.files()
+    if not F then return end
+    local slot, doc = pd.slot, pd.doc
+    local main, bak, tmp = BS.paths(slot)
+    if not main then return end
+    local old_main, old_bak, had_main = BS.doc_at(main), BS.doc_at(bak), F.exists(main)
+    local ok, err = F.write(tmp, P.json_encode(doc) .. "\n")
+    if ok then ok, err = F.rotate(main, bak, tmp) end
+    if not ok then
+        BS.stats.failed = BS.stats.failed + 1
+        BS.del_files(F, slot, doc, old_main, old_bak)
+        log.err("deathbox: writing %s failed: %s (the slot keeps its last list)", tostring(main), tostring(err))
+        return
+    end
+    -- the main list became the .bak one: the .bak list before it is gone
+    if had_main and old_bak then BS.del_files(F, slot, old_bak, doc, old_main) end
+    BS.stats.saved = BS.stats.saved + #doc.boxes
+    local names = {}
+    for _, e in ipairs(doc.boxes) do names[#names + 1] = string.format("%s (%d item(s): %s)", e.name, e.items, e.what) end
+    if #doc.boxes > 0 or pd.old_n > 0 or #pd.failed > 0 then
+        log.info("deathbox: %d death box(es) saved with slot %s%s%s%s", #doc.boxes, slot,
+            #names > 0 and (": " .. table.concat(names, "; ")) or "",
+            #pd.failed > 0 and (" | NOT saved: " .. table.concat(pd.failed, "; ")) or "",
+            note and (" (" .. note .. ")") or "")
+    end
+end
+
+-- The list of a save that did not end well: its files go, the slot keeps
+-- its last list (the clients' records keep their last commit the same way).
+function BS.discard(pd, why, quiet)
+    local F = BS.files()
+    if not F then return end
+    local main, bak = BS.paths(pd.slot)
+    BS.del_files(F, pd.slot, pd.doc, BS.doc_at(main), BS.doc_at(bak))
+    BS.stats.dropped = BS.stats.dropped + 1
+    if quiet then
+        if #pd.doc.boxes > 0 then
+            log.info("deathbox: slot %s: %s: its list of %d death box(es) is replaced", pd.slot, tostring(why), #pd.doc.boxes)
+        end
+        return
+    end
+    log.warn("deathbox: the game's save of slot %s did not end well (%s): its list of %d death box(es) is NOT kept;"
+        .. " a load of that slot puts back the boxes of its last good save", pd.slot, tostring(why), #pd.doc.boxes)
+end
+
+-- A box of the world that is not in the save being loaded.
+function BS.remove(b)
+    local name = ue.short(b)
+    local loc = real_loc(ue.location(b))
+    local marker = ue.prop(b, "DeathMarker")
+    if not pcall(function() b:K2_DestroyActor() end) then return false end
+    gone[name] = os.clock()
+    remove_marker(marker)
+    if S and S.role == "host" and loc and #(S.remote_pcs or {}) > 0 then
+        net.broadcast(S.remote_pcs, "DBOXGONE", name, string.format("%.0f", loc.X), string.format("%.0f", loc.Y),
+            string.format("%.0f", loc.Z))
+    end
+    return true
+end
+
+function BS.class()
+    local cls = ue.find_object(CLASS_PATH)
+    if not cls and ue.load_asset then
+        local ok, o = ue.load_asset(CLASS_PATH, "deathbox")
+        if ok and ue.valid(o) then cls = o end
+    end
+    return cls
+end
+
+-- One saved box back into the world (see above). Returns the box, or nil
+-- and why not.
+function BS.spawn(F, e)
+    local obj, err = F.blob_load(e.file)
+    if not obj then return nil, tostring(e.file) .. ": " .. tostring(err) end
+    local conts, uids = ue.prop(obj, "JigContainers"), ue.prop(obj, "MainUIDs")
+    local _, _, ni = F.inv_walk(conts, false)
+    if e.items and ni ~= e.items then return nil, string.format("%s holds %d item(s), the list says %d", e.file, ni, e.items) end
+    local x, y, z = tonumber(e.x), tonumber(e.y), tonumber(e.z)
+    if not (x and y and z) or not real_loc({ X = x, Y = y, Z = z }) then return nil, "no place" end
+    local gs, cls, wc = ue.gameplay_statics(), BS.class(), ue.world_context()
+    if not gs or not cls or not wc then return nil, "no GameplayStatics / box class / world" end
+    local tf = { Rotation = { X = 0, Y = 0, Z = 0, W = 1 }, Translation = { X = x, Y = y, Z = z }, Scale3D = { X = 1, Y = 1, Z = 1 } }
+    local ok, a = pcall(function() return gs:BeginDeferredActorSpawnFromClass(wc, cls, tf, 2, nil, 0) end)
+    if not ok or not ue.valid(a) then return nil, "spawn: " .. tostring(a) end
+    local okf, done = pcall(function() return gs:FinishSpawningActor(a, tf, 0) end)
+    local box = (okf and ue.valid(done)) and done or a
+    local ksl = ue.ksl and ue.ksl()
+    if ksl then pcall(function() ksl:K2_ClearTimer(box, "TraceForFloor") end) end
+    local comp = ue.prop(box, "BP_JigMultiplayer")
+    if not ue.valid(comp) then
+        pcall(function() box:K2_DestroyActor() end)
+        return nil, "the spawned box has no BP_JigMultiplayer"
+    end
+    pcall(function() comp:InitializeJigComponent() end)
+    if not (ue.set_prop(comp, "MainJigContainers", conts) and ue.set_prop(comp, "MainContainersIDs", uids)) then
+        pcall(function() box:K2_DestroyActor() end)
+        return nil, "copying the saved arrays into the box failed"
+    end
+    local push = ue.find_object(BS.PUSH_LIB)
+    if push then pcall(function() push:MarkPropertyDirtyFromRepIndex(comp, 3, FName("MainContainersIDs")) end) end
+    pcall(function() comp:OnRep_MainContainersIDs() end)
+    local n = total_items(comp)
+    if n ~= ni then log.warn("deathbox: %s put back holds %s item(s), its file %d", ue.short(box), tostring(n), ni) end
+    return box
+end
+
+-- The boxes standing now: [name] = address (BS.on_load: as the load starts).
+function BS.standing_now()
+    local out = {}
+    for _, b in ipairs(boxes()) do
+        local name = ue.short(b)
+        if not gone[name] and real_loc(ue.location(b)) then out[name] = addr(b) or "?" end
+    end
+    return out
+end
+
+-- The world of a loaded save is up: its boxes back (see above). `before`:
+-- the boxes that stood as the load started (BS.standing_now), the only ones
+-- it removes.
+function BS.restore(why, before)
+    if S == nil or S.role == "client" or not BS.on() then return end
+    local F = BS.files()
+    if not F then
+        log.warn("deathbox: a save was loaded, but sdc_persist's files are not here: death boxes not put back")
+        return
+    end
+    local slot = ue.ems_current_slot()
+    if not BS.slot_ok(slot, F) then return end
+    local doc = BS.read(slot)
+    before = before or {}
+    local standing, late = {}, 0
+    for _, b in ipairs(boxes()) do
+        local name = ue.short(b)
+        if not gone[name] and real_loc(ue.location(b)) then
+            local a = before[name]
+            if a ~= nil and (a == "?" or a == addr(b)) then standing[#standing + 1] = b else late = late + 1 end
+        end
+    end
+    local late_s = late > 0 and string.format("; %d box(es) from after the load started stay (a death meanwhile)", late) or ""
+    if not doc then
+        -- a save from before deathbox_persist (or made with it off): which
+        -- boxes it had is not known - nothing is removed or added
+        if #standing + late > 0 then
+            log.info("deathbox: slot %s loaded (%s): it has no saved list of death boxes; the %d standing in the world stay",
+                slot, tostring(why), #standing + late)
+        end
+        return
+    end
+    local saved = doc.boxes
+    if S.role == "host" and cfg.get("persist_follow_host_save") == false then
+        -- the clients' records stay live: so do the boxes (a box looted empty
+        -- after the save would come back full to a client who kept the items)
+        if #saved > 0 or #standing > 0 then
+            log.info("deathbox: slot %s loaded (%s): persist_follow_host_save is off - the %d death box(es) of that save are"
+                .. " NOT put back and the %d standing in the world stay (the friends' records do not follow the save)",
+                slot, tostring(why), #saved, #standing + late)
+        end
+        return
+    end
+    local removed = {}
+    for _, b in ipairs(standing) do
+        local name = ue.short(b)
+        if BS.remove(b) then removed[#removed + 1] = name end
+    end
+    BS.stats.removed = BS.stats.removed + #removed
+    local made, failed = {}, {}
+    for _, e in ipairs(saved) do
+        local ok, box, err = pcall(BS.spawn, F, e)
+        if ok and box then
+            made[#made + 1] = string.format("%s (was %s, %s item(s): %s)", ue.short(box), tostring(e.name),
+                tostring(e.items), tostring(e.what))
+        else
+            failed[#failed + 1] = tostring(e.name) .. ": " .. tostring(ok and err or box)
+        end
+    end
+    BS.stats.restored = BS.stats.restored + #made
+    BS.stats.failed = BS.stats.failed + #failed
+    if #saved > 0 or #removed > 0 or late > 0 then
+        log.info("deathbox: slot %s loaded (%s): %d death box(es) of that save put back%s%s%s%s", slot, tostring(why), #made,
+            #made > 0 and (": " .. table.concat(made, "; ")) or "",
+            #removed > 0 and string.format("; %d box(es) standing in the world removed (not in that save): %s", #removed,
+                table.concat(removed, ", ")) or "",
+            late_s,
+            #failed > 0 and (" | NOT put back: " .. table.concat(failed, "; ")) or "")
+    end
+end
+
+-- After the load hook: waits until the world is up, then restores once.
+function BS.wait()
+    local pd = BS.pending
+    if not pd then return end
+    local age = os.clock() - pd.at
+    if S == nil or S.in_menu ~= false or age < BS.LOAD_WAIT_S then
+        if age > BS.LOAD_GIVE_UP_S then
+            BS.pending = nil
+            log.warn("deathbox: a save was loaded, but the world was not up within %d s: death boxes not put back", BS.LOAD_GIVE_UP_S)
+            return
+        end
+        ue.delay("deathbox-restore", 1000, BS.wait)
+        return
+    end
+    BS.pending = nil
+    local ok, err = pcall(BS.restore, "the game loaded a save", pd.before)
+    if not ok then log.err("deathbox: putting the saved death boxes back: %s", tostring(err)) end
+end
+
+-- EMS AsyncLoadActors (pre): the boxes standing now are the ones this load
+-- may remove; a second load before the restore notes them again.
+function BS.on_load()
+    if S == nil or S.role == "client" or not BS.on() then return end
+    local again = BS.pending ~= nil
+    local ok, before = pcall(BS.standing_now)
+    BS.pending = { at = os.clock(), before = ok and before or {} }
+    if not ok then log.warn("deathbox: a save is loading; the boxes standing now could not be listed (%s): none is removed", tostring(before)) end
+    if not again then ue.delay("deathbox-restore", 1000, BS.wait) end
+end
+
+-- BP_PlayerController's "actors saved" / "could not save" (Blueprint post
+-- hook): the own save of the host / single player; 50 ms later, out of the
+-- game's call.
+function BS.end_hook(ctx_p, ok)
+    if S == nil or S.role == "client" or not (BS.pend or BS.save_due) then return end
+    local pc = ctx_p and ctx_p:get()
+    if ue.valid(pc) then
+        local okl, isl = pcall(function() return pc:IsLocalController() end)
+        if okl and isl == false then return end
+    end
+    -- noted at once: a world change inside these 50 ms ("open for friends"
+    -- reopens the world right after its save) still applies it (M.reset)
+    local seen = { ok = ok, note = not ok and "the game reported it FAILED" or nil }
+    BS.end_seen = seen
+    ue.delay("deathbox-saved", 50, function()
+        if BS.end_seen ~= seen then return end   -- applied by M.reset meanwhile
+        BS.end_seen = nil
+        BS.saved(seen.ok, seen.note)
+    end)
+end
+
+function BS.on_delete(name_p)
+    local F = BS.files()
+    local slot = ue.str(name_p and name_p:get())
+    if not F or not BS.slot_ok(slot, F) then return end
+    local n = BS.drop(F, slot)
+    if n then log.info("deathbox: save slot %s deleted by the game: its %d saved death box(es) deleted too", slot, n) end
+end
+
+-- Native pre-only hooks, shared with other modules (sdc_ue.hook_native).
+function BS.install()
+    local h = BS.hooks
+    if not ue.hook_native then return end
+    if not h.save and ue.find_object(BS.SAVE_FN) then
+        h.save = true
+        local ok, err = ue.hook_native(BS.SAVE_FN, "deathbox", function()
+            if BS.save_due or S == nil or S.role == "client" then return end
+            BS.save_due = true
+            ue.delay("deathbox-save", 50, function() BS.save("game save") end)
+        end)
+        log.info("deathbox: save hook (EMS AsyncSaveActors) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+    end
+    if not h.load and ue.find_object(BS.LOAD_FN) then
+        h.load = true
+        local ok, err = ue.hook_native(BS.LOAD_FN, "deathbox", function() BS.on_load() end)
+        log.info("deathbox: load hook (EMS AsyncLoadActors) %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+    end
+    if not h.delete and ue.find_object(BS.DELETE_FN) then
+        h.delete = true
+        ue.hook_native(BS.DELETE_FN, "deathbox", function(_, _, name_p) BS.on_delete(name_p) end)
+    end
+    -- the save's end (Blueprint functions: in memory once BP_PlayerController is)
+    if not h.saved and ue.find_object(BS.SAVED_FN) then
+        h.saved = true
+        local ok, err = pcall(RegisterHook, BS.SAVED_FN, function(ctx_p) pcall(BS.end_hook, ctx_p, true) end)
+        h.saved_ok = ok == true
+        log.info("deathbox: save end hook (BP_PlayerController OnCompleted) %s%s", ok and "ok" or "FAILED",
+            ok and "" or (" " .. tostring(err)))
+    end
+    if not h.failed and ue.find_object(BS.FAILED_FN) then
+        h.failed = true
+        pcall(RegisterHook, BS.FAILED_FN, function(ctx_p) pcall(BS.end_hook, ctx_p, false) end)
+    end
+end
+
+function M.store_status()
+    local s = BS.stats
+    return string.format("death boxes with the save: on=%s saved=%d put back=%d removed at load=%d failed=%d not kept=%d hooks=%s/%s/%s%s",
+        tostring(BS.on()), s.saved, s.restored, s.removed, s.failed, s.dropped, tostring(BS.hooks.save == true),
+        tostring(BS.hooks.load == true), tostring(BS.hooks.saved_ok == true),
+        BS.pend and string.format(" (list of %d box(es) waiting for the save of %s)", #BS.pend.doc.boxes, BS.pend.slot) or "")
+end
+
+-- ===========================================================================
 
 function M.reset()
     state, track, gone = {}, {}, {}
     check_at, track_at = -100, -100
+    -- a new world: the end the game reported in the last 50 ms is applied
+    -- now; a save it never reported done is not kept (the clients' records
+    -- are not committed then either, sdc_persist.reset)
+    local seen = BS.end_seen
+    BS.end_seen = nil
+    if BS.pend and seen then
+        pcall(BS.saved, seen.ok, seen.note)
+    elseif BS.pend then
+        pcall(BS.saved, false, "the world closed before the game reported it done")
+    end
+    BS.save_due, BS.early = false, nil
+    -- the old world's boxes are not this world's (a name / address may come again)
+    if BS.pending then BS.pending.before = {} end
 end
 
 function M.register_handlers()
     -- host -> client: DBOXGONE|<box>|<x>|<y>|<z>   (an emptied death box was destroyed on the host)
     net.on("DBOXGONE", on_gone)
+    -- the boxes saved with the world: hooks from the start (single player too)
+    pcall(BS.install)
+    -- a client's copy that comes into range lies where the host has it (FL)
+    M.floor_install()
 end
 
 M._state = function() return state end
 M._track = function() return track end
+M._store = BS
+M._floor = FL
 
 return M

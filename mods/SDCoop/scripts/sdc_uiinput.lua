@@ -17,12 +17,7 @@
 --   * Mouse look (IA_CameraRotation, BP_PlayerCharacter @32338-33346:
 --     GetPlayerController(self, 0).AddYawInput / AddPitchInput) has no
 --     "window open" check: only the game+UI input mode stops it (the game
---     viewport lets the mouse go). Clicks on the window need that mode too:
---     a container item's "Open" (JSI_Slot.On_MouseDoubleClick; the context
---     menu's Open calls the same function, JigContextMenuComp @514) is a
---     click on the slot widget, and it opens the container window locally
---     (JSI_Slot @2825-3796: ContainerWindowWidget on the inspector canvas,
---     no server call).
+--     viewport lets the mouse go). Clicks on the window need that mode too.
 --   * At a trader in single player the dialogue's trade event
 --     (Quest_Event_OnInteractNPC.ExecuteEvent) first calls TryExitDialogue
 --     (@116) -> the dialogue HUD's On Dialogue Finished
@@ -52,9 +47,6 @@
 --   3. M.game_ui_open(): the game window that is open, if any;
 --      sdc_widgets.game_input and sdc_players never force game controls
 --      over it.
---   4. Container items: JSI_Slot.On_MouseDoubleClick (double click and the
---      context menu's Open) and JigContextMenuComp.ContextOpenLootBox
---      post-hooks log every request and whether the container window opened.
 --
 -- Log lines start with "uiinput:". Every callback is wrapped in pcall and
 -- returns nothing; no engine object wrapper is kept between calls (only
@@ -65,20 +57,11 @@ local ue  = require("sdc_ue")
 local cfg = require("sdc_config")
 
 local M = {
-    stats = { opened = 0, closed = 0, fixed_open = 0, fixed_close = 0, kept = 0, gave_up = 0,
-              open_requests = 0, loot_boxes = 0 },
+    stats = { opened = 0, closed = 0, fixed_open = 0, fixed_close = 0, kept = 0, gave_up = 0 },
 }
 
--- ---------------------------------------------------------------------------
--- Settings (the default applies until the key is in sdc_config's SCHEMA)
--- ---------------------------------------------------------------------------
-
-local DEFAULTS = { game_ui_input = true }
-
 function M.enabled()
-    local v = cfg.get("game_ui_input")
-    if v == nil then v = DEFAULTS.game_ui_input end
-    return v ~= false
+    return cfg.get("game_ui_input") ~= false
 end
 
 -- ---------------------------------------------------------------------------
@@ -86,14 +69,10 @@ end
 -- ---------------------------------------------------------------------------
 
 local TOGGLE_FN   = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:ToggleInventory"
-local DBLCLICK_FN = "/Game/JigSInventory/Jigsaw/Widgets/JSI_Slot.JSI_Slot_C:On_MouseDoubleClick"
-local LOOTBOX_FN  = "/Game/JigSInventory/Jigsaw/Widgets/JContextMenu/JigContextMenuComp.JigContextMenuComp_C:ContextOpenLootBox"
 local GAMEONLY_FN = "/Script/UMG.WidgetBlueprintLibrary:SetInputMode_GameOnly"
-local DLG_EXIT_FN = "/Script/Narrative.NarrativeComponent:ClientExitDialogue"
 
 local LOCK_ALWAYS = 2      -- EMouseLockMode::LockAlways, as ToggleInventory @800
 local KEEP_MAX = 4         -- restores per opened window before giving up
-local DIALOGUE_WINDOW_S = 1.0
 
 -- Windows on the viewport that own the input while they are open (the game
 -- sets UI input for each): pause menu (HUD_Game @483), keypad, lockpick,
@@ -107,7 +86,6 @@ local st = {
     hooks = {},              -- [key] = true (in) / "failed"
     win = nil,               -- { key = window name, at = os.clock(), kept = n, fixed = bool }
     keep_pending = false,
-    dialogue_end = -100,
     said = {},               -- first-time info lines per world
 }
 
@@ -301,12 +279,9 @@ end
 -- 2. SetInputMode_GameOnly (pre) while the window is open
 -- ---------------------------------------------------------------------------
 
-local function source_hint(now)
-    if now - st.dialogue_end < DIALOGUE_WINDOW_S then
-        return "the NPC dialogue's end (ClientExitDialogue from the host)"
-    end
+local function source_hint()
     if panel_open() then return "the co-op panel" end
-    return "another window's close or a late game event"
+    return "another window's close or a late game event (an NPC dialogue's end)"
 end
 
 local function keep_window()
@@ -347,75 +322,10 @@ local function on_game_only(_, pc_p)
     end
     win.kept = win.kept + 1
     log.info("uiinput: a switch to game control came while the inventory window is open (%s, %.0f ms after it opened): its own input comes back next frame",
-        source_hint(now), (now - win.at) * 1000)
+        source_hint(), (now - win.at) * 1000)
     if st.keep_pending then return end
     st.keep_pending = true
     ue.delay("uiinput-keep", 1, keep_window)
-end
-
-local function on_dialogue_exit()
-    if not is_client() then return end
-    st.dialogue_end = os.clock()
-end
-
--- ---------------------------------------------------------------------------
--- 4. Container items (post)
--- ---------------------------------------------------------------------------
-
-local function window_shown(w)
-    if not ue.valid(w) then return false end
-    if in_viewport(w) then return true end
-    local parent = ue.try(function() return w:GetParent() end)
-    if not ue.valid(parent) then return false end
-    local ok, vis = pcall(function() return w:IsVisible() end)
-    return ok and vis == true
-end
-
-local function on_double_click(slot_p)
-    if not active() then return end
-    local slot = pget(slot_p)
-    if not ue.valid(slot) then return end
-    local da = ue.prop(slot, "JigDataAsset")
-    if not ue.valid(da) then return end
-    local container = ue.prop(da, "IsContainer?") == true
-    local special = ue.valid(ue.prop(da, "SpecialContainerWidget"))
-    if not container and not special then
-        log.debug("uiinput: double click on %s (not a container)", ue.short(da))
-        return
-    end
-    M.stats.open_requests = M.stats.open_requests + 1
-    local mother = ue.prop(slot, "ContainerMother")
-    local allowed = ue.prop(mother, "AllowOpeningContainers")
-    local on_dbl = ue.prop(da, "OpenContainerOnDoubleClick?")
-    local contents = ue.valid(ue.prop(slot, "SlotContainer"))
-    local pending = ue.prop(slot, "IsPending") == true
-    local shown = window_shown(ue.prop(slot, "WindowContainer")) or window_shown(ue.prop(slot, "SpecialContainerRef"))
-    local pc = ue.local_pc()
-    local line = string.format(
-        "uiinput: open request for %s in %s (double click / context menu Open): container=%s special=%s open-on-double-click=%s allowed-here=%s fixed-slot=%s pending=%s contents-widget=%s cursor=%s -> container window %s",
-        ue.short(da), ue.short(mother), tostring(container), tostring(special), tostring(on_dbl), tostring(allowed),
-        tostring(ue.prop(slot, "IsFixedSlot?")), tostring(pending), contents and "yes" or "MISSING",
-        tostring(pc and cursor_on(pc)), shown and "shown" or "not shown")
-    if shown then
-        log.info("%s", line)
-    else
-        -- a second request closes an open window (JSI_Slot @1166); an item
-        -- still waiting for the host (@48-205) or a missing contents widget
-        -- (@710) keeps it from opening at all
-        local why = pending and " (the item is still pending: waiting for the host)"
-            or (not contents and " (no contents widget for this item on this machine)") or ""
-        log.warn("%s%s", line, why)
-    end
-end
-
-local function on_loot_box(comp_p)
-    if not active() then return end
-    local comp = pget(comp_p)
-    local item = ue.prop(comp, "CurrentItemRef")
-    local da = ue.prop(item, "JigDataAsset")
-    M.stats.loot_boxes = M.stats.loot_boxes + 1
-    log.info("uiinput: loot box %s opened from the context menu here (the game rolls its items on this machine)",
-        ue.valid(da) and ue.short(da) or "?")
 end
 
 -- ---------------------------------------------------------------------------
@@ -431,14 +341,11 @@ end
 
 local BP_HOOKS = {
     { key = "toggle", path = TOGGLE_FN, fn = on_toggle },
-    { key = "open-request", path = DBLCLICK_FN, fn = on_double_click },
-    { key = "loot-box", path = LOOTBOX_FN, fn = on_loot_box },
 }
 
 local NATIVE_HOOKS = {
     -- pre only (sdc_ue.hook_native: one shared engine hook per function)
     { key = "gameonly", path = GAMEONLY_FN, fn = on_game_only },
-    { key = "dlgexit", path = DLG_EXIT_FN, fn = on_dialogue_exit },
 }
 
 local function install_hooks()
@@ -470,7 +377,7 @@ end
 
 -- New world / role: window state goes (names only, nothing to release).
 function M.reset(why)
-    st.win, st.keep_pending, st.dialogue_end, st.said = nil, false, -100, {}
+    st.win, st.keep_pending, st.said = nil, false, {}
     log.debug("uiinput: reset (%s)", tostring(why))
 end
 

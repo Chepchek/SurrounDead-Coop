@@ -329,8 +329,8 @@ WORLD = CW; C.world._t.try_hooks(true)
 -- ===========================================================================
 -- Hooks are fired the way UE4SS 3.0.1 calls a Blueprint (script) hook:
 -- LuaMod script_hook passes (Context, params...) WITHOUT the ReturnValue, so
--- GetLockpickAmount(out Lockpicks) -> Text gets (Context, Lockpicks) and
--- GetLockpickAmountText() -> Text gets (Context) only.
+-- GetLockpickAmount(out Lockpicks) -> Text gets (Context, Lockpicks)
+-- (GetLockpickAmountText() -> Text is not hooked: it would get nothing to answer).
 local lines = {}
 for _, m in ipairs({ H, C }) do
     local info0 = m.log.info
@@ -368,7 +368,6 @@ CW.jig._p.LocalJSIContainers = { pockets }
 -- what the screen shows (the binding while bound).
 local game_text = "Lockpicks: 0"   -- the game's own count over the client's empty MainJigContainers
 local function lockpick_ui(name)
-    local ui
     local tb = new(CW, { "TextBlock" }, name .. "_Txt", { Text = FText("Lockpicks: 0") }, {})
     tb._gets, tb._sets = 0, 0
     tb._m.GetText = function(self)
@@ -381,11 +380,8 @@ local function lockpick_ui(name)
         self._p.Text = t
         self._bound = nil
     end
-    tb._bound = function()
-        fire(CW, UI .. ":GetLockpickAmountText", param(ui))   -- (Context) only
-        return FText(game_text)
-    end
-    ui = new(CW, { "LockpickUI_C" }, name, { UseLockpick = true, LockpickTxt = tb,
+    tb._bound = function() return FText(game_text) end
+    local ui = new(CW, { "LockpickUI_C" }, name, { UseLockpick = true, LockpickTxt = tb,
         LPRef = new(CW, { "LockPickingComponent_C" }, name .. "_LP", { LPDurability = 25 }) })
     return ui, tb
 end
@@ -514,6 +510,36 @@ local hui = new(HW, { "LockpickUI_C" }, "LockpickUI_C_7", { LockpickTxt = hui_tb
 local hout = param(3)
 fire(HW, UI .. ":GetLockpickAmount", param(hui), hout)
 check(hout._v() == 3 and called(hui_tb, "SetText") == nil, "host: the game's own count and text")
+
+-- 2026-11-13 log review: a client's Russian game showed "Отмычки: 0" and the
+-- mod put the English "Lockpicks: 2" over it. Only the number changes now.
+print("== P8. a Russian game: the game's own word stays, only the number changes")
+do
+    WORLD = CW
+    game_text = "Отмычки: 0"
+    have(2)
+    advance(1)
+    local ui8, tb8 = lockpick_ui("LockpickUI_C_2147480108")
+    local n8, shown8 = frame(ui8)
+    check(n8 == 2 and shown8 == "Отмычки: 2", "the screen shows 'Отмычки: 2', not 'Lockpicks: 2' - " .. tostring(shown8))
+    check(logged("lockpick minigame text 'Отмычки: 0' -> 'Отмычки: 2'") ~= nil, "log: the game's word kept")
+    have(1)
+    advance(1)
+    n8, shown8 = frame(ui8)
+    check(n8 == 1 and shown8 == "Отмычки: 1", "the count changes on our own text, the word stays - " .. tostring(shown8))
+    check(tb8._sets == 2, "SetText once per change (" .. tb8._sets .. ")")
+    -- a screen whose text reads back without a number: the last game text seen with one
+    local ui9, tb9 = lockpick_ui("LockpickUI_C_2147480109")
+    tb9._bound = function() return FText("") end
+    advance(1)
+    n8, shown8 = frame(ui9)
+    check(shown8 == "Отмычки: 1", "no number on screen: the game's last word with this count - " .. tostring(shown8))
+    local tf = C.world._t.locks.text_for
+    check(tf("Отмычки: 1 000", 7) == "Отмычки: 7", "a grouped number is replaced whole")
+    check(tf("Lockpicks: 12", 3) == "Lockpicks: 3", "an English game: English text")
+    check(tf("Lockpicks: {A}", 4) == "Lockpicks: 4", "no digits: the last text seen with one")
+    game_text = "Lockpicks: 0"
+end
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

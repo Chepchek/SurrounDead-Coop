@@ -29,7 +29,7 @@ local gearfx = require("sdc_gearfx")
 local S = { role = "client", remote_pcs = {} }
 items.init(S); appearance.init(S); pawnstate.init(S); gearfx.init(S)
 items.install()
-items.client_tick(); gearfx.client_tick(); gearfx.tick(); appearance.tick(); pawnstate.tick(); pawnstate.fast_tick(); pawnstate.frame_tick()
+items.client_tick(); gearfx.client_tick(); appearance.tick(); pawnstate.tick(); pawnstate.fast_tick(); pawnstate.frame_tick()
 items.hotbar_tick()
 S.role = "host"
 items.host_tick({}); gearfx.host_tick(); appearance.tick({}); pawnstate.tick({})

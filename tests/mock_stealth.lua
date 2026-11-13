@@ -69,6 +69,18 @@ package.preload["sdc_ue"] = function()
     function M.location(a) local l = a._p._loc; if l then return { X = l.X, Y = l.Y, Z = l.Z } end return nil end
     -- sdc_ue.hook_native (0.6.39): one shared engine hook; here a plain RegisterHook
     function M.hook_native(path, _, fn) return pcall(RegisterHook, path, fn) end
+    -- sdc_ue.param / backoff (2026-11-13: shared helpers, as in sdc_ue)
+    function M.param(p)
+        if p == nil then return nil end
+        local ok, v = pcall(function() return p:get() end)
+        if ok then return v end
+        return nil
+    end
+    function M.backoff(rec, now, base, cap)
+        local w = rec.wait and math.min(cap, rec.wait * 2) or base
+        rec.wait, rec.next_try = w, now + w
+        return w
+    end
     return M
 end
 
@@ -213,11 +225,15 @@ r = noise(cl, { X = 500, Y = 0, Z = 0 }, 1, cl, 150, "Noise")
 check(r == 150, "client's landing noise untouched")
 CFG.stealth_sync = false
 advance(1); stealth.tick()
+local s_before = stealth.stats.host.s
 r = noise(cl, at_cl, 1, cl, 2000, "Noise")
 check(r == 2000, "stealth_sync=false: host keeps the game's value")
+-- 2026-11-13 (critic B6): the host's noise hook serves only the cap; with
+-- stealth_sync off it does not even look at the step (the trace has its own hook)
+check(stealth.stats.host.s == s_before, "stealth_sync=false: the host's noise hook is passive (trace on)")
 CFG.stealth_sync = nil
 advance(1); stealth.tick()
-check(stealth.stats.host.s >= 2 and stealth.stats.host.r >= 1 and stealth.stats.host.c >= 2, "host copy steps classified by kind")
+check(stealth.stats.host.s >= 1 and stealth.stats.host.r >= 1 and stealth.stats.host.c >= 2, "host copy steps classified by kind")
 check(stealth.stats.cap_pairs["r>c"] == 1 and stealth.stats.cap_pairs["s>w"] == 1 and stealth.stats.cap_pairs["0>c"] == 1, "cap pairs counted")
 HANDLERS.STEALTH({ "0.871", "c", "1.1480" }, clpc)
 local capped0 = stealth.stats.capped

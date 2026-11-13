@@ -1,7 +1,8 @@
 -- Mock harness for sdc_gearfx: other players' lasers aim where their owner
 -- aims (host and client), and their light / laser parts show only for the
 -- weapon in hand (holster gate). Real sdc_gearfx + sdc_ue + sdc_log; sdc_items
--- and sdc_pawnstate are stubs.
+-- and sdc_pawnstate are stubs (pawnstate.others as the real one picks other
+-- players' characters).
 -- usage: lua mock_gearfx_laser.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
@@ -120,8 +121,22 @@ end
 -- ------------------------------------------------------------ stubs
 local equipped = {}   -- [pawn] = { { actor =, slot = } }
 package.loaded["sdc_items"] = { equipped_of = function(p) return equipped[p] or {} end }
-local old_aim = {}    -- [pawn] = rotator from an older peer (cp / cy)
-package.loaded["sdc_pawnstate"] = { aim_of = function(p) return old_aim[p] end }
+local S = { role = "host", remote_pcs = {} }
+-- sdc_pawnstate.others: host = every character not locally controlled,
+-- client = simulated proxies
+package.loaded["sdc_pawnstate"] = { others = function()
+    local out = {}
+    for _, p in ipairs(registry["BP_PlayerCharacter_C"] or {}) do
+        if p._valid then
+            if S.role == "host" then
+                if not p:IsLocallyControlled() then out[#out + 1] = p end
+            elseif p._p.Role == 1 then
+                out[#out + 1] = p
+            end
+        end
+    end
+    return out
+end }
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -225,8 +240,10 @@ local function gate_tick() for _, l in ipairs(loops) do l.f() end end
 
 -- ============================================================ setup
 out("== setup (host)")
-local S = { role = "host" }
 gearfx.init(S)
+gearfx.host_tick()
+check(hooks[LASER_PATH] == nil and #loops == 0, "host with nobody connected: no laser hook, no gate loop")
+S.remote_pcs = { PC }
 gearfx.host_tick()
 check(hooks[LASER_PATH] and #hooks[LASER_PATH] == 1, "laser hook registered on the host too")
 check(hooks[COMBO_PATH] and #hooks[COMBO_PATH] == 1, "combo laser hook registered")
@@ -283,6 +300,21 @@ out("== host: the host's own laser is the game's")
 local hsets = HL_NS._sets
 laser(HL)
 check(HL_NS._sets == hsets, "local character's laser untouched")
+-- the next ~100 calls a second: skipped by the module's address, no owner lookup
+local owner_calls = 0
+rawset(HL, "GetOwner", function(self) owner_calls = owner_calls + 1; return self._p.__owner end)
+for _ = 1, 10 do laser(HL) end
+check(owner_calls == 0 and HL_NS._sets == hsets, "own laser: no owner lookup within a second")
+advance(1.0)
+laser(HL)
+check(owner_calls == 1 and HL_NS._sets == hsets, "looked up again after a second, still untouched")
+rawset(HL, "GetOwner", nil)
+-- nobody connected any more: the client's laser is not touched either
+S.remote_pcs = {}
+sets = L_NS._sets
+laser(L)
+check(L_NS._sets == sets, "host alone: Event_Laser does nothing")
+S.remote_pcs = { PC }
 
 -- ============================================================ holster gate
 out("== holster gate (host)")
@@ -338,11 +370,93 @@ set_active(PH, "Jig.PlayerSlot.PrimaryWeapon")
 laser(L)
 check(L_NS._vis and L_NS._sets == sets + 1, "drawn, no poll yet: Event_Laser shows and aims it")
 
+-- 0.8.1 host log: a friend's rifle on the back, its laser left in StateADS,
+-- Event_Laser 100/s for 26 minutes at 12-20 ms/s (owner lookup, slot and
+-- visibility checks on every call)
+out("== holstered laser left in StateADS: Event_Laser skipped until drawn")
+set_active(PH, "Jig.PlayerSlot.SidearmWeapon")
+advance(0.1)
+gate_tick()
+check(not L_NS._vis and gearfx.gate.tags[P._addr] == "Jig.PlayerSlot.SidearmWeapon", "MP5 to the back, seen by the gate: hidden")
+local owner_n, vis_n = 0, 0
+rawset(L, "GetOwner", function(self) owner_n = owner_n + 1; return self._p.__owner end)
+local real_is_vis = L_NS._m.IsVisible
+L_NS._m.IsVisible = function(self) vis_n = vis_n + 1; return real_is_vis(self) end
+sets = L_NS._sets
+n_lines = #lines
+for _ = 1, 100 do advance(0.01); fire(LASER_PATH, param(L)) end   -- one second of the 0.01 s timer
+check(owner_n >= 2 and owner_n <= 4, "100 calls in a second: owner looked up " .. owner_n .. " times (every 0.5 s), not 100")
+check(vis_n == owner_n, "visibility checked only on those look-ups (" .. vis_n .. ")")
+check(L_NS._sets == sets and not L_NS._vis, "no beam written, stays hidden")
+local away_rec = gearfx.gate.away[L._addr]
+check(away_rec and away_rec.n >= 95 and away_rec.slot == "Jig.PlayerSlot.PrimaryWeapon",
+    "skip record by module address with the weapon's slot (" .. tostring(away_rec and away_rec.n) .. " calls skipped)")
+check(#lines == n_lines, "nothing logged while it stays away")
+advance(0.6)
+fire(LASER_PATH, param(L))       -- a fresh look-up: the record is new from here
+check(owner_n >= 3, "looked up again after 0.5 s")
+-- drawn: the gate's next poll ends the skip, never a wrong beam meanwhile
+set_active(PH, "Jig.PlayerSlot.PrimaryWeapon")
+advance(0.01)
+fire(LASER_PATH, param(L))
+check(not L_NS._vis and L_NS._sets == sets, "drawn, gate not polled yet: still skipped, parts still hidden")
+advance(0.05)
+gate_tick()
+check(L_NS._vis and L_PL._vis, "the gate's poll shows the drawn MP5's laser")
+check(gearfx.gate.away[L._addr] == nil, "skip record dropped on the draw")
+check((last_line("drew BP_BlackOpsMP5Pickup_C") or ""):find("laser call%(s%) skipped while away") ~= nil, "draw line counts the skipped calls")
+laser(L)
+check(L_NS._sets == sets + 1 and near(L_NS._beam, { X = 11000, Y = 40, Z = 210 }), "the next Event_Laser aims the beam again")
+laser(L)
+check(L_NS._sets == sets + 2, "in hand: every call aims (no skip)")
+rawset(L, "GetOwner", nil)
+L_NS._m.IsVisible = real_is_vis
+
+out("== gate loop down: the hook's own look-up every 0.5 s notices the draw")
+set_active(PH, "Jig.PlayerSlot.SidearmWeapon")
+advance(0.1)
+gate_tick()
+laser(L)
+check(gearfx.gate.away[L._addr] ~= nil, "holstered: skip record")
+set_active(PH, "Jig.PlayerSlot.PrimaryWeapon")   -- no gate poll from here on
+sets = L_NS._sets
+laser(L)
+check(not L_NS._vis and L_NS._sets == sets, "within 0.5 s: skipped")
+advance(0.6)
+laser(L)
+check(L_NS._vis and L_NS._sets == sets + 1, "after 0.5 s: looked up again, shown and aimed without the gate")
+check(gearfx.gate.away[L._addr] == nil, "skip record dropped")
+advance(0.1)
+gate_tick()
+
+out("== weapon moved to another slot while away, drawn there")
+set_active(PH, "Jig.PlayerSlot.SidearmWeapon")
+advance(0.1)
+gate_tick()
+laser(L)
+check(gearfx.gate.away[L._addr] and gearfx.gate.away[L._addr].slot == "Jig.PlayerSlot.PrimaryWeapon", "skip record for the primary slot")
+local eq_saved = equipped[P]
+equipped[P] = { { actor = MP5, slot = "Jig.PlayerSlot.SecondaryWeapon" }, { actor = USP, slot = "Jig.PlayerSlot.SidearmWeapon" } }
+set_active(PH, "Jig.PlayerSlot.SecondaryWeapon")
+advance(0.1)
+gate_tick()
+check(L_NS._vis and gearfx.gate.away[L._addr] == nil, "the gate shows it in its new slot and drops the skip")
+sets = L_NS._sets
+laser(L)
+check(L_NS._sets == sets + 1, "its beam is aimed at once")
+equipped[P] = eq_saved
+set_active(PH, "Jig.PlayerSlot.PrimaryWeapon")
+advance(0.1)
+gate_tick()
+check(L_NS._vis and not C_NS._vis and not C_SL._vis, "back to the primary: MP5 shown, USP hidden")
+
 out("== hands empty, module re-created by the game while holstered")
 set_active(PH, "None")
 advance(0.1)
 gate_tick()
 check(not L_NS._vis and not C_NS._vis and not C_SL._vis, "nothing in hand: every module hidden")
+laser(L)
+check(gearfx.gate.away[L._addr] ~= nil, "hands empty: the MP5 laser skipped too")
 -- ProcessAttachments replaced the laser module with a new (visible) actor
 local L2_NS = laser_ns("NS_LaserSight", { X = 10030, Y = 25, Z = 130 }, true)
 local L2 = make_module("BP_SmallTacticalLaserSightLocalAttachment_C", "Laser_2", MP5, "StateADS", { NS_LaserSight = L2_NS })
@@ -355,6 +469,7 @@ advance(1.0)
 gate_tick()
 check(not L2_NS._vis, "sweep hides the re-created module of the holstered weapon")
 check(gearfx.gate.hidden[L._addr] == nil and gearfx.gate.hidden[L2._addr] ~= nil, "record of the destroyed module dropped")
+check(gearfx.gate.away[L._addr] == nil, "skip record of the destroyed module dropped")
 
 out("== client sees the host (base aim)")
 S.role = "client"
@@ -374,11 +489,6 @@ check(near(Q_NS._beam, { X = 0, Y = 5000 + 160 / math.tan(math.rad(10)), Z = 0 }
 check(traces[#traces].ch == 5, "combo module's trace channel (5)")
 check(count_lines("on BP_BlackOpsUSPPickup_C %(BP_TacticalLaserLightComboLocalAttachment_C%): aim from base aim %(RemoteViewPitch %+ actor yaw%), beam from the module to the aim point %(client%)") == 1,
     "per-class line for the client source")
-old_aim[Q] = { Pitch = 0, Yaw = 90, Roll = 0 }
-laser(QL, COMBO_PATH)
-check(Q_NS._beam.Y > 9000 and math.abs(Q_NS._beam.Z - 160) < 1, "an older peer's cp/cy wins")
-check(count_lines("aim from peer aim %(cp/cy%)") == 1, "per-class line for the peer source")
-old_aim[Q] = nil
 
 out("== client: holster / draw of the host's sidearm")
 advance(0.3)
@@ -388,10 +498,24 @@ set_active(QH, "Jig.PlayerSlot.PrimaryWeapon")
 advance(0.1)
 gate_tick()
 check(not Q_NS._vis, "host switched to the primary: USP laser hidden on the client")
+local q_sets = Q_NS._sets
+for _ = 1, 20 do advance(0.01); fire(COMBO_PATH, param(QL)) end
+check(Q_NS._sets == q_sets and gearfx.gate.away[QL._addr] and gearfx.gate.away[QL._addr].n >= 18,
+    "client: the host's holstered laser skipped too")
 set_active(QH, "Jig.PlayerSlot.SidearmWeapon")
 advance(0.1)
 gate_tick()
 check(Q_NS._vis, "host drew the USP again: shown")
+check(gearfx.gate.away[QL._addr] == nil, "client: skip ended by the draw")
+q_sets = Q_NS._sets
+laser(QL, COMBO_PATH)
+check(Q_NS._sets == q_sets + 1, "client: the drawn USP's beam aimed again")
+-- holstered again before the host leaves view
+set_active(QH, "Jig.PlayerSlot.PrimaryWeapon")
+advance(0.1)
+gate_tick()
+laser(QL, COMBO_PATH)
+check(gearfx.gate.away[QL._addr] ~= nil, "client: skip record again")
 
 out("== pruning and failures")
 Q._valid = false
@@ -400,11 +524,18 @@ gate_tick()
 local left = 0
 for _ in pairs(gearfx.gate.tags) do left = left + 1 end
 check(gearfx.gate.tags[Q._addr] == nil, "gone character's records dropped")
+check(gearfx.gate.away[QL._addr] == nil, "gone character's skip records dropped")
 -- a module whose owner lookup throws: the hook swallows it
 local BAD = make_module("BP_SmallTacticalLaserSightLocalAttachment_C", "Laser_bad", nil, "StateADS", {})
 rawset(BAD, "GetOwner", function() error("stale object") end)
 local okb = pcall(fire, LASER_PATH, param(BAD))
 check(okb, "hook never throws")
+-- the host alone again: every record goes, skip records too
+S.role, S.remote_pcs = "host", {}
+gate_tick()
+gearfx.gate.away[12345] = { t = T, pk = 1, slot = "Jig.PlayerSlot.PrimaryWeapon", n = 0 }   -- the only record left
+gate_tick()
+check(next(gearfx.gate.away) == nil, "host alone: skip records dropped")
 S.role = "standalone"
 sets = Q_NS._sets
 check(pcall(gate_tick) and pcall(laser, L2), "standalone: gate and hook do nothing")

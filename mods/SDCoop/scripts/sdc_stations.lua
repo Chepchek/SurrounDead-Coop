@@ -258,7 +258,8 @@ end
 -- (RequestServerData -> SERVER_RequestData on the own component; the host
 -- answers CLIENT_ContainerDataResponse with the items it has). A container
 -- that stays empty shows here as a request without an answer, with what this
--- machine's copy is (replicated from the host, or spawned here).
+-- machine's copy is (replicated from the host, or spawned here). The
+-- RequestServerData hook serves only that warning: with config debug only.
 local loot_wait = {}   -- [component address] = { at, name, cls, role, here }
 
 local function container_owner(comp)
@@ -442,6 +443,7 @@ local function add_to_grid(comp, pawn, da, n, grid)
         end
     end
     -- its own notice is a Client RPC (the host's view); the remote viewers get it like a multicast
+    -- (sdc_containers sends a run's ops together: one message per viewer)
     local cont = package.loaded["sdc_containers"]
     if cont and cont.notify_viewers then
         for _, u in ipairs(new) do pcall(cont.notify_viewers, comp, "add", u) end
@@ -551,7 +553,9 @@ local function disassemble(station, pawn)
         ue.short(pawn), ue.short(station), #done > 0 and table.concat(done, "; ") or "nothing to disassemble",
         #skipped > 0 and ("; skipped " .. table.concat(skipped, ", ")) or "", where, placed.grid, placed.dropped,
         placed.other)
-    -- the player is told where the results went (their log)
+    -- the window's changes first (queued by sdc_containers), then where the
+    -- results went (the player's log)
+    if containers.flush_viewers then pcall(containers.flush_viewers) end
     local pc = ue.prop(pawn, "Controller")
     if ue.valid(pc) then
         net.send_to(pc, "DISASMR", grid and grid.idx or 0, grid and grid.n or 0, grid and grid.name or "",
@@ -666,7 +670,8 @@ function M.client_tick()
     for _, path in ipairs(WINDOWS) do
         try_hook(path, "window-" .. (path:match("%.([%w_]+)_C:") or "?"), on_station_window)
     end
-    try_hook(PLAYER_FN .. "RequestServerData", "loot-request", on_request_data)
+    -- (log only: its one use is the "no contents from the host" warning; with config debug)
+    if log.debug_enabled then try_hook(PLAYER_FN .. "RequestServerData", "loot-request", on_request_data) end
     try_hook(JIG_FN .. "CLIENT_ContainerDataResponse", "loot-answer", on_data_answer)
 end
 

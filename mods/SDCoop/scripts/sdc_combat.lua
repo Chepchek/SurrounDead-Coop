@@ -6,6 +6,16 @@
 --   (The game's own MC_Montage multicast is no substitute: a server executes
 --   a multicast too, which would restart the montage on the host and
 --   interrupt the weapon's montage proxy with its Chamber notify / sound.)
+--   MONT goes to the shooting client too, on purpose: Svr_WeaponShot is a
+--   server RPC (a client's call runs only on the host), and its
+--   @3222 -> Delay 0.5 -> @274-481 is the one place in the game that plays
+--   the chamber montage, so without MONT a client never sees its own bolt /
+--   pump cycle (work/audit/combat.md J). The 0.8.1 log review took MONT on
+--   the own character for a restart of a montage already playing there; in
+--   case some path ever does play it there, a client does not restart an
+--   own chamber montage that MONT did not start itself (counted and logged,
+--   "own ... already playing"). The first three plays on the own character
+--   are logged ("own character") even when other players shot first.
 --
 -- * Melee hits of a remote player's NORMAL swing: the client detects them and
 --   the host applies them with the game's own HitBody / HitHead (MHIT), see
@@ -13,7 +23,8 @@
 --
 -- * Loop reloads (rounds one at a time): the end of the owner's loop montage
 --   and its after-reload chamber montage reach the other machines (RLSTOP),
---   see the loop reload section.
+--   see the loop reload section. Such a reload stops at the gun's capacity
+--   (sdc_reloadcap, driven from here).
 --
 -- Camera shake of other players' shots is not handled here any more:
 -- MC_WeaponEffects@2450 asks GetPlayerController(self, 0) for the camera and
@@ -29,10 +40,15 @@ local ctx = require("sdc_ctx")
 local appearance = require("sdc_appearance")
 local items = require("sdc_items")
 local cfg = require("sdc_config")
+local reloadcap = require("sdc_reloadcap")
 
-local M = { stats = { montages_sent = 0, montages_played = 0 } }
+local M = { stats = { montages_sent = 0, montages_played = 0, montages_own = 0, montages_own_busy = 0 },
+            reloadcap = reloadcap }
 local S
-function M.init(state) S = state end
+function M.init(state)
+    S = state
+    reloadcap.init(state)
+end
 
 local addr = ctx.addr
 
@@ -45,6 +61,24 @@ local PROXY_FN = "/Script/AnimGraphRuntime.PlayMontageCallbackProxy:CreateProxyO
 local function is_player(a)
     return ue.valid(a) and ue.class_name(a):find("PlayerCharacter", 1, true) ~= nil
 end
+
+local function locally_controlled(pawn)
+    local ok, v = pcall(function() return pawn:IsLocallyControlled() end)
+    return ok and v == true
+end
+
+-- true / false / nil (could not ask)
+local function montage_playing(anim, montage)
+    local ok, v = pcall(function() return anim:Montage_IsPlaying(montage) end)
+    if not ok or type(v) ~= "boolean" then return nil end
+    return v
+end
+
+-- client: [montage address] = os.clock() of the last MONT played on the own
+-- character (a pump MONT can come while the previous one still plays: that
+-- one is MONT's own and is restarted, as the host's copy restarts it)
+local OWN_MONT_S = 5
+local own_mont = {}
 
 -- true when `montage` is the montage `prop` (ChamberFirearmMontage,
 -- LoopReloadMontage...) of the BP_WeaponsPickupComponent of one of the
@@ -68,14 +102,18 @@ local function chamber_of(pawn, montage)
     return weapon_montage(pawn, montage, "ChamberFirearmMontage")
 end
 
+-- CreateProxyObjectForPlayMontage(InSkeletalMeshComponent, MontageToPlay,
+-- PlayRate, StartingPosition, StartingSection, bShouldStopAllMontages), pre:
+-- the rate is the first number after the montage (the weapon's
+-- ChamberBaseSpeed); StartingPosition comes after it.
 local function on_play_montage(...)
-    if S.role ~= "host" or #(S.remote_pcs or {}) == 0 then return end
-    local mesh, montage, rate = nil, nil, 1.0
+    if not S or S.role ~= "host" or #(S.remote_pcs or {}) == 0 then return end
+    local mesh, montage, rate = nil, nil, nil
     for _, p in ipairs({ ... }) do
         local ok, v = pcall(function() return p:get() end)
         if ok and v ~= nil then
             if type(v) == "number" then
-                if not montage then rate = v end
+                if montage and rate == nil then rate = v end
             elseif ue.valid(v) then
                 local cls = ue.class_name(v)
                 if cls:find("SkeletalMeshComponent", 1, true) then mesh = v
@@ -88,29 +126,30 @@ local function on_play_montage(...)
     if not is_player(pawn) or not chamber_of(pawn, montage) then return end
     local id = appearance.player_id(pawn)
     if not id then return end
-    net.broadcast(S.remote_pcs, "MONT", id, ue.path(montage), string.format("%.2f", rate or 1))
+    if type(rate) ~= "number" or rate <= 0 then rate = 1.0 end
+    net.broadcast(S.remote_pcs, "MONT", id, ue.path(montage), string.format("%.2f", rate))
     M.stats.montages_sent = M.stats.montages_sent + 1
     if M.stats.montages_sent <= 3 then
-        log.info("combat: forwarding %s of %s", ue.short(montage), ue.short(pawn))
+        log.info("combat: forwarding %s of %s (x%.2f)", ue.short(montage), ue.short(pawn), rate)
     end
 end
 
+-- One shared pre-only engine hook (sdc_ue.hook_native, each subscriber in its
+-- own pcall); sdc_throw and sdc_ai_attacks watch the same native.
 local montage_hooked = false
 local function try_hook_montage()
     if montage_hooked then return end
-    local ok, err = pcall(RegisterHook, PROXY_FN, function() end, function(_, ...) on_play_montage(...) end)
     montage_hooked = true
+    local ok, err = ue.hook_native(PROXY_FN, "combat.chamber", function(_, ...) on_play_montage(...) end)
     log.info("combat: montage hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
 end
 
+-- MONT|player id|montage path|rate (host -> clients). A message path: the
+-- montage must already be in memory here (no synchronous load on a client).
 local function play_forwarded(f)
     local id = tonumber(f[1])
     if not id or not f[2] then return end
-    local montage = ue.find_object(f[2])
-    if not montage then
-        local ok, loaded = ue.load_asset(f[2], "combat")
-        if ok and ue.valid(loaded) then montage = loaded end
-    end
+    local montage = ue.loaded_asset(f[2], "combat MONT")
     if not montage then return end
     -- the path came over the network: Montage_Play does not check the type
     if ue.class_name(montage) ~= "AnimMontage" then
@@ -121,11 +160,29 @@ local function play_forwarded(f)
         if appearance.player_id(p) == math.floor(id) and (S.role ~= "client" or ue.role(p) ~= ue.ROLE_AUTHORITY) then
             local mesh = ue.prop(p, "Mesh")
             local anim = ue.valid(mesh) and ue.try(function() return mesh:GetAnimInstance() end) or nil
-            if ue.valid(anim) and ue.valid(montage) then
+            local own = S.role == "client" and locally_controlled(p)
+            local ma = own and addr(montage)
+            if own and ma and ue.valid(anim) and montage_playing(anim, montage) == true
+                and os.clock() - (own_mont[ma] or -1e9) > OWN_MONT_S then
+                -- see the header: not restarted
+                M.stats.montages_own_busy = M.stats.montages_own_busy + 1
+                if M.stats.montages_own_busy <= 3 then
+                    log.warn("combat: own %s already playing here when the host's MONT came (not started by MONT); not restarted",
+                        ue.short(montage))
+                end
+            elseif ue.valid(anim) and ue.valid(montage) then
                 pcall(function() anim:Montage_Play(montage, tonumber(f[3]) or 1.0, 0, 0.0, true) end)
                 M.stats.montages_played = M.stats.montages_played + 1
-                if M.stats.montages_played <= 3 then
-                    log.info("combat: played %s on %s", ue.short(montage), ue.short(p))
+                if ma then
+                    own_mont[ma] = os.clock()
+                    M.stats.montages_own = M.stats.montages_own + 1
+                end
+                -- the first 3 plays, and the first 3 on the own character
+                -- whoever shot first (the log alone shows that MONT reaches
+                -- the shooter; the counts are in sdcoop_status only)
+                if M.stats.montages_played <= 3 or (ma and M.stats.montages_own <= 3) then
+                    log.info("combat: played %s on %s%s", ue.short(montage), ue.short(p),
+                        ma and " (own character: the game plays it only on the host)" or "")
                 end
             end
         end
@@ -366,14 +423,17 @@ local function try_melee_hooks()
 end
 
 -- The weapon class loads with the first melee weapon: retried every
--- 2 s on both roles until in (independent of the session ticks).
+-- 2 s on both roles until in (independent of the session ticks); the retry
+-- chain ends once both hooks are in.
 local function start_melee()
     if melee.looping then return end
     melee.looping = true
-    ue.every("combat-melee-hooks", 2000, function()
-        if melee.hooked.HitBody and melee.hooked.HitHead then return end
+    local function retry()
         try_melee_hooks()
-    end)
+        if melee.hooked.HitBody and melee.hooked.HitHead then return end
+        ue.delay("combat-melee-hooks", 2000, retry)
+    end
+    ue.delay("combat-melee-hooks", 2000, retry)
 end
 
 -- ---------------------------------------------------------------------------
@@ -409,6 +469,14 @@ end
 -- (@90647 -> 5053). Only logged: a loop still playing 2 s after the game's
 -- reload ended (Reloading? false) or for 20 s.
 -- Config reload_loop_fix.
+-- Capacity (sdc_reloadcap): the owner's machine decides each round with
+-- exact checks on its own copy of the count (Cap == Max: full; Max - Cap ==
+-- 1: the last one) and the host adds what it is asked for. A client whose
+-- count came back late (lag, or several Round_In in one frame after a
+-- hitch) loaded past the capacity, and from then on every reload of that
+-- gun took the whole reserve (2026-11-13: a sawn-off with 42 of 6). Now the
+-- client counts its own requests at once and the game's checks stop at the
+-- capacity by themselves; the host never keeps more than the capacity.
 
 local PLAYER_BP = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:"
 local RL_POLL_MS = 100     -- ms: own loop montage check
@@ -435,24 +503,12 @@ local function coop_active()
     return S.role == "client"
 end
 
-local function locally_controlled(pawn)
-    local ok, v = pcall(function() return pawn:IsLocallyControlled() end)
-    return ok and v == true
-end
-
 local function anim_of(pawn)
     local mesh = ue.prop(pawn, "Mesh")
     if not ue.valid(mesh) then return nil end
     local anim = ue.try(function() return mesh:GetAnimInstance() end)
     if ue.valid(anim) then return anim end
     return nil
-end
-
--- true / false / nil (could not ask)
-local function montage_playing(anim, montage)
-    local ok, v = pcall(function() return anim:Montage_IsPlaying(montage) end)
-    if not ok or type(v) ~= "boolean" then return nil end
-    return v
 end
 
 local function is_loop_montage(pawn, montage)
@@ -483,6 +539,7 @@ local function send_loop_end(pawn, montage, why)
         end
     end
     M.stats.rl_ended = M.stats.rl_ended + 1
+    pcall(reloadcap.loop_ended)   -- the reload is over: its next one starts from the widget again
     if M.stats.rl_ended <= 5 or why ~= "finished" then
         log.info("combat: own loop reload %s ended here (%s, %.1f s) -> stopped on the other machines (Svr_StopMontage %s, RLSTOP %s)",
             ue.short(montage), why, os.clock() - rl.since, ok and "sent" or "FAILED", id and "sent" or "no player id")
@@ -648,6 +705,7 @@ end
 function M.install()
     start_melee()
     start_reload_watch()
+    reloadcap.install()
     -- AN_BoltAction_Rerack_Anim_Montage / Chr_AN_Shotgun_Pump_Montage hold only
     -- AnimNotify_PlayMontageNotify (named notifies), no sound notify
     log.info("sound relay MONT / RLSTOP: no sound (the chamber montages have no sound notifies; RLSTOP ends other players' loop reloads, whose insert sounds sdc_ownsounds' guard keeps at 15.5 m)")
@@ -656,14 +714,17 @@ end
 -- World change: the watched montage belonged to the old character.
 function M.reset(why)
     rl.montage, rl.pawn, rl.unreloaded = nil, nil, nil
+    own_mont = {}
+    reloadcap.reset()
     log.debug("combat: reset (%s)", tostring(why))
 end
 
 function M.status_line()
     local s = M.stats
-    return string.format("combat: chamber sent=%d played=%d | loop reloads own=%d ended=%d outlived-reload=%d after-reload chamber=%d | others stopped by RLSTOP=%d already stopped=%d | hook=%s | melee sent=%d applied=%d missed=%d dup=%d",
-        s.montages_sent, s.montages_played, s.rl_started, s.rl_ended, s.rl_orphans, s.rl_chamber,
-        s.rl_stopped, s.rl_idle, tostring(rl.hooked), s.melee_sent, s.melee_applied, s.melee_missed, s.melee_dup)
+    return string.format("combat: chamber sent=%d played=%d (own=%d, own already playing=%d) | loop reloads own=%d ended=%d outlived-reload=%d after-reload chamber=%d | others stopped by RLSTOP=%d already stopped=%d | hook=%s | melee sent=%d applied=%d missed=%d dup=%d | %s",
+        s.montages_sent, s.montages_played, s.montages_own, s.montages_own_busy, s.rl_started, s.rl_ended, s.rl_orphans, s.rl_chamber,
+        s.rl_stopped, s.rl_idle, tostring(rl.hooked), s.melee_sent, s.melee_applied, s.melee_missed,
+        s.melee_dup, reloadcap.status_line())
 end
 
 function M.host_tick()
@@ -687,6 +748,8 @@ function M.register_handlers()
     end)
     -- RLSTOP|player id|montage path (both directions): a loop reload ended
     net.on("RLSTOP", on_rlstop)
+    -- sdc_reloadcap: RLNOTE (host -> the player whose gun was set right)
+    reloadcap.register_handlers()
 end
 
 return M

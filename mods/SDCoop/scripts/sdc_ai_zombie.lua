@@ -25,14 +25,7 @@ M.BONES = { "calf_l", "calf_r", "Foot_L", "Foot_R", "lowerarm_l", "lowerarm_r", 
 -- standing capsule half height is 75, a crawler's 40 (Archetype_Crawler @27785)
 M.CRAWLER_HH = 60
 
-function M.vec(v)
-    if v == nil then return nil end
-    local x = ue.try(function() return v.X end)
-    local y = ue.try(function() return v.Y end)
-    local z = ue.try(function() return v.Z end)
-    if type(x) == "number" and type(y) == "number" and type(z) == "number" then return { X = x, Y = y, Z = z } end
-    return nil
-end
+M.vec = ue.vec
 
 -- Archetype letters from a Name as the Archetype_* events set it:
 -- c crawler, t toughened (crawler), s sprinter, u ultra-radiated, a acidic,
@@ -59,6 +52,135 @@ end
 
 -- The Feral Hound's armour (BP_Zombie_Dog ubergraph @264) renames it.
 function M.armored(n) return (n or ""):find("Armored", 1, true) ~= nil end
+
+-- ---------------------------------------------------------------------------
+-- Names in this machine's language
+-- ---------------------------------------------------------------------------
+-- A zombie's Name is its class's default Name (BP_Zombie_Roamer "Undead",
+-- BP_Zombie_Radiated "Radiated Undead", BP_Zombie_Dog "Undead Feral Hound",
+-- ...) put through the text its Archetype_* event formats it with
+-- (BP_MasterZombie: "{A} Sprinter", "Acidic {A}", ...; Toughened after
+-- Crawler), or replaced whole ("Ultra-Radiated Undead", the hound's armour).
+-- All are localized texts, so a host with a translation shows them in its
+-- language; the host sends which FORM its zombie's name is and each client
+-- builds that form from its own game's texts. Forms: "" not rolled, "h"
+-- shambler, "c" / "ct" crawler / toughened crawler, "s", "a", "g", "r",
+-- "u" (whole), "A" (the armoured hound, whole).
+-- The format texts by key in the game's localization table (namespace "",
+-- English source; work/re/json/BP_MasterZombie.json, BP_Zombie_Dog.json, 0.8.0).
+local NAME_TEXTS = {
+    h = { "A350A34C4C78C0E382329DB6B8FB5CF5", "{A} Shambler" },
+    c = { "393D6D484BFA1908C89999819243C8F4", "{A} Crawler" },
+    t = { "CF15AD12487D4B530D17139E6E5C98F5", "Toughened {A}" },
+    s = { "B75C469844FBE9A3913930AF445FFC73", "{A} Sprinter" },
+    a = { "BA9E1A864BD9F111621D4BB181A81DDC", "Acidic {A}" },
+    g = { "A0F3F08F4B606F17913742B1541DF96F", "{A} Grenadier" },
+    r = { "FAAE5E9D4834EA4B05C7C9B33C9AB988", "{A} Screamer" },
+    u = { "8532F4A247CFF485D199F9AB452B671F", "Ultra-Radiated Undead" },
+    A = { "3A4D1C264174094B82E619911498014D", "Armored Undead Feral Hound" },
+}
+M.NAME_TEXTS = NAME_TEXTS
+M.NAME_FORMS = { "", "h", "c", "ct", "s", "a", "g", "r", "u", "A" }
+local WHOLE = { u = true, A = true }
+local TEXT_LIB = "/Script/Engine.Default__KismetTextLibrary"
+local texts = {}     -- form letter -> this game's text; false: no way to look it up here
+local bases = {}     -- class name -> its default Name here ("" unknown)
+local forms = {}     -- class name .. "|" .. a name -> its form (false: none)
+M._name_cache = { texts = texts, bases = bases, forms = forms }   -- tests
+
+-- This game's text of a format / whole name. Not in the live table (no
+-- translation loaded for it here): the English source, which is what this
+-- game shows then. nil when the lookup itself fails (then nothing is built).
+local function local_text(letter)
+    local t = texts[letter]
+    if t ~= nil then return t or nil end
+    local e = NAME_TEXTS[letter]
+    local lib = e and ue.find_object(TEXT_LIB)
+    if not lib then texts[letter] = false return nil end
+    local out = {}
+    local ok, found = pcall(function() return lib:FindTextInLocalizationTable("", e[1], out, e[2]) end)
+    if not ok then texts[letter] = false return nil end
+    local s = found and ue.str(out.OutText) or ""
+    if s == "" then s = e[2] end
+    texts[letter] = s
+    return s
+end
+
+-- The class's default Name here (its CDO, in this game's language).
+local function base_name(z)
+    local cls = ue.class_name(z)
+    if cls == "" then return nil end
+    local b = bases[cls]
+    if b == nil then
+        local cdo = ue.try(function() return z:GetClass():GetCDO() end)
+        if not ue.valid(cdo) then
+            local p = ue.path(ue.try(function() return z:GetClass() end))
+            if p ~= "" then cdo = ue.find_object((p:gsub("%.([^%.:]+)$", ".Default__%1"))) end
+        end
+        b = ue.valid(cdo) and ue.str(ue.prop(cdo, "Name")) or ""
+        bases[cls] = b
+    end
+    return b ~= "" and b or nil
+end
+
+-- The name of zombie `z`'s class in form `form`, in this game's language;
+-- nil when it cannot be built here.
+function M.build_name(z, form)
+    if type(form) ~= "string" then return nil end
+    if WHOLE[form] then return local_text(form) end
+    local name = base_name(z)
+    if not name then return nil end
+    for letter in form:gmatch(".") do
+        local p = local_text(letter)
+        if not p then return nil end
+        local a = name
+        name = (p:gsub("{A}", function() return a end))
+    end
+    return name
+end
+
+-- Which form `name` is for `z`'s class (the name as this game shows it);
+-- nil when none matches (a translation patched into the assets, a name
+-- from elsewhere).
+function M.name_form(z, name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local ck = ue.class_name(z) .. "|" .. name
+    local f = forms[ck]
+    if f == nil then
+        f = false
+        for _, cand in ipairs(M.NAME_FORMS) do
+            if M.build_name(z, cand) == name then f = cand break end
+        end
+        forms[ck] = f
+    end
+    return f or nil
+end
+
+-- Archetype letters of a form ("-" none).
+function M.form_arch(f)
+    local s = (f or ""):gsub("[hA]", "")
+    return s == "" and "-" or s
+end
+
+-- Language-free versions of arch_from_name / rolled_name / armored: by the
+-- form of the name when it is one of this game's, else the English parse.
+function M.arch_of(z, name)
+    local f = M.name_form(z, name)
+    if f then return M.form_arch(f) end
+    return M.arch_from_name(name)
+end
+
+function M.rolled(z, name)
+    local f = M.name_form(z, name)
+    if f then return f ~= "" and f ~= "A" end
+    return M.rolled_name(name)
+end
+
+function M.is_armored(z, name)
+    local f = M.name_form(z, name)
+    if f then return f == "A" end
+    return M.armored(name)
+end
 
 function M.obj_path(o)
     if not ue.valid(o) then return "" end
@@ -168,7 +290,7 @@ function M.describe(z)
     local mesh = ue.prop(z, "Mesh")
     local name = ue.str(ue.prop(z, "Name"))
     local d = {
-        obj = ue.short(z), type = M.type_of(z), name = name, arch = M.arch_from_name(name),
+        obj = ue.short(z), type = M.type_of(z), name = name, arch = M.arch_of(z, name),
         mesh = "-", mat = "-", hh = M.capsule_hh(z), loc = M.where(z),
     }
     if ue.valid(mesh) then

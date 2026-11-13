@@ -261,6 +261,12 @@ package.preload["sdc_ue"] = function()
         for _, p in ipairs(W.pawns) do if p._class == c then out[#out + 1] = p end end
         return out
     end
+    -- sdc_ue.player_chars: the shared list of valid player characters
+    U.player_chars = function()
+        local out = {}
+        for _, p in ipairs(U.find_all("BP_PlayerCharacter_C")) do if U.valid(p) then out[#out + 1] = p end end
+        return out
+    end
     U.find_object = function(path)
         if path == MARKER_PATH then return MARKER_CLS end
         if path:find("WidgetComponent") then return obj("Class") end

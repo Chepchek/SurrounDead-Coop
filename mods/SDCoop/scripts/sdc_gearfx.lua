@@ -36,7 +36,6 @@
 --           rotation from the character's eyes
 --   client: GetBaseAimRotation (replicated RemoteViewPitch + actor yaw, which
 --           follows the aim while aiming / hip firing) from the eyes
---   older peers' cp / cy (sdc_pawnstate.aim_of) first, where sent.
 --
 -- Holstered weapons. The game never touches a module when its weapon goes to
 -- the back or hip (EquipActorToSocket only re-attaches the weapon); a module
@@ -47,6 +46,15 @@
 -- in their hands (replicated BP_JigHelperComp.ActiveWeapon): a holstered
 -- weapon's parts are hidden (SetVisibility), drawn again they are shown as
 -- they were - the module's state, timers and battery stay the game's.
+-- Such a module's 0.01 s Event_Laser timer keeps running for as long as the
+-- weapon stays away (0.8.1 host: a friend's rifle on the back, 100 calls a
+-- second for 26 minutes, 12-20 ms/s - the owner lookup, slot check and
+-- visibility check on every call). The laser hook remembers the module's
+-- address once it found the weapon not in hand (gate.away) and returns at
+-- once, like for this player's own lasers, while the gate's last poll still
+-- has another slot in that player's hands, at most AWAY_S. The draw ends it
+-- at the gate's next poll (the gate shows the parts and drops the record),
+-- the beam is aimed again from the next Event_Laser.
 --
 -- Weapons that reach a client already fitted (client): what a sight,
 -- suppressor or muzzle brake DOES is not replicated. BP_FirearmPickup binds
@@ -74,10 +82,14 @@ local ue = require("sdc_ue")
 local pawnstate = require("sdc_pawnstate")
 local items = require("sdc_items")
 
-local M = { stats = { lasers = 0, host_states = 0, hidden = 0, shown = 0, refits = 0, refit_errors = 0,
-                      refit_sweeps = 0 } }
+local M = {}
 local S
 function M.init(state) S = state end
+
+-- A host nobody is connected to: no other player's gear to fix.
+local function host_alone()
+    return S.role == "host" and #(S.remote_pcs or {}) == 0
+end
 
 local LASERS = {
     "/Game/Inventory/Items/LocalAttachments/Tactical/BP_SmallTacticalLaserSightLocalAttachment.BP_SmallTacticalLaserSightLocalAttachment_C:Event_Laser",
@@ -166,10 +178,6 @@ local function dist2(a, b)
     return dx * dx + dy * dy + dz * dz
 end
 
--- Lights are switched by the game itself now (see the header): kept so that
--- older callers of a 200 ms loop have something to call.
-function M.tick() end
-
 -- ---------------------------------------------------------------------------
 -- Holster gate: light / laser parts only for the weapon in hand
 -- ---------------------------------------------------------------------------
@@ -179,25 +187,14 @@ local gate = {
     slots = {},    -- [weapon address] = { slot =, pawn = pawn address }
     hidden = {},   -- [module address] = { names = { [part] = true }, pawn = pawn address }
     miss = {},     -- [weapon address] = os.clock() of a slot lookup that did not find it
+    -- [module address] = { t = os.clock(), pk = pawn address, slot = its weapon's
+    -- slot, n = Event_Laser calls skipped }: a laser found on a weapon not in hand
+    away = {},
     swept = -1e9,  -- os.clock() of the last full pass
     loop = false,  -- the gate loop was registered
     logged = 0,
 }
 M.gate = gate
-
--- Other players' characters here (the host: every remote character; a
--- client: replicated ones, not a stale local copy).
-local function remote_players()
-    local out = {}
-    local list = (ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {}
-    for _, p in ipairs(list) do
-        if ue.valid(p) then
-            local replicated = (S.role == "host") or ue.role(p) == ue.ROLE_SIMULATED
-            if replicated and not is_local(p) then out[#out + 1] = p end
-        end
-    end
-    return out
-end
 
 -- The replicated slot in hand ("Jig.PlayerSlot.PrimaryWeapon", "None"), or nil.
 local function active_slot(pawn)
@@ -268,15 +265,18 @@ local function set_shown(pawn, weapon, m, show, why)
     if not mk then return false end
     local rec = gate.hidden[mk]
     if show then
+        -- in hand: the laser hook aims its beam again from the next call
+        local off = gate.away[mk]
+        gate.away[mk] = nil
         if not rec then return false end
         gate.hidden[mk] = nil
         for name in pairs(rec.names) do
             local c = ue.prop(m, name)
             if ue.valid(c) then pcall(function() c:SetVisibility(true, false) end) end
         end
-        M.stats.shown = M.stats.shown + 1
-        gate_log("gearfx: holster: %s drew %s: %s light/laser shown again (module state %s, %s; %s)",
-            ue.short(pawn), ue.class_name(weapon), ue.class_name(m), state_tag(m), lit_text(m), why)
+        gate_log("gearfx: holster: %s drew %s: %s light/laser shown again (module state %s, %s; %s%s)",
+            ue.short(pawn), ue.class_name(weapon), ue.class_name(m), state_tag(m), lit_text(m), why,
+            (off and off.n > 0) and string.format("; %d laser call(s) skipped while away", off.n) or "")
         return true
     end
     local names = rec and rec.names or {}
@@ -293,7 +293,6 @@ local function set_shown(pawn, weapon, m, show, why)
     if next(names) == nil then return false end
     gate.hidden[mk] = { names = names, pawn = addr(pawn) }
     if changed and not rec then
-        M.stats.hidden = M.stats.hidden + 1
         gate_log("gearfx: holster: %s put %s away: %s light/laser hidden here (module state %s, %s; %s)",
             ue.short(pawn), ue.class_name(weapon), ue.class_name(m), state_tag(m), lit_text(m), why)
     end
@@ -316,6 +315,9 @@ local function pass_pawn(p, pk, active, why)
     for k, r in pairs(gate.hidden) do
         if r.pawn == pk and not mods[k] then gate.hidden[k] = nil end
     end
+    for k, r in pairs(gate.away) do
+        if r.pk == pk and not mods[k] then gate.away[k] = nil end
+    end
 end
 
 -- Records of characters (and their weapons / modules) not seen any more.
@@ -323,6 +325,7 @@ local function prune(seen)
     for k in pairs(gate.tags) do if not seen[k] then gate.tags[k] = nil end end
     for k, r in pairs(gate.slots) do if not seen[r.pawn] then gate.slots[k] = nil end end
     for k, r in pairs(gate.hidden) do if not seen[r.pawn] then gate.hidden[k] = nil end end
+    for k, r in pairs(gate.away) do if not seen[r.pk] then gate.away[k] = nil end end
     gate.miss = {}
 end
 
@@ -331,11 +334,18 @@ end
 -- ProcessAttachments; a re-lit module of a holstered weapon is hidden again).
 local function gate_body()
     if not S or (S.role ~= "host" and S.role ~= "client") then return end
+    if host_alone() then
+        -- the last player left: their records go
+        if next(gate.tags) or next(gate.slots) or next(gate.hidden) or next(gate.away) then prune({}) end
+        return
+    end
     local now = os.clock()
     local sweep = now - gate.swept >= GATE_SWEEP or now < gate.swept
     if sweep then gate.swept = now end
     local seen = {}
-    for _, p in ipairs(remote_players()) do
+    -- other players' characters here (the host: every remote character; a
+    -- client: replicated ones, not a stale local copy)
+    for _, p in ipairs(pawnstate.others()) do
         local pk = addr(p)
         local active = pk and active_slot(p)
         if pk then seen[pk] = true end
@@ -367,7 +377,8 @@ local function ensure_gate_loop()
         GATE_MS, ok and "" or (", loop FAILED: " .. tostring(err) .. "; once a second instead"))
 end
 
--- Laser hook: the weapon is not in hand (true), in hand (false), unknown (nil).
+-- Laser hook: the weapon is not in hand (true), in hand (false), unknown (nil);
+-- known: its gate.slots record second.
 local function holstered_now(pawn, weapon)
     local wk = addr(weapon)
     if not wk then return nil end
@@ -387,7 +398,7 @@ local function holstered_now(pawn, weapon)
     end
     local active = active_slot(pawn)
     if not active then return nil end
-    return rec.slot ~= active
+    return rec.slot ~= active, rec
 end
 
 -- ---------------------------------------------------------------------------
@@ -421,8 +432,6 @@ end
 -- Where the owner looks from and along: origin, rotation, source name.
 local function aim_ray(pawn, start)
     local eye = eyes(pawn) or start
-    local old = pawnstate.aim_of(pawn)
-    if old then return eye, old, "peer aim (cp/cy)" end
     if S.role == "host" then
         local pc = ue.prop(pawn, "Controller")
         if ue.valid(pc) then
@@ -462,13 +471,40 @@ local aim_logged = {}   -- [weapon class .. "|" .. source] = true
 local REUSE_S = 0.004
 local last_end = {}     -- [module address] = { t = os.clock(), p = end point }
 local last_end_n = 0
+-- This player's own laser modules (~100 Event_Laser a second): skipped by
+-- address for MINE_S without the owner lookup (~6 engine calls); then
+-- looked up again (an address can be reused by another module).
+local MINE_S = 1.0
+local mine = {}         -- [module address] = os.clock() it was found to be this player's
+local mine_n = 0
+-- Another player's laser on a weapon not in hand (gate.away, see the header):
+-- skipped by address while the gate has not seen that slot drawn, at most
+-- AWAY_S; then looked up again (the gate loop may be down, an address can be
+-- reused).
+local AWAY_S = 0.5
+M.AWAY_S = AWAY_S
+local function note_away(ak, srec, now)
+    local off = gate.away[ak]
+    if off then
+        off.t, off.pk, off.slot = now, srec.pawn, srec.slot
+    else
+        gate.away[ak] = { t = now, pk = srec.pawn, slot = srec.slot, n = 0 }
+    end
+end
 local beam_param = nil
 local function laser_fix(c)
-    if not S or (S.role ~= "client" and S.role ~= "host") then return end
+    if not S or (S.role ~= "client" and S.role ~= "host") or host_alone() then return end
     local att = c and c:get()
     if not ue.valid(att) then return end
     local ak = addr(att)
     local now = os.clock()
+    local own_at = ak and mine[ak]
+    if own_at and now - own_at < MINE_S and now >= own_at then return end
+    local off = ak and gate.away[ak]
+    if off and now - off.t < AWAY_S and now >= off.t and gate.tags[off.pk] ~= off.slot then
+        off.n = off.n + 1
+        return
+    end
     local prev = ak and last_end[ak]
     if prev and now - prev.t < REUSE_S and now >= prev.t then
         local ns0 = ue.prop(att, "NS_LaserSight")
@@ -476,11 +512,27 @@ local function laser_fix(c)
         return
     end
     local pawn, weapon = owner_pawn(att)
-    if not is_player(pawn) or is_local(pawn) then return end
+    if not is_player(pawn) then return end
+    if is_local(pawn) then
+        if ak then
+            if not own_at then
+                mine_n = mine_n + 1
+                -- modules come and go with weapons: start over now and then
+                if mine_n > 64 then mine, mine_n = {}, 1 end
+            end
+            mine[ak] = now
+        end
+        return
+    end
+    if ak and own_at then
+        mine[ak] = nil
+        mine_n = mine_n - 1
+    end
     -- a holstered weapon's beam stays hidden; drawn again it is shown
-    local away = holstered_now(pawn, weapon)
+    local away, srec = holstered_now(pawn, weapon)
     if away then
         set_shown(pawn, weapon, att, false, "laser of a weapon not in hand")
+        if ak then note_away(ak, srec, now) end
         return
     end
     if away == false and gate.hidden[ak or -1] then set_shown(pawn, weapon, att, true, "laser") end
@@ -501,7 +553,6 @@ local function laser_fix(c)
             end
             last_end[ak] = { t = now, p = p }
         end
-        M.stats.lasers = M.stats.lasers + 1
         local key = ue.class_name(weapon) .. "|" .. source
         if not aim_logged[key] then
             aim_logged[key] = true
@@ -535,6 +586,7 @@ end
 -- the new state; ProcessAttachments applies it to the local module actors
 -- (Jig_SetAttachmentActiveState) and reconciles them, exactly what clients
 -- run from OnRep_RepAttachments.
+local host_states = 0   -- client switches applied on the host (the first are logged)
 local function on_host_state(c, uid_p, state_p)
     if S.role ~= "host" then return end
     local comp = c and c:get()
@@ -544,8 +596,8 @@ local function on_host_state(c, uid_p, state_p)
     -- the host's own switches: the game pre-executes them locally
     if not is_player(pawn) or is_local(pawn) then return end
     local ok, err = pcall(function() comp:ProcessAttachments() end)
-    M.stats.host_states = M.stats.host_states + 1
-    if M.stats.host_states <= 3 or not ok then
+    host_states = host_states + 1
+    if host_states <= 3 or not ok then
         local tag = ue.try(function() return ue.str(state_p:get().TagName) end)
         log.info("gearfx: %s of %s -> %s on the host (ProcessAttachments ok=%s%s)", ue.class_name(weapon),
             ue.short(pawn), tostring(tag), tostring(ok), ok and "" or (" " .. tostring(err)))
@@ -620,7 +672,6 @@ local function refit_weapon(weapon, why)
     if n == 0 then return false end
     local before = fit_text(weapon)
     local ok, err = pcall(function() comp:ProcessAttachments() end)
-    if ok then M.stats.refits = M.stats.refits + 1 else M.stats.refit_errors = M.stats.refit_errors + 1 end
     refit.logged = refit.logged + 1
     local owner = ue.try(function() return weapon:GetOwner() end)
     local fmt = "gearfx: %s of %s %s with %d module(s): ProcessAttachments run again (ok=%s%s): was %s -> now %s"
@@ -658,7 +709,6 @@ function M.refit_own(why)
     if not S or S.role ~= "client" then return 0 end
     local pawn = ue.local_pawn()
     if not ue.valid(pawn) then return 0 end
-    M.stats.refit_sweeps = M.stats.refit_sweeps + 1
     local looked, done = 0, 0
     for _, it in pairs(items.equipped_of(pawn)) do
         local w = it.actor
@@ -677,13 +727,18 @@ function M.refit_own(why)
     return done
 end
 
--- 1 s ticks (sdc_session phase B)
+-- 1 s ticks (sdc_session phase B). The host's hooks and gate loop wait for
+-- a remote player.
 local function common_tick()
     try_hook_lasers()
     ensure_gate_loop()
     if not gate.loop_ok then M.gate_tick() end
 end
-function M.host_tick() try_hook_host(); common_tick() end
+function M.host_tick()
+    if host_alone() then return end
+    try_hook_host()
+    common_tick()
+end
 function M.client_tick() try_hook_refit(); common_tick() end
 
 return M

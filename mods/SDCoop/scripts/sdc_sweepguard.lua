@@ -71,7 +71,7 @@ end
 -- Not destroyed. UE4SS's own IsValid stays true for a destroyed actor until
 -- the garbage collector runs (and ksl:IsValid(o) would call that same Lua
 -- method), so the engine's KismetSystemLibrary.IsValid is called through its
--- UFunction object: fn(context, object).
+-- UFunction object: fn(context, object). Shared: sdc_sync (AI ghosts).
 local isvalid_fn, isvalid_broken = nil, false
 local function live(o)
     if not ue.valid(o) then return false end
@@ -82,11 +82,12 @@ local function live(o)
     local ok, v = pcall(isvalid_fn, k, o)
     if not ok or type(v) ~= "boolean" then
         isvalid_broken = true
-        log.warn("guard: KismetSystemLibrary.IsValid from Lua failed (%s); destroyed characters are not told apart from live ones", tostring(v))
+        log.warn("guard: KismetSystemLibrary.IsValid from Lua failed (%s); destroyed actors are not told apart from live ones (player sweeps, AI ghosts)", tostring(v))
         return true
     end
     return v
 end
+M.live = live
 
 local function is_dead(p)
     local f = players.helpers and players.helpers.is_dead
@@ -241,10 +242,13 @@ local function on_sweep(wco_p, cls_p)
     if not ok then log.err_throttled("guard-sweep", "guard: %s sweep: %s", caller, tostring(err)) end
 end
 
+-- A failed registration is retried on later ticks, HOOK_TRIES times at most.
+local HOOK_TRIES = 5
+local hook_tries = 0
 local function install_hook()
-    if hooked then return end
+    if hooked or hook_tries >= HOOK_TRIES then return end
     if not ue.find_object(SWEEP_FN) then return end
-    hooked = true
+    hook_tries = hook_tries + 1
     -- shared pre-only engine hook (sdc_ue.hook_native): the game calls
     -- GetAllActorsOfClass ~100 times a second; no empty post callback
     local ok, err = ue.hook_native(SWEEP_FN, "sweepguard", function(_, wco_p, cls_p)
@@ -255,8 +259,12 @@ local function install_hook()
             log.err_throttled("guard-hook", "guard: GetAllActorsOfClass hook: %s", tostring(e))
         end
     end)
-    log.info("guard: GetAllActorsOfClass pre-hook %s%s (the game's player-character sweeps keep remote players' characters)",
-        ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+    hooked = ok == true
+    if ok or hook_tries == 1 or hook_tries == HOOK_TRIES then
+        log.info("guard: GetAllActorsOfClass pre-hook %s%s (the game's player-character sweeps keep remote players' characters)%s",
+            ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)),
+            (not ok and hook_tries == HOOK_TRIES) and "; not tried again" or "")
+    end
 end
 
 -- A remote player's living character must not disappear or lose its

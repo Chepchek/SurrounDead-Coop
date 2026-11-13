@@ -24,6 +24,7 @@ function ue.set_prop(o, n, v) if not ue.valid(o) then return false end o[n] = v 
 function ue.call(o, f, ...) return pcall(o[f], o, ...) end
 local world = {}
 function ue.find_all(cls) return world[cls] or {} end
+function ue.player_chars() return world.BP_PlayerCharacter_C or {} end
 function ue.find_object(p) return { __name = p, __cls = "Class", FlashlightIntensity = 5000 } end
 function ue.is_runtime_spawned() return true end
 function ue.role(a) return a and a.Role or -1 end

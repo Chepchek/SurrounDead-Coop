@@ -276,9 +276,16 @@ local function fresh_modules(values)
             return ow and ctx_map[ow] or nil
         end,
         classify = function(o) return ctx_map[o] and "remote" or "local" end,
+        -- (sdc_dialogue / sdc_quests take addr from sdc_ctx)
+        addr = function(o)
+            local ok, a = pcall(function() return o:GetAddress() end)
+            if ok then return a end
+        end,
     }
     local cfg = require("sdc_config")
     cfg.values = values or {}
+    -- the log-only quest hooks (BeginQuest, PendingUpdateList) need debug_probes
+    require("sdc_log").probes_enabled = true
     local quests = require("sdc_quests")
     return quests, require("sdc_dialogue"), require("sdc_net")
 end
@@ -409,11 +416,13 @@ rpc._p.Pawn = rpawn
 from_client("SDC1|QT|" .. POWER_TASK .. "|LaboratoryBunker|1")
 local c2 = W.cndt[#W.cndt]
 check(c2 and c2.comp == rcomp and c2.task == W.power and c2.arg == "LaboratoryBunker", "host: QT credited to the client's own component")
--- generator on the host away from the host's character
+-- generator on the host away from the host's character (a client powered it,
+-- the host's copy ran Event_TurnOn): the group's progress, the host's own
+-- task counts too (before: None, the host's task stuck - the generator was on)
 local gen = new({ "BP_LaboratoryGenerator_C" }, "BP_LaboratoryGenerator_C_1", { _loc = { X = 50000, Y = 0, Z = 0 }, QuestArgument = "LaboratoryBunker" })
 local g1 = param(gen)
 fire(GNC, param(LIBCDO), g1)
-check(g1:get() == nil, "host: generator turned on away from the host: None (no credit to the host)")
+check(g1:get() == gen, "host: generator turned on 500 m from the host: untouched (the host's own task counts too)")
 gen._p._loc = { X = 100, Y = 0, Z = 0 }
 local g2 = param(gen)
 fire(GNC, param(LIBCDO), g2)
@@ -449,6 +458,33 @@ check(fq and fq[2] == W.lab_quest, "host: QQ forget: ForgetQuest on the client's
 check(quests.persist_bind(rpc, "Slot1", "s765", true) == false and called(rcomp, "Load") ~= nil, "host: persist_bind loads (no save yet -> false)")
 check(quests.persist_save(rpc, "test") == true and called(rcomp, "Save")[2] == "Slot1_SDQuests_s765", "host: persist_save: Narrative Save to <slot>_SDQuests_<key>")
 check(quests.persist_bind(rpc, "Slot1", "s765", true) == true, "host: persist_bind loads the saved quests")
+-- 13.11: Narrative refires a finished quest's events when its save loads (the
+-- exe's UNarrativeEvent constructor: bRefireOnLoad = true); the start quest's
+-- reward ran inside the mod's Load of the client's quests -> QX|300 and a
+-- "+300 XP" toast at every join. Not sent now; a real reward later still is.
+local function reward300() return new({ "Quest_Event_RewardPlayerXP_C" }, "Event_RewardPlayerXP", { Amount = 300 }) end
+local nqx = #msgs("QX", false)
+local load0 = rcomp._m.Load
+rcomp._m.Load = function(self, name, slot)
+    fire(REWARD_XP, param(reward300()), param(rpawn), param(rpc), param(rcomp))
+    return load0(self, name, slot)
+end
+check(quests.persist_bind(rpc, "Slot1", "s765", true) == true and #msgs("QX", false) == nqx
+    and logged("reward event (300 XP) ran again while their quests were loaded (Narrative refires quest events on Load): not sent") ~= nil,
+    "host: the reward refired inside the Load of the client's quests: not sent")
+rcomp._m.Load = load0
+advance(1)
+fire(REWARD_XP, param(reward300()), param(rpawn), param(rpc), param(rcomp))
+check(#msgs("QX", false) == nqx, "host: 1 s after that Load (a deferred refire): not sent either")
+advance(2)
+fire(REWARD_XP, param(reward300()), param(rpawn), param(rpc), param(rcomp))
+check(#msgs("QX", false) == nqx + 1, "host: 3 s later a reward of that quest log is real again: sent")
+-- the host's own rewards are noted (sdc_savecheck explains the XP of the game's own quest load)
+local hr = quests.host_rewards_since(0)
+check(#hr == 1 and hr[1].amount == 400, "host: the host's own reward noted for the save check (" .. #hr .. ")")
+-- review of fix 16: with the host's character then (a load's refires run on a
+-- new one; sdc_savecheck leaves out the rewards of the character before it)
+check(hr[1] and hr[1].pawn == hpawn:GetFullName(), "host: the noted reward carries the host's character (" .. tostring(hr[1] and hr[1].pawn) .. ")")
 quests.host_tick(1030)   -- first signature
 local nsave = n_called(rcomp, "Save")
 rcomp._p.QuestList = tarray({ new({ "Quest" }, "Q1", { QuestCompletion = 1, QuestName = "Camp" }) })

@@ -24,6 +24,7 @@ function ue.set_prop(o, n, v) if not ue.valid(o) then return false end o[n] = v 
 function ue.call(o, f, ...) return pcall(o[f], o, ...) end
 local all = {}
 function ue.find_all() return all end
+function ue.player_chars() return all end
 function ue.find_object(p) return nil end
 function ue.role(a) return a and a.Role or -1 end
 function ue.local_pawn() return ue.__me end

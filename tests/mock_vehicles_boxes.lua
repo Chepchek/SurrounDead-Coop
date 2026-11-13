@@ -8,6 +8,11 @@
 -- player's inventory once, the amount added, the state to every client, the answer (VBOXR).
 -- Client: that note asks the host once per hold, the false note goes, VBOXR applies the game's
 -- success step (or the game's note), nothing is reported twice.
+-- C7..C11 (13.11, 0.11.0: in the game that note never reached the mod, so a client's repair
+-- never asked): the client's tick at the hold's end asks instead; UseGasCan's hook still asks
+-- for a refuel (once); leaving the box, a flag the game never took down and another option
+-- pressed during the hold ask nothing. The whole round with both machines:
+-- mock_vehicles_boxes_e2e.lua.
 -- usage: lua mock_vehicles_boxes.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
@@ -167,7 +172,15 @@ end
 local ctx = require("sdc_ctx")
 local net = require("sdc_net")
 local sent = {}
-net.send_to = function(pc, kind, ...) sent[#sent + 1] = { to = pc, kind = kind, args = { ... } }; return true end
+net.send_to = function(pc, kind, ...)
+    local args = { ... }
+    -- (0.7.3: VSTATE|*|<12 fields>|<12 fields>|...: one entry per vehicle record, as the single form was)
+    if kind == "VSTATE" and args[1] == "*" then
+        for i = 2, #args, 12 do sent[#sent + 1] = { to = pc, kind = kind, args = table.move(args, i, i + 11, 1, {}) } end
+        return true
+    end
+    sent[#sent + 1] = { to = pc, kind = kind, args = args }; return true
+end
 net.send_to_host = function(kind, ...) sent[#sent + 1] = { to = "host", kind = kind, args = { ... } }; return true end
 net.broadcast = function(pcs, kind, ...) for _, pc in ipairs(pcs) do net.send_to(pc, kind, ...) end end
 local function deliver(kind, args, from_pc)
@@ -757,6 +770,95 @@ T = T + 6
 gfl:CreateNotificationUI("No gas found", nil, {}, 2, false, me)
 gfl:CreateNotificationUI("Vehicle hitched", nil, {}, 2, false, ctruck)
 check(#msgs("VFUEL", "host") == 0 and #msgs("VREPAIR", "host") == 0, "C6: nothing sent")
+
+print("C7. the game's note never reaches the mod (13.11 in the game): the tick sees the hold's end and asks")
+local note_hook = hooks[NOTE_HOOK]
+hooks[NOTE_HOOK] = nil
+T = T + 6
+chc._p.CurrentHealth = 40
+mjig._widgets.kit = 1
+sent = {}
+ctruck:OnExecuteInteract(me, OPT_KIT)
+check(ctruck._p.IsHeld == true, "C7: the game's repair hold here")
+T = T + 5
+V.tick()
+check(#msgs("VREPAIR", "host") == 0, "C7: nothing asked while the hold runs")
+T = T + 5
+ctruck._hold_end()
+check(#msgs("VREPAIR", "host") == 0 and chc._p.CurrentHealth == 40, "C7: the kit branch ran here: nothing added, its note asked nothing")
+T = T + 0.5
+V.tick()
+q = last("VREPAIR", "host")
+check(q and tonumber(q[5]) == 102.5 and tonumber(q[6]) == 62.5, "C7: the tick asked the host: +62.5")
+check(said("seen in the tick") ~= nil, "C7: logged")
+T = T + 0.5
+V.tick()
+check(#msgs("VREPAIR", "host") == 1, "C7: asked once")
+deliver("VBOXR", { "repair", "ok", "1050", "0", "80", ctruck._cls, "102.5", "125.0" }, cl_pc)
+check(chc._p.CurrentHealth == 102.5, "C7: the host's answer applied here")
+
+print("C8. refuel without the note: UseGasCan's own hook asks, the tick does not ask again")
+T = T + 6
+cfc._p.CurrentFuel = 300
+mjig._widgets.gas = 1
+sent = {}
+ctruck:OnExecuteInteract(me, OPT_GAS)
+T = T + 10
+ctruck._hold_end()
+check(#msgs("VFUEL", "host") == 1 and said("UseGasCan added nothing here") ~= nil, "C8: UseGasCan's hook asked")
+T = T + 0.5
+V.tick()
+T = T + 0.5
+V.tick()
+check(#msgs("VFUEL", "host") == 1, "C8: one ask")
+
+print("C9. this player leaves the box during the hold: nothing asked")
+T = T + 6
+chc._p.CurrentHealth = 40
+mjig._widgets.kit = 1
+sent = {}
+ctruck:OnExecuteInteract(me, OPT_KIT)
+T = T + 3
+ctruck._p.IsHeld = false
+fire_post("OnEndRepairInteract", param(ctruck), param(me))
+T = T + 7.5
+V.tick()
+T = T + 3
+V.tick()
+check(#msgs("VREPAIR", "host") == 0, "C9: nothing asked")
+
+print("C10. the game never started its delay (flag left up): dropped, nothing asked")
+T = T + 6
+mjig._widgets.kit = 1
+sent = {}
+ctruck:OnExecuteInteract(me, OPT_KIT)
+T = T + 10.5
+V.tick()
+check(#msgs("VREPAIR", "host") == 0, "C10: flag still up at the hold's time: nothing asked yet")
+T = T + 3
+V.tick()
+check(#msgs("VREPAIR", "host") == 0 and warned("its last step never ran"), "C10: dropped with a warning")
+check(ctruck._p.IsHeld == false, "C10: the stuck flag cleared (the next press starts a hold, not only clears it)")
+T = T + 1
+V.tick()
+check(#msgs("VREPAIR", "host") == 0, "C10: nothing asked later")
+
+print("C11. another option pressed on the car during the hold: the hold is over, nothing asked")
+T = T + 6
+chc._p.CurrentHealth = 40
+ctruck._p.IsHeld = false
+mjig._widgets.kit = 1
+sent = {}
+ctruck:OnExecuteInteract(me, OPT_KIT)
+T = T + 4
+ctruck:OnExecuteInteract(me, "Jig.InteractOptions.Inspect")
+check(ctruck._p.IsHeld == false and said("ended by another option") ~= nil, "C11: the game's press cleared the hold; logged")
+T = T + 6.5
+V.tick()
+T = T + 3
+V.tick()
+check(#msgs("VREPAIR", "host") == 0, "C11: nothing asked")
+hooks[NOTE_HOOK] = note_hook
 
 print("status: " .. V.status_line())
 print(string.format("%d passed, %d failed", passes, fails))

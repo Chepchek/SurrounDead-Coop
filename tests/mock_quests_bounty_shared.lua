@@ -293,6 +293,11 @@ local function fresh_modules(values)
             return ow and ctx_map[ow] or nil
         end,
         classify = function(o) return ctx_map[o] and "remote" or "local" end,
+        -- (sdc_dialogue / sdc_quests take addr from sdc_ctx)
+        addr = function(o)
+            local ok, a = pcall(function() return o:GetAddress() end)
+            if ok then return a end
+        end,
     }
     local cfg = require("sdc_config")
     cfg.values = values or {}

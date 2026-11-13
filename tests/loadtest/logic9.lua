@@ -74,6 +74,8 @@ local me = { __name = "Me", __cls = "BP_PlayerCharacter_C", IsLocallyControlled 
 ue.__me = me
 local mycomp = { __name = "MyJig", GetOwner = function() return me end, LocalJSIContainers = arr({}) }
 me.BP_JigMultiplayer = mycomp
+-- (0.7.3: the RequestServerData hook, which only feeds the "no contents" warning, is on with config debug)
+log.debug_enabled = true
 items.client_tick()
 -- a repair sets a durability in the empty data here: sent, and Updated answered
 local up = P(false)
@@ -106,8 +108,16 @@ local inv = {
   { uid = 7, n = 1, id = "DA_Pistol", x = 40, y = 100 },
   { uid = 8, n = 1, id = "DA_WeaponCleaningKit", x = 50, y = 50 } }
 local granted, setdur = {}, {}
+-- (2026-11-13: a gain goes where the client's screen put it - grid 1 here -
+-- with the plugin's add into that grid, not AddNewItemSomewhere)
 local djig = setmetatable({ __name = "GuestJig", GetOwner = function() return guest end,
-  AddNewItemSomewhere = function(_, da, n, i, ic, drop, spec, a, d, uid) granted[#granted + 1] = da; a.Added = true; d["Dropped?"] = false end,
+  AddNewItemSomewhere = function() error("the any-grid add is not used for gains") end,
+  Generate_AddNewItemToContainer = function(_, g, da, n, info, res)
+    granted[#granted + 1] = da
+    inv[#inv + 1] = { uid = 300 + #granted, n = n, id = da.__name, x = 100, y = 100 }
+    res["Added?"] = true
+  end,
+  CLIENT_AddNewItem = function() end,
   ServerFunc_UpdateDurabilityByUID = function(_, g, nd, out) setdur[#setdur + 1] = { a = g.A, x = nd.X, y = nd.Y }
     for _, e in ipairs(inv) do if e.uid == g.A then e.x = nd.X end end; out.Updated = true end },
   { __index = function(_, k)
@@ -115,7 +125,7 @@ local djig = setmetatable({ __name = "GuestJig", GetOwner = function() return gu
       local list = {}
       for _, e in ipairs(inv) do list[#list + 1] = { [F_USID] = G(e.uid),
         [F_INFO] = { [F_COUNT] = e.n, [F_ITEMID] = { __name = e.id }, [F_DUR] = { X = e.x, Y = e.y } } } end
-      return arr({ { [F_ITEMS] = arr(list) } })
+      return arr({ { ["ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"] = G(1), [F_ITEMS] = arr(list) } })
     end end })
 guest.BP_JigMultiplayer = djig
 local clean = { __name = "DA_WaterBottle", __cls = "JigsawItem_DataAsset_C", __path = "/Game/I/DA_WaterBottle.DA_WaterBottle" }
@@ -123,7 +133,7 @@ assets[clean.__path] = clean
 items.host_tick({ pc })
 assert(hooks[JIG .. "SERVER_RequestRemoveItem"], "remove hook missing")
 -- purify: the client's IGAIN for the clean bottle, then the two removes
-handlers.IGAIN({ clean.__path, "1" }, pc)
+handlers.IGAIN({ clean.__path, "1", "c", "1:0:0:0", "3" }, pc)
 assert(#granted == 0, "granted before the use")
 table.remove(inv, 1)
 hooks[JIG .. "SERVER_RequestRemoveItem"](C(djig), P(djig), P(G(1)), P(1), P(false))

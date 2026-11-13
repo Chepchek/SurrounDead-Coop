@@ -3,8 +3,7 @@
 -- Joining through Steam is done by sdc_steamlink: the game stays on plain
 -- UDP (IpNetDriver) and the helper SDCoopSteamLink.exe carries it over
 -- Steam P2P. The game's own SteamSocketsNetDriver (`open steam.<id>:7777`)
--- never came up in this build; that path is used only with config
--- steam_p2p = true (an experiment) or when the helper is off.
+-- never came up in this build and is not used.
 --
 -- This module, through the game's SteamCore plugin (static functions on the
 -- class default objects):
@@ -34,7 +33,6 @@ local CONNECT_PREFIX = "+sdcoop_join "
 local function is_steam_id(s)
     return type(s) == "string" and #s == 17 and s:match("^7656119%d+$") ~= nil
 end
-M.is_steam_id = is_steam_id
 
 -- ---------------------------------------------------------------------------
 -- Own SteamID64
@@ -123,19 +121,15 @@ local function writable(path)
 end
 
 -- The setting this mod keeps in the game's Engine.ini ([OnlineSubsystemSteam]):
---   bUseSteamNetworking=False  (unless config steam_p2p) the SteamSockets
---     plugin reads this at start: True makes Steam Sockets the DEFAULT socket
---     subsystem, so even the plain IpNetDriver listened through Steam and
---     failed (2026-11-10: launched through Steam, neither SteamSockets nor
---     IpNetDriver opened the world; outside Steam IP works). False keeps the
---     Windows sockets: the world opens over UDP (the Steam tunnel of
---     sdc_steamlink, or IP: Radmin VPN, ZeroTier, port 7777); Steam itself
---     (ID, invites, presence) stays.
+--   bUseSteamNetworking=False  the SteamSockets plugin reads this at start:
+--     True makes Steam Sockets the DEFAULT socket subsystem, so even the
+--     plain IpNetDriver listened through Steam and failed (2026-11-10:
+--     launched through Steam, neither SteamSockets nor IpNetDriver opened the
+--     world; outside Steam IP works). False keeps the Windows sockets: the
+--     world opens over UDP (the Steam tunnel of sdc_steamlink, or IP: Radmin
+--     VPN, ZeroTier, port 7777); Steam itself (ID, invites, presence) stays.
 -- Takes effect at the next game start; the file is kept read-only.
-M.ip_mode = true
-
 function M.ensure_server_api(cfg)
-    M.ip_mode = not (cfg and cfg.get("steam_p2p") == true)
     if cfg and cfg.get("steam_server_api") == false then return end
     local base = os.getenv("LOCALAPPDATA")
     if not base or base == "" then return end
@@ -143,7 +137,7 @@ function M.ensure_server_api(cfg)
     local f = io.open(path, "r")
     local text = f and f:read("a") or ""
     if f then f:close() end
-    local want = { { "bUseSteamNetworking", M.ip_mode and "False" or "True" } }
+    local want = { { "bUseSteamNetworking", "False" } }
     local missing = {}
     for _, kv in ipairs(want) do
         local cur = text:match(kv[1] .. "%s*=%s*(%a+)")
@@ -151,12 +145,11 @@ function M.ensure_server_api(cfg)
     end
     if #missing == 0 then
         if writable(path) then set_readonly(path, true) end
-        log.info("steam: Engine.ini ok (bUseSteamNetworking=%s, read-only=%s)",
-            M.ip_mode and "False" or "True", tostring(not writable(path)))
+        log.info("steam: Engine.ini ok (bUseSteamNetworking=False, read-only=%s)", tostring(not writable(path)))
         return
     end
     if not writable(path) then set_readonly(path, false) end
-    -- a value of ours that is wrong now (steam_p2p switched): drop that line
+    -- a line with another value (an older mod's experiment, or by hand): dropped
     for _, kv in ipairs(missing) do
         text = text:gsub("\n?" .. kv[1] .. "%s*=%s*%a+", "")
     end

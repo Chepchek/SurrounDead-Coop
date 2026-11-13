@@ -376,6 +376,71 @@ advance(3.1); run_delayed()
 check(logged("DIFFERS from the last save") and logged("level 7 -> 6"), "load: level difference reported")
 host_pc._p.LevellingComponent._p.CurrentLevel = 7
 
+print("load: XP the game's own quest load gave again (Narrative refires quest events on Load; 13.11: +1200 every load)")
+local lev = host_pc._p.LevellingComponent._p
+local xp0 = lev.CurrentXP
+local quests_was = package.loaded["sdc_quests"]
+local REW = {}
+package.loaded["sdc_quests"] = { host_rewards_since = function(t)
+    local out = {}
+    for _, e in ipairs(REW) do if e.at >= t then out[#out + 1] = { amount = e.amount, name = e.name, pawn = e.pawn } end end
+    return out
+end }
+lev.Difficulty_MultiplierValue = 2.0
+REW = { { at = T - 2, amount = 300, name = "My New Quest" }, { at = T - 2, amount = 300, name = "My New Quest" } }
+lev.CurrentXP = xp0 + 1200
+clear_log()
+fire(F_LOAD, "pre", p(nil), p(host_pc), p(3), p(true))
+fire(PC .. ":OnCompleted_F36E30354316ADD99BBAD29E4E315233", "post", p(host_pc))
+advance(3.1); run_delayed()
+check(logged("matches the last save of this slot") and logged("is the game's own: quest reward(s) given again by its quest load ('My New Quest' 300, 'My New Quest' 300, x2 XP multiplier")
+    and not logged("DIFFERS"), "load: +1200 = 2 x 300 x 2.0 refired: explained, not a difference")
+-- other XP besides: still a difference, the refired part named
+lev.CurrentXP = xp0 + 1500
+REW = { { at = T - 2, amount = 300, name = "My New Quest" }, { at = T - 2, amount = 300, name = "My New Quest" } }
+clear_log()
+fire(F_LOAD, "pre", p(nil), p(host_pc), p(3), p(true))
+fire(PC .. ":OnCompleted_F36E30354316ADD99BBAD29E4E315233", "post", p(host_pc))
+advance(3.1); run_delayed()
+check(logged("DIFFERS from the last save") and logged("+1200 XP of quest reward(s) the game gave again while loading"),
+    "load: +1500 with 1200 refired: reported, the refired part named")
+-- rewards long before this load do not count
+lev.CurrentXP = xp0 + 1200
+REW = { { at = T - 120, amount = 300, name = "My New Quest" } }
+clear_log()
+fire(F_LOAD, "pre", p(nil), p(host_pc), p(3), p(true))
+fire(PC .. ":OnCompleted_F36E30354316ADD99BBAD29E4E315233", "post", p(host_pc))
+advance(3.1); run_delayed()
+check(logged("DIFFERS from the last save") and not logged("quest reward(s)"), "load: a reward 2 min before the load: not taken for the game's refire")
+-- review of fix 16: the host hands in a quest (+500) and loads within 30 s.
+-- That real reward ran on the character of the world before the load (gone
+-- in the main menu); the refires run on the new one. Only these count.
+local cur_pawn = host_char:GetFullName()
+local old_pawn = "BP_PlayerCharacter_C /Game/Levels/PL.PL:PersistentLevel.BP_PlayerCharacter_C_0"
+lev.CurrentXP = xp0 + 1200
+REW = { { at = T - 10, amount = 500, name = "Bunker", pawn = old_pawn },
+        { at = T - 2, amount = 300, name = "My New Quest", pawn = cur_pawn },
+        { at = T - 2, amount = 300, name = "My New Quest", pawn = cur_pawn } }
+clear_log()
+fire(F_LOAD, "pre", p(nil), p(host_pc), p(3), p(true))
+fire(PC .. ":OnCompleted_F36E30354316ADD99BBAD29E4E315233", "post", p(host_pc))
+advance(3.1); run_delayed()
+check(logged("matches the last save of this slot") and not logged("DIFFERS")
+    and logged("is the game's own: quest reward(s) given again by its quest load ('My New Quest' 300, 'My New Quest' 300, x2 XP multiplier")
+    and not logged("'Bunker'"),
+    "load: a real reward of the character before the load (10 s earlier) is no refire: +1200 explained, no WARN, 'Bunker' not named")
+-- only that old character's reward in the window: nothing taken for a refire
+lev.CurrentXP = xp0 + 1000
+REW = { { at = T - 10, amount = 500, name = "Bunker", pawn = old_pawn } }
+clear_log()
+fire(F_LOAD, "pre", p(nil), p(host_pc), p(3), p(true))
+fire(PC .. ":OnCompleted_F36E30354316ADD99BBAD29E4E315233", "post", p(host_pc))
+advance(3.1); run_delayed()
+check(logged("DIFFERS from the last save") and not logged("quest reward(s)") and not logged("is the game's own"),
+    "load: only the old character's +500 x2 = +1000 in the window: still a difference, not called the game's refire")
+lev.CurrentXP, lev.Difficulty_MultiplierValue = xp0, nil
+package.loaded["sdc_quests"] = quests_was
+
 print("autosave watchdog")
 clear_log()
 WORLD.timer = false
@@ -444,6 +509,43 @@ cfg.set("coop_autosave", true)
 run_delayed()
 WORLD.cvars["Game.AutoSave"] = true
 WORLD.timer = true
+
+print("save now (opening a single-player world for friends)")
+do
+    S.role = "standalone"; WORLD.role = "standalone"
+    S.remote, S.remote_pcs = {}, {}
+    local real_pawn = ue.local_pawn
+    ue.local_pawn = function() return host_char end
+    run_delayed()
+    -- a save that runs: done after the game's file check, with the slot
+    WORLD.calls = {}
+    local got = nil
+    sc.save_now("test", function(ok, why, slot) got = { ok = ok, why = why, slot = slot } end)
+    check(called("SaveGameToSlot"), "save now: the game's SaveGameToSlot (current slot)")
+    advance(0.3); run_delayed()
+    check(got == nil, "save now: not done before the save starts")
+    host_save({})
+    advance(0.3); run_delayed()
+    check(got and got.ok == true and got.slot == "MySlot", "save now: done after the file check, slot MySlot ("
+        .. tostring(got and got.why) .. ")")
+    -- no save starts: false after 6 s
+    got = nil
+    WORLD.calls = {}
+    sc.save_now("test", function(ok, why) got = { ok = ok, why = why } end)
+    for _ = 1, 30 do advance(0.25); run_delayed() end
+    check(got and got.ok == false and tostring(got.why):find("no save started", 1, true),
+        "save now: no save started -> false (" .. tostring(got and got.why) .. ")")
+    -- a dead character: refused, nothing saved
+    got = nil
+    WORLD.calls = {}
+    host_char._p["PlayerDead?"] = true
+    sc.save_now("test", function(ok, why) got = { ok = ok, why = why } end)
+    check(got and got.ok == false and not called("SaveGameToSlot"), "save now: dead character -> refused, no save")
+    host_char._p["PlayerDead?"] = false
+    ue.local_pawn = real_pawn
+    S.role = "host"; WORLD.role = "host"
+    S.remote, S.remote_pcs = { [cl_pc:GetFullName()] = { pc = cl_pc, name = "Friend", pawn = cl_char } }, { cl_pc }
+end
 
 print("client save")
 clear_log()

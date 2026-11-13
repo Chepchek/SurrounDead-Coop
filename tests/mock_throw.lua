@@ -403,9 +403,39 @@ deliver()
 check(copy._p._loc.X == 900 and copy._p._loc.Y == 10, "client copy moved to the host's blast point")
 check(copy._p.Capsule._p._sim == false, "copy frozen")
 check(copy._events[1] == "Frag@0.0", "copy set off by Frag with ExplosionDelay 0 (" .. tostring(copy._events[1]) .. ")")
+-- sdc_ffire: who threw the blast whose damage runs now
+WORLD = HW
+local boom = H.throw.blast_now()
+check(boom and boom.pc == rpc._addr and boom.short == "BP_Throwable_Frag_C" and boom.loc.X == 900,
+    "blast_now: the client's frag, its controller and point (friendly fire)")
 advance(5)
+WORLD = HW
+check(H.throw.blast_now() == nil, "blast_now: nothing 5 s later")
 client_tick()
 check(#copy._events == 1, "no fallback after the host's blast")
+
+-- ---------------------------------------------------------------- 3b. client's noise maker
+print("== 3b. client throws a noise maker")
+-- its firecracker is a "boom" for the copies, but it hurts nobody: no blast
+-- for sdc_ffire (a host's own damage right after it is the host's own)
+game_throw(CW, "BP_Throwable_NoiseMaker_C", { X = 30, Y = 0, Z = 150 }, { X = 1500, Y = 0, Z = 0 })
+run_timers(CW)
+deliver()
+local hnm = live(HW, "BP_Throwable_NoiseMaker_C")[1]
+check(hnm ~= nil and hnm._p._owner == rpawn and hnm._events[1] == "NoiseMaker@3.0",
+    "host spawned the client's noise maker, its fuse started")
+HW.outbox = {}
+advance(3.0)
+fire(HW, FN_PLAY_SOUND, "pre", param(H.ue.gameplay_statics()), param(hnm), param(nil), param({ X = 700, Y = 0, Z = 20 }))
+check(sent(HW, "THRFX") == 1, "its firecracker: THRFX boom to the client")
+WORLD = HW
+check(H.throw.blast_now() == nil, "blast_now: the noise maker is no blast (friendly fire)")
+deliver()
+-- the game destroys both after their 17.5 s of noise
+for _, w in ipairs({ HW, CW }) do
+    for _, o in ipairs(live(w, "BP_Throwable_NoiseMaker_C")) do o._valid = false end
+end
+advance(2.5)
 
 -- ---------------------------------------------------------------- 4. host's molotov
 print("== 4. host throws a Molotov")
@@ -436,6 +466,21 @@ deliver()
 local cms = live(CW, "BP_Throwable_Molotov_C")
 local cm2 = cms[#cms]
 check(cm2 and cm2._p._loc.Y == 1000, "late fire point ignored (the fire already burns at the hit point)")
+-- sdc_ffire: whose Molotov fire burns near a player
+WORLD = HW
+local hf = H.throw.fires_near({ X = 0, Y = 2300, Z = 100 }, 600)
+check(#hf == 1 and hf[1].pc == nil and hf[1].who == "host", "host fires_near: the host's own fire at 2060 (thrower: the host)")
+check(#H.throw.fires_near({ X = 0, Y = 3000, Z = 100 }, 600) == 0, "host fires_near: nothing 9 m away")
+WORLD = CW
+local cf = C.throw.fires_near({ X = 0, Y = 2100, Z = 100 }, 600)
+check(#cf == 1 and cf[1].own == false and cf[1].who == "256", "client fires_near: the host's copy, its thrower's PlayerId 256")
+local cf2 = C.throw.fires_near({ X = 0, Y = 1050, Z = 100 }, 600)
+check(#cf2 == 1 and cf2[1].d < 200, "client fires_near: the late fire burns at the hit point")
+advance(12)
+WORLD = HW
+check(#H.throw.fires_near({ X = 0, Y = 2300, Z = 100 }, 600) == 0, "host fires_near: the fire is out 12 s later")
+WORLD = CW
+check(#C.throw.fires_near({ X = 0, Y = 2100, Z = 100 }, 600) == 0, "client fires_near: the copy's fire is out too")
 
 -- ---------------------------------------------------------------- 5. fallbacks
 print("== 5. no host answer / refusal")

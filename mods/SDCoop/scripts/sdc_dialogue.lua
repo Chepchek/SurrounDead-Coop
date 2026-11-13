@@ -83,11 +83,13 @@
 --          that fires there) sees the trader whose CurrentActor is this
 --          player's character and asks the host (QD); the host starts the
 --          dialogue on the client's component (the game's server path,
---          ClientBeginDialogue). The BeginDialogue pre-hook keeps the same
---          request for a call that does reach the native.
+--          ClientBeginDialogue).
 --   host   a wandering trader stops while a client talks / trades with it
 --          (its own DisableMovement) and walks again when the client closes
---          the trade window (QE), walks away or leaves.
+--          the trade window (QE), walks away or leaves - unless another
+--          client or the host's own player (its CurrentActor) still trades
+--          with it; the host closing its own trade (the game lets it walk)
+--          stops it again for a client still trading.
 --   client creates the Narrative HUD the way the game does (Create, set
 --          NarrativeComponent, AddToViewport(0)) and tells the host (QH).
 --          The host routes dialogues only to clients that reported a HUD.
@@ -120,33 +122,11 @@ local ue  = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
+local consume = require("sdc_consume")   -- shared helpers (param, guid_str)
 
-local M = {
-    stats = { routed = 0, requested = 0, started = 0, hud = 0, vendor = 0,
-              trades = 0, money_sent = 0, money_set = 0, spawn_blocked = 0, ghosts = 0, held = 0 },
-}
+local M = {}
 
 local S   -- sdc_session.state
-
--- ---------------------------------------------------------------------------
--- Settings (defaults apply until the keys are in sdc_config's SCHEMA)
--- ---------------------------------------------------------------------------
-
-local DEFAULTS = {
-    quest_dialogues = true,
-    quest_hud = true,
-    quest_vendor_fallback = true,
-    quest_trace = true,
-    trade_host_traders = true,
-    trade_vendor_money = true,
-}
-
-local function opt(key)
-    local v = cfg.get(key)
-    if v == nil then return DEFAULTS[key] end
-    return v
-end
-M.opt = opt
 
 -- ---------------------------------------------------------------------------
 -- Game assets
@@ -187,18 +167,8 @@ local GHOST_PASS_S = 10      -- client: look for traders only this machine has
 -- Helpers
 -- ---------------------------------------------------------------------------
 
-local function addr(o)
-    local a = ue.try(function() return o:GetAddress() end)
-    return a
-end
-
-local function p_get(p) return p:get() end
-local function pget(p)
-    if p == nil then return nil end
-    local ok, v = pcall(p_get, p)
-    if ok then return v end
-    return nil
-end
+local addr = ctx.addr
+local pget = consume.param
 
 local function role()
     return S and S.role or "unknown"
@@ -206,7 +176,7 @@ end
 
 local throttle = {}
 local function trace(key, msg, ...)
-    if not opt("quest_trace") then return end
+    if not cfg.get("quest_trace") then return end
     local now = os.clock()
     if throttle[key] and now - throttle[key] < 2 then return end
     throttle[key] = now
@@ -267,7 +237,12 @@ end
 local function o_class(o) return o:GetClass() end
 local function o_addr(o) return o:GetAddress() end
 local kind_by_class, kind_at = {}, 0
+-- ue.valid first: a hook parameter with no object (GetNarrativeComponent's
+-- Target, a spawn's WorldContextObject) or an empty InteractExecutedActor is
+-- a null object, not nil, and GetClass on it crashes the game (pcall cannot
+-- catch it; the host's ApplyDamage crash of 2026-11-13).
 local function class_key(o)
+    if not ue.valid(o) then return nil end
     local ok, c = pcall(o_class, o)
     if not ok or c == nil then return nil end
     local oka, a = pcall(o_addr, c)
@@ -436,7 +411,6 @@ local function start_for(pc, cls, npc, why)
         return false, "no component"
     end
     local ok, r = pcall(function() return comp:BeginDialogue(cls, play_params()) end)
-    M.stats.started = M.stats.started + 1
     log.info("dlg: host: %s: %s (npc %s) started on the component of %s -> %s",
         why, short_class(cls), ue.short(npc), ue.short(pc), ok and tostring(r) or ("error " .. tostring(r)))
     return ok, r
@@ -450,7 +424,7 @@ end
 local money_last = {}   -- [trader full name] = { v = money, at = os.clock() } (one QM per change)
 
 local function send_money(trader, why, only_pc)
-    if not opt("trade_vendor_money") or role() ~= "host" or not ue.valid(trader) then return end
+    if not cfg.get("trade_vendor_money") or role() ~= "host" or not ue.valid(trader) then return end
     local amount = trader_money(trader)
     local loc = ue.location(trader)
     if not amount or not loc then return end
@@ -474,7 +448,6 @@ local function send_money(trader, why, only_pc)
         end
     end
     if #sent > 0 then
-        M.stats.money_sent = M.stats.money_sent + #sent
         log.info("trade: host: money of %s (%.0f) sent to %s (%s)", ue.short(trader), amount, table.concat(sent, ", "), why)
     end
 end
@@ -483,7 +456,12 @@ end
 -- Host: a wandering trader stops while a client talks / trades with it
 -- ---------------------------------------------------------------------------
 
-local held = {}   -- [controller full name] = { path, name, at } of the stopped wandering trader
+-- [controller full name] = { path, name, who, at } of the stopped wandering
+-- trader; [HOST_WAIT .. trader path] = { path, name, at, host = true }: a
+-- client let go of it while the host's own player still talked / traded with
+-- it (it walks once the host is done, check_held).
+local held = {}
+local HOST_WAIT = "host-wait:"
 local release_wanderer   -- defined below
 
 local function hold_wanderer(pc, npc)
@@ -491,10 +469,33 @@ local function hold_wanderer(pc, npc)
     if held[ue.name(pc)] then release_wanderer(ue.name(pc), "its player started another dialogue") end
     local cm = ue.prop(npc, "CharacterMovement")
     local ok = ue.valid(cm) and pcall(function() cm:DisableMovement() end)
-    held[ue.name(pc)] = { path = ue.path(npc), name = ue.short(npc), at = os.clock() }
-    M.stats.held = M.stats.held + 1
+    held[ue.name(pc)] = { path = ue.path(npc), name = ue.short(npc), who = ue.short(pc), at = os.clock() }
     log.info("trade: host: wandering trader %s stops while %s talks / trades with it (DisableMovement, as the game does on the machine that pressed F, BP_MasterTrader @5050): %s",
         ue.short(npc), ue.short(pc), ok and "ok" or "FAILED")
+end
+
+-- Who else keeps a wandering trader stopped: another client held for it, or
+-- the host's own player talking / trading with it - the game's CurrentActor,
+-- set by OnExecuteInteract on the machine that pressed F (@5682), cleared by
+-- OnExecuteInteractEnded (@5586) and its CheckDistanceFromActor timer (@389),
+-- with the host's character within HOLD_RANGE (a CurrentActor left behind by
+-- a talk without trading does not hold it once the host walked off).
+-- 13.11 host log: a client closed its window at 17:22:41, the trader walked
+-- while the host still sold to it at 17:22:45.
+-- Returns "client" / "host" and the reason, or nil.
+local function wanderer_user(npc, path, except_key)
+    for k, h in pairs(held) do
+        if k ~= except_key and h.path == path and not h.host then
+            return "client", "another player (" .. tostring(h.who) .. ") still talks / trades with it"
+        end
+    end
+    local me = ue.local_pawn()
+    local cur = ue.prop(npc, "CurrentActor")
+    if me and ue.valid(cur) and addr(cur) == addr(me)
+        and dist2(ue.location(me), ue.location(npc)) <= HOLD_RANGE * HOLD_RANGE then
+        return "host", "the host's player still talks / trades with it (its CurrentActor)"
+    end
+    return nil
 end
 
 release_wanderer = function(key, why)
@@ -507,12 +508,27 @@ release_wanderer = function(key, why)
         return
     end
     if ue.prop(ue.prop(npc, "BP_AIComponent"), "Dead") == true then return end
+    local user, busy = wanderer_user(npc, h.path, key)
+    if user then
+        -- the host's own trade: the game lets it walk when the host closes its
+        -- window (@5545); a host that walks off without that is checked each
+        -- second. Another client's entry lets it go itself.
+        if user == "host" then
+            local wk = HOST_WAIT .. h.path
+            if not held[wk] then held[wk] = { path = h.path, name = h.name, at = h.host and h.at or os.clock(), host = true } end
+        end
+        if not h.host then log.info("trade: host: wandering trader %s stays stopped (%s): %s", h.name, why, busy) end
+        return
+    end
     local cm = ue.prop(npc, "CharacterMovement")
     local ok = ue.valid(cm) and pcall(function() cm:SetMovementMode(1, 0) end)
     log.info("trade: host: wandering trader %s walks again (%s; SetMovementMode Walking as its OnExecuteInteractEnded @5545): %s",
         h.name, why, ok and "ok" or "FAILED")
 end
 
+-- Every second (host). What to do is collected first: release_wanderer may
+-- add a HOST_WAIT entry, and a table must not get new keys while pairs()
+-- walks it.
 local function check_held()
     if not next(held) then return end
     local by_key = {}
@@ -520,19 +536,53 @@ local function check_held()
         if ue.valid(pc) then by_key[ue.name(pc)] = pc end
     end
     local now = os.clock()
+    local todo = {}   -- { key, why } (why false: gone, drop quietly)
     for key, h in pairs(held) do
-        local pc = by_key[key]
         local npc = ue.find_object(h.path)
-        local pawn = pc and ue.pawn_of(pc)
         if not npc then
-            held[key] = nil
-            log.info("trade: host: wandering trader %s is gone", h.name)
-        elseif not pawn then
-            release_wanderer(key, "its player left or has no character")
-        elseif dist2(ue.location(pawn), ue.location(npc)) > HOLD_RANGE * HOLD_RANGE then
-            release_wanderer(key, "its player walked away")
-        elseif now - h.at > HOLD_MAX_S then
-            release_wanderer(key, "10 minutes")
+            todo[#todo + 1] = { key, false }
+            if not h.host then log.info("trade: host: wandering trader %s is gone", h.name) end
+        elseif h.host then
+            local user = wanderer_user(npc, h.path, key)
+            if user == "client" then
+                todo[#todo + 1] = { key, false }   -- that client's own entry lets it go
+            elseif not user then
+                todo[#todo + 1] = { key, "the host's player is done with it" }
+            elseif now - h.at > HOLD_MAX_S then
+                todo[#todo + 1] = { key, false }
+            end
+        else
+            local pc = by_key[key]
+            local pawn = pc and ue.pawn_of(pc)
+            if not pawn then
+                todo[#todo + 1] = { key, "its player left or has no character" }
+            elseif dist2(ue.location(pawn), ue.location(npc)) > HOLD_RANGE * HOLD_RANGE then
+                todo[#todo + 1] = { key, "its player walked away" }
+            elseif now - h.at > HOLD_MAX_S then
+                todo[#todo + 1] = { key, "10 minutes" }
+            end
+        end
+    end
+    for _, t in ipairs(todo) do
+        if t[2] then release_wanderer(t[1], t[2]) else held[t[1]] = nil end
+    end
+end
+
+-- Host: BP_MasterTrader.OnExecuteInteractEnded, post - the HOST's player
+-- closed its trade window (the event runs on the machine that pressed F) and
+-- the game has just let the trader walk (@5545). A client still trading with
+-- it: stopped again; a release that waited for the host is done.
+local function host_wanderer_end(npc)
+    if not next(held) or not ue.valid(npc) then return end
+    local path = ue.path(npc)
+    held[HOST_WAIT .. path] = nil
+    for _, h in pairs(held) do
+        if h.path == path then
+            local cm = ue.prop(npc, "CharacterMovement")
+            local ok = ue.valid(cm) and pcall(function() cm:DisableMovement() end)
+            log.info("trade: host: the host's player closed its trade with wandering trader %s; it stays stopped for %s (DisableMovement again): %s",
+                h.name, tostring(h.who), ok and "ok" or "FAILED")
+            return
         end
     end
 end
@@ -553,9 +603,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local handled = {}         -- [npc address] = { at = os.clock(), pc = controller } of the routed call (host)
-local last_npc = nil       -- client: { a = address, at = clock, loc = location } of the last NPC asking
 local asked = {}           -- client: [npc address] = os.clock() of the last QD for its F press
-local asked_at = -100      -- client: os.clock() of the last QD from an F press
 local ghost_next = 0       -- client: next pass over traders only this machine has
 
 M.hud_widget = nil
@@ -575,11 +623,11 @@ local function client_trader_f(npc, a, cur)
     if a then asked[a] = now end
     local name = ue.short(npc)
     local own = client_only(npc)
-    if not opt("quest_dialogues") then
+    if not cfg.get("quest_dialogues") then
         log.info("trade: client: F on %s: quest_dialogues is off - its BeginDialogue is server-only, nothing opens here", name)
         return
     end
-    if own and opt("trade_host_traders") then
+    if own and cfg.get("trade_host_traders") then
         ghost_next = 0
         notice("own-trader", "Это копия торговца только на вашем компьютере — она убирается. Подойдите к торговцу хоста и нажмите F снова.",
             string.format("trade: client: F on %s (%s): a trader only this machine has (role authority, spawned here); the host does not know it - not asking, it is removed", name, ue.class_name(npc)))
@@ -600,8 +648,6 @@ local function client_trader_f(npc, a, cur)
     local loc = ue.location(npc)
     local x, y, z = "", "", ""
     if loc then x, y, z = f0(loc.X), f0(loc.Y), f0(loc.Z) end
-    asked_at = now
-    M.stats.requested = M.stats.requested + 1
     log.info("trade: client: F on %s (%s, %s): its BeginDialogue is server-only (BlueprintAuthorityOnly) and the engine skips it here; asking the host to start %s",
         name, ue.class_name(npc), own and "a copy only this machine has" or "the host's replicated trader", short_class(cls))
     ue.game_thread("dlg-ask", function() net.send_to_host("QD", full, x, y, z) end)
@@ -665,7 +711,6 @@ local function on_gnc(_, wco_p)
     local a = addr(npc)
 
     if r == "client" then
-        last_npc = { a = a, at = os.clock(), loc = ue.location(npc) }
         local cur = ue.prop(npc, "CurrentActor")
         trace("gnc-c" .. tostring(a), "client: GetNarrativeComponent from %s (%s) actor=%s who=%s -> own component",
             ue.short(npc), kind, ue.short(cur), who(cur))
@@ -675,7 +720,7 @@ local function on_gnc(_, wco_p)
 
     -- host
     local now = os.clock()
-    if kind == "giver" and a and opt("quest_dialogues") then
+    if kind == "giver" and a and cfg.get("quest_dialogues") then
         local d = giver.defer[a]
         if d and now - d.at < HANDLED_WINDOW then
             d.n = d.n + 1
@@ -710,7 +755,7 @@ local function on_gnc(_, wco_p)
     local outcome
     if not e or not ue.valid(e.pc) then
         outcome = "host component (host player or nobody)"
-    elseif not opt("quest_dialogues") then
+    elseif not cfg.get("quest_dialogues") then
         outcome = "host component (quest_dialogues off)"
     elseif not client_has_hud(e.pc) then
         outcome = "host component (client reported no dialogue HUD)"
@@ -722,7 +767,6 @@ local function on_gnc(_, wco_p)
             outcome = "host component (could not clear the world context)"
         else
             if a then handled[a] = { at = now, pc = e.pc } end
-            M.stats.routed = M.stats.routed + 1
             outcome = "None (routed to " .. ue.short(e.pc) .. ")"
             local pc = e.pc
             ue.game_thread("dlg-route", function()
@@ -735,7 +779,9 @@ local function on_gnc(_, wco_p)
 end
 
 -- ---------------------------------------------------------------------------
--- BeginDialogue pre / post (both roles), ClientBegin / ClientExit (client)
+-- Log only, hooked with config debug_probes only: BeginDialogue pre / post
+-- (host: it is BlueprintAuthorityOnly, a client's own call never runs it),
+-- ClientBegin / ClientExit (client)
 -- ---------------------------------------------------------------------------
 
 local function comp_owner(comp_p)
@@ -745,46 +791,23 @@ local function comp_owner(comp_p)
 end
 
 local function on_begin_pre(comp_p, cls_p)
-    local r = role()
-    if r ~= "host" and r ~= "client" then return end
+    if role() ~= "host" or not log.probes_enabled then return end
     local comp, owner = comp_owner(comp_p)
-    local cls = pget(cls_p)
-    local authority = ue.role(owner) == ue.ROLE_AUTHORITY
-    trace("begin-pre" .. tostring(addr(comp)), "%s: BeginDialogue %s on the component of %s (who=%s, authority=%s)",
-        r, short_class(cls), ue.short(owner), who(owner), tostring(authority))
-    if r ~= "client" or authority or not opt("quest_dialogues") then return end
-    if not ue.valid(cls) then return end
-    if os.clock() - asked_at < 2 then return end   -- the F path asked already
-    if not M.hud_ok() then
-        log.warn("dlg: client: own BeginDialogue %s refused natively, not asking the host: no dialogue HUD (quest_hud off or not built yet)",
-            short_class(cls))
-        return
-    end
-    local full = ue.try(function() return cls:GetFullName() end)
-    if not full then return end
-    local loc = last_npc and os.clock() - last_npc.at < 2 and last_npc.loc or nil
-    M.stats.requested = M.stats.requested + 1
-    log.info("dlg: client: own BeginDialogue %s has no authority (returns false); asking the host", short_class(cls))
-    ue.game_thread("dlg-ask", function()
-        net.send_to_host("QD", full,
-            loc and f0(loc.X) or "", loc and f0(loc.Y) or "", loc and f0(loc.Z) or "")
-    end)
+    trace("begin-pre" .. tostring(addr(comp)), "host: BeginDialogue %s on the component of %s (who=%s)",
+        short_class(pget(cls_p)), ue.short(owner), who(owner))
 end
 
 local function on_begin_post(comp_p, ret_p, cls_p)
-    local r = role()
-    if r ~= "host" and r ~= "client" then return end
-    if not opt("quest_trace") then return end
+    if role() ~= "host" or not log.probes_enabled then return end
     local comp, owner = comp_owner(comp_p)
-    local ret = pget(ret_p)
-    trace("begin-post" .. tostring(addr(comp)), "%s: BeginDialogue %s on the component of %s returned %s",
-        r, short_class(pget(cls_p)), ue.short(owner), tostring(ret))
+    trace("begin-post" .. tostring(addr(comp)), "host: BeginDialogue %s on the component of %s returned %s",
+        short_class(pget(cls_p)), ue.short(owner), tostring(pget(ret_p)))
 end
 
 -- ClientBeginDialogue(Dialogue, NPCReplyChainIDs, AvailableResponseIDs) /
 -- ClientExitDialogue(Reason): the host's dialogue arriving on this client.
 local function on_client_begin(comp_p, dlg_p)
-    if role() ~= "client" then return end
+    if role() ~= "client" or not log.probes_enabled then return end
     local comp = pget(comp_p)
     local d = pget(dlg_p)
     log.info("dlg: client: the host started %s on %s (ClientBeginDialogue): the dialogue shows here%s",
@@ -792,7 +815,7 @@ local function on_client_begin(comp_p, dlg_p)
 end
 
 local function on_client_exit(_, reason_p)
-    if role() ~= "client" then return end
+    if role() ~= "client" or not log.probes_enabled then return end
     log.info("dlg: client: dialogue ended (ClientExitDialogue, reason %s)", tostring(pget(reason_p)))
 end
 
@@ -822,7 +845,7 @@ end
 
 local function on_request(f, pc)
     ue.game_thread("dlg-request", function()
-        if role() ~= "host" or not opt("quest_dialogues") then return end
+        if role() ~= "host" or not cfg.get("quest_dialogues") then return end
         if not ue.valid(pc) then return end
         local want = f[1]
         local pawn = ue.pawn_of(pc)
@@ -876,7 +899,7 @@ local function on_trade_event(_, target_p, ctl_p)
         log.info("trade: client: trade event ran here (interact-actor %s): the trade window opens by itself", ue.short(iea))
         return
     end
-    if not opt("quest_vendor_fallback") then return end
+    if not cfg.get("quest_vendor_fallback") then return end
     local e = ue.valid(ctl) and ctx.player_for(ctl)
     if e and ue.valid(e.pc) then
         local pc = e.pc
@@ -889,7 +912,7 @@ local function on_trade_event(_, target_p, ctl_p)
 end
 
 local function on_vendor_signal()
-    if role() ~= "client" or not opt("quest_vendor_fallback") then return end
+    if role() ~= "client" or not cfg.get("quest_vendor_fallback") then return end
     ue.delay("dlg-vendor", 700, function()
         if role() ~= "client" then return end
         if os.clock() - last_local_trade < 3 then
@@ -907,7 +930,6 @@ local function on_vendor_signal()
         local comp = ue.prop(pc, "NarrativeComponent")
         if ue.valid(comp) then pcall(function() comp:TryExitDialogue(0) end) end
         local ok, err = pcall(function() npc:OnExecuteInteractDialogue(pawn) end)
-        M.stats.vendor = M.stats.vendor + 1
         log.info("dlg: client: trade event did not run here; opened the trade window of %s ourselves: %s",
             ue.short(npc), ok and "ok" or tostring(err))
     end)
@@ -943,7 +965,7 @@ end
 -- Client: QTM|<trader class>|x|y|z|<money>: the host's money of that trader
 -- into this machine's copy of its component (the trade window reads it).
 local function on_money(f)
-    if role() ~= "client" or not opt("trade_vendor_money") then return end
+    if role() ~= "client" or not cfg.get("trade_vendor_money") then return end
     local cls = f[1]
     local x, y, z, amount = tonumber(f[2]), tonumber(f[3]), tonumber(f[4]), tonumber(f[5])
     if not cls or cls == "" or not (x and y and z and amount) or amount ~= amount then return end
@@ -962,7 +984,6 @@ local function on_money(f)
     local comp = ue.prop(best, "BP_JigMultiplayer")
     local before = tonumber(ue.prop(comp, "VendorCurrentCurrencyAmount"))
     local ok = ue.valid(comp) and ue.set_prop(comp, "VendorCurrentCurrencyAmount", amount)
-    if ok then M.stats.money_set = M.stats.money_set + 1 end
     log.info("trade: client: money of %s is the host's %.0f (this copy had %s)%s", ue.short(best), amount,
         before and f0(before) or "?", ok and "" or " - could not set it")
 end
@@ -973,15 +994,13 @@ local F_INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
 local F_ITEMID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
 local F_COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
 
-local function guid_str(g)
-    local ok, s = pcall(function() return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D) end)
-    return ok and s or "?"
-end
+local guid_str = consume.guid_str
 
 -- The item with this UID in the component's main containers: name, count.
 local function find_item(comp, uid)
     if not ue.valid(comp) or uid == nil then return nil end
-    local want = guid_str(uid)
+    local want = ue.try(guid_str, uid)
+    if not want then return nil end
     local name, count
     pcall(function()
         comp.MainJigContainers:ForEach(function(_, ct)
@@ -1017,10 +1036,9 @@ local function on_comp_move(c, from_p, to_p, uid_p, _, _, _, amount_p)
     local name, count = find_item(to, uid)
     if not name then name, count = find_item(from, uid) end
     local money = trader_money(trader)
-    M.stats.trades = M.stats.trades + 1
     log.info("trade: host: %s %s %s %s %s (uid %s, amount asked %s, that stack now x%s); the trader's money now %s",
         player, buying and "bought" or "sold", name or "an item", buying and "from" or "to", ue.short(trader),
-        guid_str(uid), tostring(pget(amount_p)), tostring(count or "?"), money and f0(money) or "?")
+        ue.try(guid_str, uid) or "?", tostring(pget(amount_p)), tostring(count or "?"), money and f0(money) or "?")
     send_money(trader, buying and "after a purchase" or "after a sale")
 end
 
@@ -1100,9 +1118,11 @@ local function on_giver_server(c, _, by_p)
 end
 
 -- Client: BP_MasterTrader.OnExecuteInteractEnded, post: this player closed
--- the trade window of a wandering trader (BP_JigHelperComp @2569).
+-- the trade window of a wandering trader (BP_JigHelperComp @2569). (Host:
+-- host_wanderer_end.)
 local function on_wanderer_end(c)
-    if role() ~= "client" or not opt("quest_dialogues") then return end
+    if role() == "host" then return host_wanderer_end(pget(c)) end
+    if role() ~= "client" or not cfg.get("quest_dialogues") then return end
     local npc = pget(c)
     if not ue.valid(npc) or client_only(npc) then return end
     local loc = ue.location(npc)
@@ -1143,12 +1163,11 @@ local function on_trader_spawn(_, wco_p, class_p)
         is_sp = TRADER_SPAWNERS[ue.class_name(wco)] == true
         if ck then spawner_by_class[ck] = is_sp end
     end
-    if not is_sp or not opt("trade_host_traders") or not world_is_client(wco) then return end
+    if not is_sp or not cfg.get("trade_host_traders") or not world_is_client(wco) then return end
     if not ue.valid(not_actor) then not_actor = ue.find_object(NOT_AN_ACTOR) end
     local cls = pget(class_p)
     local ok = not_actor ~= nil and pcall(function() class_p:set(not_actor) end)
     if ok then
-        M.stats.spawn_blocked = M.stats.spawn_blocked + 1
         log.info("trade: client: %s's own spawn of %s blocked on this client (the host's trader comes replicated; a copy only this machine had could not trade)",
             ue.short(wco), short_class(cls))
     else
@@ -1162,13 +1181,12 @@ local function remove_own_traders()
     local now = os.clock()
     if now < ghost_next then return end
     ghost_next = now + GHOST_PASS_S
-    if not opt("trade_host_traders") then return end
+    if not cfg.get("trade_host_traders") then return end
     for _, t in ipairs(ue.find_all(STATIC_TRADER)) do
         -- in a client world only (the role flips while the old world is still loaded)
         if ue.valid(t) and client_only(t) and world_is_client(t) then
             local name, cls = ue.short(t), ue.class_name(t)
             local ok = pcall(function() t:K2_DestroyActor() end)
-            M.stats.ghosts = M.stats.ghosts + 1
             log.info("trade: client: removed %s (%s): a trader only this machine had (role authority, spawned here); the host's own trader comes replicated%s",
                 name, cls, ok and "" or " - FAILED")
         end
@@ -1207,7 +1225,6 @@ local function build_hud(pc, now)
     local oka, erra = pcall(function() w:AddToViewport(0) end)
     if not oka then return false, "AddToViewport: " .. tostring(erra) end
     M.hud_widget = w
-    M.stats.hud = M.stats.hud + 1
     log.info("dlg: client: Narrative HUD created for %s (bound to its own NarrativeComponent)", ue.short(pc))
     last_qh = 0
     return true
@@ -1221,7 +1238,7 @@ function M.client_tick(now, pc, pawn)
     M.install()
     ensure_bp_hooks(now)
     remove_own_traders()
-    if not opt("quest_hud") then return end
+    if not cfg.get("quest_hud") then return end
     if not ue.valid(pc) or not pawn then return end
     local key = ue.name(pc)
     if key ~= hud_pc_key then
@@ -1275,17 +1292,18 @@ end
 -- Native hooks (the Narrative module is loaded with the engine). Called at
 -- load and again from the ticks until all are in; each is registered once.
 -- sdc_gaptrace hooks the same natives read-only; native hooks stack.
+-- probe = log only: registered with config debug_probes only.
 local NATIVE_HOOKS = {
     -- pre only: an empty post callback made UE4SS wrap the parameters again on
     -- every call (~600 a second on a host)
     { GNC, "GetNarrativeComponent", function() return safe("gnc", on_gnc), nil end },
-    { BEGIN, "BeginDialogue", function() return safe("begin", on_begin_pre), safe("begin-post", on_begin_post) end },
-    { CLIENT_BEGIN, "ClientBeginDialogue", function() return safe("client-begin", on_client_begin), nil end },
-    { CLIENT_EXIT, "ClientExitDialogue", function() return safe("client-exit", on_client_exit), nil end },
+    { BEGIN, "BeginDialogue", function() return safe("begin", on_begin_pre), safe("begin-post", on_begin_post) end, probe = true },
+    { CLIENT_BEGIN, "ClientBeginDialogue", function() return safe("client-begin", on_client_begin), nil end, probe = true },
+    { CLIENT_EXIT, "ClientExitDialogue", function() return safe("client-exit", on_client_exit), nil end, probe = true },
 }
 function M.install()
     for i, h in ipairs(NATIVE_HOOKS) do
-        if not native_done[i] and ue.find_object(h[1]) then
+        if not native_done[i] and (not h.probe or log.probes_enabled) and ue.find_object(h[1]) then
             local pre, post = h[3]()
             local ok, err = pcall(RegisterHook, h[1], pre, post)
             native_done[i] = ok
@@ -1302,7 +1320,8 @@ function M.install()
 end
 
 -- Blueprint hooks, each once its class is loaded. No other module hooks these
--- functions (a second RegisterHook on a BP function can replace the first).
+-- functions; each is registered once (a second RegisterHook on the same
+-- function would add a second callback: they stack).
 -- The trade event's class is loaded here (as before); the others are only
 -- waited for (BP_JigComponent comes with every character, BP_MasterTrader
 -- with the first wandering trader).
@@ -1373,12 +1392,14 @@ end
 -- wandering trader stopped for a client walks again first.)
 function M.reset(why)
     if tostring(why):find("^role") then
-        for key in pairs(held) do pcall(release_wanderer, key, "session role changed") end
+        local keys = {}   -- (release_wanderer may add an entry: not while pairs() walks held)
+        for key, h in pairs(held) do if not h.host then keys[#keys + 1] = key end end
+        for _, key in ipairs(keys) do pcall(release_wanderer, key, "session role changed") end
     end
     M.hud_widget = nil
     hud_pc_key, hud_tries, hud_next_try = nil, 0, 0
-    handled, hud_ready, last_npc, recent_start = {}, {}, nil, {}
-    asked, asked_at, ghost_next, held, money_last = {}, -100, 0, {}, {}
+    handled, hud_ready, recent_start = {}, {}, {}
+    asked, ghost_next, held, money_last = {}, 0, {}, {}
     class_cache, class_tried, spawner_by_class = {}, {}, {}
     giver.defer = {}
     log.info("dlg: reset (%s)", tostring(why))
@@ -1386,13 +1407,6 @@ end
 
 function M.init(state)
     S = state
-end
-
-function M.status_lines(out)
-    out[#out + 1] = string.format("Диалоги: перенаправлено %d, запросов %d, запущено %d, окон торговли %d",
-        M.stats.routed, M.stats.requested, M.stats.started, M.stats.vendor)
-    out[#out + 1] = string.format("Торговля: сделок на хосте %d, деньги торговца отправлено %d / принято %d, своих торговцев заблокировано %d / убрано %d, бродячих остановлено %d",
-        M.stats.trades, M.stats.money_sent, M.stats.money_set, M.stats.spawn_blocked, M.stats.ghosts, M.stats.held)
 end
 
 return M

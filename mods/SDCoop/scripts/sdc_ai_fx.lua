@@ -28,6 +28,19 @@
 -- Client: the same GameplayStatics call at that place, with an asset already in
 --   memory (they are hard references of BP_MasterZombie); never a load — a
 --   missing one is skipped and logged once.
+-- Which asset is one of these (host, every call of the three functions): the
+--   six assets' addresses, found by their paths every host tick (1 s). A call
+--   with another asset costs one address read - no name read, nothing cached
+--   (until 0.7.3 every other asset's address was cached as "not wanted" for up
+--   to 5 min, and a grenadier asset loaded at such an address was not relayed
+--   meanwhile). While one of the six is not at its path, other assets are
+--   checked by their names, as before (logged once per asset).
+--   The three engine hooks stay (measured 2026-11-13 in 1526 [PERF] windows of
+--   host logs: PlaySoundAtLocation 1-13 calls/s, already hooked by
+--   sdc_ownsounds / sdc_shake / sdc_throw; the emitter / decal hooks never in
+--   the top list). Rejected: BP_MasterZombie's Event_Grenadier / GrenadierDeath
+--   / Event_SpecialDeath - the effect comes 1.3-2.7 s after them (Delay), with
+--   a random yaw and scale only the GameplayStatics call has.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -48,32 +61,35 @@ local WANTED = {
     M_Burn = "d",
 }
 local CLASS_PART = { s = "Sound", e = "ParticleSystem", d = "Material" }
+-- their packages (work\re\paklist.txt; /Game = SurrounDead/Content)
+local WANTED_PATH = {
+    S_Beep_Cue = "/Game/Audio/Sounds/Cue/S_Beep_Cue.S_Beep_Cue",
+    explosion_large_06_Cue = "/Game/Audio/WARFARE_SOUNDS/Explosion_Fire_Gas/Cues/explosion_large_06_Cue.explosion_large_06_Cue",
+    Infected_SpecialCue = "/Game/Audio/Infected_SpecialCue.Infected_SpecialCue",
+    FX_Explosion_Grenadier = "/Game/PolygonFiles/PolygonMilitary/FX/FX_Explosion_Grenadier.FX_Explosion_Grenadier",
+    FX_Explosion_RadiatedZombie = "/Game/PolygonFiles/PolygonMilitary/FX/FX_Explosion_RadiatedZombie.FX_Explosion_RadiatedZombie",
+    M_Burn = "/Game/Blueprints/Other/ExplosiveBarrel/M_Burn.M_Burn",
+}
+local WANTED_N = 0
+for _ in pairs(WANTED_PATH) do WANTED_N = WANTED_N + 1 end
 local SEND_CM = 16000
 local PER_CLIENT_S = 20        -- relayed effects per client and second
 
-local wanted_by_addr = {}      -- host: [asset address] = kind | false
+-- host: [asset address] = short name of a relayed asset there (WANTED_PATH
+-- found in memory, refreshed every host tick, or met by name). Nothing else
+-- is cached: an address that held another asset is never "not wanted".
+local wanted_by_addr = {}
+local found = { n = 0, absent = {} }    -- host: how many of WANTED_PATH are in memory; [name] = true for the others
+local by_name_logged = {}      -- host: [short name] = true (met by name, not at its path: logged once)
 local per_client = {}          -- host: [pc full name] = { t, n }
 local missing = {}             -- client: [asset path] = true (logged once)
 
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
+local get = ue.param
+local vec = ue.vec
 
 local function num(v, d)
     if type(v) == "number" then return v end
     return d
-end
-
-local function vec(v)
-    if v == nil then return nil end
-    local x = ue.try(function() return v.X end)
-    local y = ue.try(function() return v.Y end)
-    local z = ue.try(function() return v.Z end)
-    if type(x) == "number" and type(y) == "number" and type(z) == "number" then return { X = x, Y = y, Z = z } end
-    return nil
 end
 
 local function rot(v)
@@ -89,16 +105,52 @@ local function f0(v) return string.format("%.0f", v) end
 -- Host
 -- ---------------------------------------------------------------------------
 
--- The kind of an asset this module relays, or nil (cached by address: assets live long).
+-- Where the relayed assets are now: their addresses by their paths
+-- (StaticFindObject; the host tick, every second). An asset loaded again
+-- elsewhere is at its new address within a second; nothing waits 5 min.
+local function refresh_wanted()
+    local map, n, absent = {}, 0, {}
+    for name, path in pairs(WANTED_PATH) do
+        local k = addr(ue.find_object(path))
+        if k then
+            map[k] = name
+            n = n + 1
+        else
+            absent[name] = true
+        end
+    end
+    -- one met by its name (not at its path) stays known by its address
+    for k, name in pairs(wanted_by_addr) do
+        if map[k] == nil and absent[name] then map[k] = name end
+    end
+    wanted_by_addr = map
+    found.n, found.absent = n, absent
+end
+
+-- The kind of an asset this module relays, or nil. A known address is
+-- checked by the asset's name (an address can be freed and taken by another
+-- asset). Any other asset: nil without reading its name once all six are in
+-- memory at their paths; while one is not, by its name (and a relayed one
+-- found that way is remembered by its address).
 local function wanted(a)
     local k = addr(a)
     if not k then return nil end
-    local w = wanted_by_addr[k]
-    if w == nil then
-        w = WANTED[ue.short(a)] or false
-        wanted_by_addr[k] = w
+    local name = wanted_by_addr[k]
+    if name ~= nil then
+        if ue.short(a) == name then return WANTED[name] end
+        wanted_by_addr[k] = nil   -- another asset there now
     end
-    return w or nil
+    if found.n >= WANTED_N then return nil end
+    name = ue.short(a)
+    local kind = WANTED[name]
+    if not kind then return nil end
+    wanted_by_addr[k] = name
+    if not by_name_logged[name] then
+        by_name_logged[name] = true
+        log.info("ai: fx: %s found by its name, not at %s (%d of %d relayed assets at their paths)", name,
+            WANTED_PATH[name] or "?", found.n, WANTED_N)
+    end
+    return kind
 end
 
 local function budget_ok(pc_key, now)
@@ -151,7 +203,8 @@ local function relay(kind, asset, loc, r, a, b, c, d, z)
     end
     M.stats.sent = M.stats.sent + n
     if n > 0 and core.first("fx.sent." .. ue.short(asset), 2) then
-        log.info("ai: fx: %s of %s -> %d client(s)", ue.short(asset), ue.short(z), n)
+        log.info("ai: fx: %s of %s -> %d client(s) (%d of %d relayed assets found at their paths)", ue.short(asset),
+            ue.short(z), n, found.n, WANTED_N)
     end
 end
 
@@ -231,9 +284,8 @@ local function on_fx(f)
         return
     end
     M.stats.played = M.stats.played + 1
-    if core.first("fx.played." .. ue.short(a), 2) then
-        log.info("ai: fx: %s at %.0f %.0f %.0f (from the host)", ue.short(a), loc.X, loc.Y, loc.Z)
-    end
+    local say = core.line("fx.played." .. ue.short(a), 2)
+    if say then say("ai: fx: %s at %.0f %.0f %.0f (from the host)", ue.short(a), loc.X, loc.Y, loc.Z) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -257,6 +309,7 @@ function M.host_tick(now)
     for k, b in pairs(per_client) do
         if now - b.t > 60 then per_client[k] = nil end
     end
+    refresh_wanted()
 end
 
 function M.on_message(kind, f)
@@ -265,6 +318,7 @@ end
 
 function M.reset()
     per_client, missing = {}, {}
+    wanted_by_addr, found, by_name_logged = {}, { n = 0, absent = {} }, {}
 end
 
 function M.status_line()

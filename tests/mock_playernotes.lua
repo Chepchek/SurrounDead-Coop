@@ -1,7 +1,7 @@
 -- Mock harness: sdc_playernotes - "<player> died / respawned" as the game's
 -- own notification on every screen but that player's (host decides, PEV to
--- the clients, text in the RECEIVING player's language), cause of death from
--- the killing blow (BP_PlayerCharacter.ReceiveAnyDamage post), rate limit,
+-- the clients, text in the RECEIVING player's language), no cause of death
+-- (BP_PlayerCharacter.ReceiveAnyDamage is never hooked), rate limit,
 -- setting player_event_notes.
 -- usage: lua mock_playernotes.lua <scripts dir>
 -- Three machines in one Lua state (modules loaded once per machine, as
@@ -137,19 +137,7 @@ engine(HW); engine(AW); engine(BW)
 
 -- the host's world: both clients' controllers and characters, AI classes, the damage event
 WORLD = HW
-new(HW, { "Function" }, "ReceiveAnyDamage", {}, {}, DMG_FN)
-local CLASSES = {
-    { "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C", "BP_MasterZombie_C" },
-    { "/Game/AI/Zombies/Boss/BP_ZombieBoss.BP_ZombieBoss_C", "BP_ZombieBoss_C" },
-    { "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C", "BP_AnimalWolf_C" },
-    { "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C", "BP_AnimalBear_C" },
-    { "/Game/AI/Animals/BP_Animal.BP_Animal_C", "BP_Animal_C" },
-    { "/Game/SmartAI/Blueprints/AI/AICharacters/BP_MasterAICharacter.BP_MasterAICharacter_C", "BP_MasterAICharacter_C" },
-}
-for _, c in ipairs(CLASSES) do
-    local o = new(HW, { "BlueprintGeneratedClass" }, c[2], {}, {}, c[1])
-    o._is = c[2]
-end
+new(HW, { "Function" }, "ReceiveAnyDamage", {}, {}, DMG_FN)   -- loaded, but never to be hooked
 local function remote(name, n)
     local conn = new(HW, { "IpConnection" }, "IpConnection_" .. n)
     local pc = new(HW, { "BP_PlayerController_C", "PlayerController" }, "BP_PlayerController_C_" .. n,
@@ -162,13 +150,6 @@ end
 local apc, apawn = remote("Alice", 1)
 local bpc, bpawn = remote("Bob", 2)
 local AKEY, BKEY = apc:GetFullName(), bpc:GetFullName()
-local zombie = new(HW, { "BP_Zombie_Roamer_C", "BP_MasterZombie_C", "Character" }, "BP_Zombie_Roamer_C_7", {})
-local zctrl = new(HW, { "BP_ZombieAIController_C", "AIController" }, "BP_ZombieAIController_C_7", {})
-local wolf = new(HW, { "BP_AnimalWolf_C", "BP_Animal_C", "Character" }, "BP_AnimalWolf_C_1", {})
-local bear = new(HW, { "BP_AnimalBear_C", "BP_Animal_C", "Character" }, "BP_AnimalBear_C_1", {})
-local bandit = new(HW, { "BP_Bandit_Rifle_C", "BP_MasterBandit_C", "BP_MasterAICharacter_C", "Character" }, "BP_Bandit_3", {})
-local barrel = new(HW, { "BP_ExplosiveBarrel_C", "Actor" }, "BP_ExplosiveBarrel_2", {})
-local bob_gun = new(HW, { "BP_M4Pickup_C", "Actor" }, "BP_M4Pickup_C_5", { _owner = bpawn })
 
 -- ---------------------------------------------------------------- modules per machine
 local function load_mods(w, lang, name)
@@ -232,17 +213,17 @@ local function shown(w, text)
 end
 local function count(w) return #w.screen end
 local function tick() WORLD = HW; H.pn.tick() end
-local function fire_damage(victim, dmg, inst, causer)
-    WORLD = HW
-    for _, h in ipairs(HW.hooks[DMG_FN] or {}) do
-        local r = h.pre(param(victim), param(dmg), param(nil), param(inst), param(causer))
-        assert(r == nil, "the damage hook returned a value")
+local function kill(victim) victim._p["PlayerDead?"] = true end
+-- the fields of the last PEV sent to `pc` (decoded like the client does)
+local function last_pev(pc)
+    for i = #outbox, 1, -1 do
+        local e = outbox[i]
+        if e.to == pc and e.kind == "PEV" then
+            local _, f = H.net.decode(e.raw)
+            return f
+        end
     end
-end
--- the killing blow as the game runs it: PlayerDead? set inside the damage call
-local function kill(victim, dmg, inst, causer)
-    victim._p["PlayerDead?"] = true
-    fire_damage(victim, dmg, inst, causer)
+    return nil
 end
 local function respawn(rec, pc, pawn_name)
     WORLD = HW
@@ -254,38 +235,34 @@ end
 local rA, rB = HS.remote[AKEY], HS.remote[BKEY]
 
 -- ---------------------------------------------------------------- scenarios
-print("== P0. install, first sight")
+print("== P0. install, first sight, no damage hook")
 check(A.net.handlers.PEV ~= nil and B.net.handlers.PEV ~= nil, "clients handle PEV")
--- the cause-of-death hook is off by default since the 0.7.1 crashes
 tick()
-check(not HW.hooks[DMG_FN], "by default the host does NOT hook BP_PlayerCharacter ReceiveAnyDamage (cause off)")
-H.pn.CAUSE_HOOK = true   -- the rest covers the cause logic, still there behind the switch
-tick()
-check(HW.hooks[DMG_FN] and #HW.hooks[DMG_FN] == 1, "player_event_cause on: host hooked BP_PlayerCharacter ReceiveAnyDamage (clients connected)")
+check(not HW.hooks[DMG_FN], "the host never hooks BP_PlayerCharacter ReceiveAnyDamage (clients connected)")
+check(H.pn.CAUSE_HOOK == nil and H.pn._t.on_damage == nil and H.pn._t.classify == nil, "no cause-of-death code left")
 check(#outbox == 0 and count(HW) == 0, "first sight of the players: no event")
 advance(1); tick()
 check(#outbox == 0, "nothing while everyone lives")
 
-print("== P1. Alice killed by a zombie: the host and Bob are told, Alice is not")
-advance(0.6)
-fire_damage(apawn, 20, zctrl, zombie)          -- an ordinary hit first
-advance(0.2)
-kill(apawn, 35, zctrl, zombie)
+print("== P1. Alice dies: the host and Bob are told, Alice is not")
+advance(0.8)
+kill(apawn)
 rA.dead = true                                  -- sdc_players.host_player_tick
 advance(0.5); tick()
 check(sent_to(bpc, "PEV") == 1, "PEV sent to Bob")
 check(sent_to(apc) == 0, "nothing sent to Alice (her own death)")
-local hs = shown(HW, "Alice погиб — убит зомби.")
+local f1 = last_pev(bpc)
+check(f1 and #f1 == 2 and f1[1] == "died" and f1[2] == "Alice", "PEV|died|name: no cause fields")
+local hs = shown(HW, "Alice погиб.")
 check(hs ~= nil, "host's screen (Russian): " .. tostring(HW.screen[#HW.screen] and HW.screen[#HW.screen].text))
 check(hs and hs.icon == HW.paths[SKULL], "with the game's skull icon")
 check(hs and hs.col.R == 1 and hs.col.G == 0 and hs.col.B == 0, "in the game's red")
 deliver()
-check(shown(BW, "Alice was killed by a zombie.") ~= nil, "Bob's screen in English: " .. tostring(BW.screen[1] and BW.screen[1].text))
+check(shown(BW, "Alice died.") ~= nil, "Bob's screen in English: " .. tostring(BW.screen[1] and BW.screen[1].text))
 check(count(AW) == 0, "nothing on Alice's screen")
 
-print("== P2. a hit on the body changes nothing; Alice respawns")
+print("== P2. nothing more while she lies dead; Alice respawns")
 local before = count(HW)
-fire_damage(apawn, 50, nil, bob_gun)
 advance(2); tick()
 check(count(HW) == before and #outbox == 0, "no second death notice")
 respawn(rA, apc, "BP_PlayerCharacter_C_11")
@@ -301,8 +278,7 @@ check(back_icon and back_icon.icon == HW.paths[BAG], "respawn with the sleeping-
 print("== P3. rate limit: Alice dies again within 30 s")
 local hn, bn = count(HW), count(BW)
 advance(5); tick()
-local apawn2 = HS.remote[AKEY].pawn
-kill(apawn2, 99, zctrl, zombie)
+kill(rA.pawn)
 rA.dead = true
 advance(0.5); tick()
 check(#outbox == 0 and count(HW) == hn, "second death within 30 s: not announced")
@@ -313,82 +289,58 @@ deliver()
 check(count(BW) == bn, "Bob's screen unchanged")
 check(H.pn.stats.limited >= 1, "counted as rate limited")
 
-print("== P4. after 30 s: Bob kills Alice (his gun): Bob sees 'You killed', the host the killer's name")
+print("== P4. after 30 s: Alice dies again (whoever killed her): the plain text again")
 advance(31); tick()
-local apawn3 = rA.pawn
 advance(0.4)
-kill(apawn3, 60, bpc, bob_gun)
+kill(rA.pawn)
 rA.dead = true
 advance(0.5); tick()
-check(shown(HW, "Alice погиб — его убил Bob.") ~= nil, "host's screen names the killer")
 check(sent_to(bpc, "PEV") == 1 and sent_to(apc) == 0, "Bob told, Alice not")
 deliver()
-check(shown(BW, "You killed Alice.") ~= nil, "Bob's screen: You killed Alice.")
+check(#BW.screen >= 2 and BW.screen[#BW.screen].text == "Alice died.", "Bob's screen: Alice died.")
 respawn(rA, apc, "BP_PlayerCharacter_C_13")
 advance(1); tick(); deliver()
 
-print("== P5. the host falls to death (own_watch): both clients told in their language, not the host's screen")
-advance(1); tick()                               -- the tick sees the host alive
+print("== P5. the host dies (own_watch): both clients told in their language, not the host's screen")
+advance(1); tick()
 local hn5 = count(HW)
-advance(0.3)
-kill(HW.pawn, 999, nil, nil)                     -- OnLanded: ApplyDamage(self, 999, None, None)
-WORLD = HW; H.pn.own_event("died", HW.pawn:GetAddress())
+kill(HW.pawn)
+WORLD = HW; H.pn.own_event("died", HW.pawn:GetAddress())   -- sdc_respawn still passes the address
 check(sent_to(apc, "PEV") == 1 and sent_to(bpc, "PEV") == 1, "PEV to Alice and Bob")
 check(count(HW) == hn5, "nothing on the host's own screen")
 deliver()
-check(shown(AW, "Hosty погиб — разбился при падении.") ~= nil, "Alice (Russian): " .. tostring(AW.screen[#AW.screen] and AW.screen[#AW.screen].text))
-check(shown(BW, "Hosty died from a fall.") ~= nil, "Bob (English): fall")
+check(shown(AW, "Hosty погиб.") ~= nil, "Alice (Russian): " .. tostring(AW.screen[#AW.screen] and AW.screen[#AW.screen].text))
+check(shown(BW, "Hosty died.") ~= nil, "Bob (English)")
 HW.pawn._p["PlayerDead?"] = false
 WORLD = HW; H.pn.own_event("back", HW.pawn:GetAddress())
 deliver()
 check(shown(AW, "Hosty возродился.") ~= nil and shown(BW, "Hosty respawned.") ~= nil, "host respawned: both told")
 
-print("== P6. Bob bleeds out (no causer, random damage): no cause in the text")
+print("== P6. Bob dies: Alice and the host told, Bob not")
 advance(1); tick()
-advance(0.3)
-kill(bpawn, 2.7, nil, nil)
+kill(bpawn)
 rB.dead = true
 advance(0.5); tick()
-check(shown(HW, "Bob погиб.") ~= nil, "host: 'Bob погиб.' without a cause")
+check(shown(HW, "Bob погиб.") ~= nil, "host: 'Bob погиб.'")
 check(sent_to(apc, "PEV") == 1 and sent_to(bpc) == 0, "Alice told, Bob not")
 deliver()
 check(shown(AW, "Bob погиб.") ~= nil, "Alice: 'Bob погиб.'")
 respawn(rB, bpc, "BP_PlayerCharacter_C_21")
 advance(1); tick(); deliver()
 
-print("== P7. a dead hit without a fresh 'alive' (no tick for 31 s): no cause")
-advance(31)
-local bp2 = rB.pawn
-kill(bp2, 40, zctrl, zombie)
-rB.dead = true
-tick()
-check(sent_to(apc, "PEV") == 1, "death still announced")
-deliver()
-check(shown(AW, "Bob погиб.") ~= nil and not shown(AW, "Bob погиб — убит зомби."), "but without a guessed cause")
-respawn(rB, bpc, "BP_PlayerCharacter_C_22")
-advance(1); tick(); deliver()
+print("== P7. an older host's PEV with cause fields: shown as the plain text")
+local bn7 = count(BW)
+WORLD = BW
+B.net.handlers.PEV({ "died", "Alice", "zombie", "", "0" }, BW.pc)
+advance(0.2); run_timers(BW)
+check(count(BW) == bn7 + 1 and BW.screen[#BW.screen].text == "Alice died.", "old PEV|died|name|cause|killer|you: plain text")
 
-print("== P8. causes: wolf, bear, humans, barrel, own grenade, inexact fall damage")
-local cl = H.pn._t.classify
-WORLD = HW
-check(cl(apawn3, 1, AKEY, 30, nil, wolf).kind == "wolf", "wolf")
-check(cl(apawn3, 1, AKEY, 30, nil, bear).kind == "bear", "bear")
-check(cl(apawn3, 1, AKEY, 30, nil, bandit).kind == "human", "bandit -> humans")
-check(cl(apawn3, 1, AKEY, 30, nil, barrel).kind == nil, "an exploding barrel: no cause")
-local a_nade = new(HW, { "BP_FragGrenade_C", "Actor" }, "BP_FragGrenade_1", { _owner = rA.pawn })
-check(cl(rA.pawn, 1, AKEY, 80, nil, a_nade).kind == nil, "own grenade: no cause (self)")
-check(cl(apawn3, 1, AKEY, 80, nil, apawn3).kind == nil, "hunger / radiation (causer = the victim): no cause")
-check(cl(apawn3, 1, AKEY, 30, nil, nil).kind == "fall", "landing damage 30: fall")
-check(cl(apawn3, 1, AKEY, 30.4, nil, nil).kind == nil, "30.4 without a causer: no cause")
-local h = cl(apawn3, 1, AKEY, 50, HW.pc, nil)
-check(h.kind == "player" and h.kkey == "host" and h.killer == "Hosty", "the host's own shot: player Hosty")
-
-print("== P9. setting off on the host: nothing sent or shown")
+print("== P8. setting off on the host: nothing sent or shown")
 advance(40); tick()
 H.cfg.set("player_event_notes", false)
-local hn9, an9 = count(HW), count(AW)
+local hn9 = count(HW)
 advance(0.4)
-kill(rB.pawn, 40, zctrl, zombie)
+kill(rB.pawn)
 rB.dead = true
 advance(0.5); tick()
 check(#outbox == 0 and count(HW) == hn9, "host off: no PEV, nothing on the host's screen")
@@ -397,25 +349,25 @@ advance(1); tick()
 check(#outbox == 0, "and no respawn notice")
 H.cfg.set("player_event_notes", true)
 
-print("== P10. setting off on a client: only that screen stays quiet")
+print("== P9. setting off on a client: only that screen stays quiet")
 advance(40); tick()
 B.cfg.set("player_event_notes", false)
 local bn10 = count(BW)
 advance(0.4)
-kill(rA.pawn, 40, zctrl, zombie)
+kill(rA.pawn)
 rA.dead = true
 advance(0.5); tick()
 check(sent_to(bpc, "PEV") == 1, "the host still sends it")
 deliver()
 check(count(BW) == bn10, "Bob (off) shows nothing")
-check(shown(HW, "Alice погиб — убит зомби.") ~= nil, "the host still shows it")
+check(shown(HW, "Alice погиб.") ~= nil, "the host still shows it")
 B.cfg.set("player_event_notes", true)
 respawn(rA, apc, "BP_PlayerCharacter_C_14")
 advance(1); tick(); deliver()
 
-print("== P11. a player who leaves while dead, world reset")
+print("== P10. a player who leaves while dead, world reset")
 advance(40); tick()
-kill(rB.pawn, 40, zctrl, zombie)
+kill(rB.pawn)
 rB.dead = true
 HS.remote[BKEY] = nil
 HS.remote_pcs = { apc }
@@ -427,15 +379,15 @@ rA.dead = true
 tick()
 check(#outbox == 0, "after a reset: first sight again, no event")
 
-print("== P12. language switch on a client follows its own panel language")
+print("== P11. language switch on a client follows its own panel language")
 B.cfg.set("language", "ru")
 WORLD = BW
-check(B.pn.text("died", "Alice", "bear") == "Alice погиб — его задрал медведь.", "Bob in Russian now")
+check(B.pn.text("died", "Alice") == "Alice погиб.", "Bob in Russian now")
 B.cfg.set("language", "en")
-check(B.pn.text("died", "Alice", "player", "Hosty", false) == "Alice was killed by Hosty.", "player killer (en)")
-check(B.pn.text("died", "Alice", "unknown-cause") == "Alice died.", "an unknown cause word: plain text")
+check(B.pn.text("died", "Alice") == "Alice died." and B.pn.text("back", "Alice") == "Alice respawned.", "English again")
+check(B.i18n.STR.ru.pe_died_zombie == nil and B.i18n.STR.en.pe_died_player == nil, "no cause strings in the catalog")
 
-print("== P13. wiring: sdc_respawn installs the module, its tick feeds own_watch's death / respawn")
+print("== P12. wiring: sdc_respawn installs the module, its tick feeds own_watch's death / respawn")
 do
     WORLD = HW
     for k in pairs(package.loaded) do if k:match("^sdc_") then package.loaded[k] = nil end end

@@ -7,6 +7,14 @@
 --     "Pure virtual function being called" and <unnameable> objects).
 --   * A null object property comes back as an *invalid* UObject, not nil, so
 --     always test with M.valid(), never with `if obj then`.
+--   * The same for a hook parameter with no object (p:get()) and GetOwner /
+--     GetOuter / a property read that found none. On such a null object
+--     UE4SS 3.0.1's GetClass, GetFName, GetOuter, IsClass and IsAnyClass read
+--     address 0 and the GAME CRASHES - pcall does not catch it (the host,
+--     2026-11-13 17:36: GetClass on ApplyDamage's DamageCauser None). Safe on
+--     it: IsValid, GetAddress (0), IsA, GetFullName, GetWorld, Has*Flags.
+--     M.valid (or a non-zero GetAddress) before any other method, always;
+--     `== nil` does not catch it.
 
 local log = require("sdc_log")
 
@@ -279,9 +287,6 @@ function M.watch_new(class_name, path)
         class_name, WATCH_TTL)
     return true
 end
-
--- Watch state of a class, or nil: { ok, notes, missed, confirmed, dirty }.
-function M.watch_state(class_name) return watched[class_name] end
 
 -- Every BP_PlayerCharacter_C (players, remote copies, dead / unpossessed
 -- bodies): the shared list (copy, only valid objects). `fresh` = a message
@@ -556,6 +561,16 @@ function M.has_pending_connection()
     return M.count("PendingNetGame") > 0
 end
 
+-- A connection attempt still running: a PendingNetGame that has its net
+-- driver (UEngine::CancelPending clears it; the object itself stays until
+-- the garbage collector takes it).
+function M.pending_connection_live()
+    for _, o in ipairs(M.find_all("PendingNetGame")) do
+        if M.valid(o) and not M.short(o):find("^Default__") and M.valid(M.prop(o, "NetDriver")) then return true end
+    end
+    return false
+end
+
 -- Executes a console command the same way the game does (through
 -- KismetSystemLibrary with the game instance as world context).
 -- `M.exec_in_progress` lets our own ExecuteConsoleCommand hook skip it.
@@ -605,12 +620,69 @@ function M.teleport(actor, loc)
 end
 
 -- ---------------------------------------------------------------------------
--- Game-thread scheduling
+-- Hook parameters, vectors, engine actor lists (shared by the modules)
 -- ---------------------------------------------------------------------------
 
--- Debug: loops switched off by label (experiment.txt "loop <label> off").
-M.disabled_loops = {}
-function M.loop_on(label) return not M.disabled_loops[label] end
+-- The value of a hook parameter (p:get()), or nil (no parameter, or the read
+-- failed).
+function M.param(p)
+    if p == nil then return nil end
+    local ok, v = pcall(m_get, p)
+    if ok then return v end
+    return nil
+end
+
+-- An element of an engine out-array: a parameter wrapper (read with :get())
+-- or the object itself.
+function M.elem(e)
+    local ok, o = pcall(m_get, e)
+    if ok then return o end
+    return e
+end
+
+-- { X, Y, Z } of a vector value (struct, table), or nil when it has no three
+-- numbers.
+function M.vec(v)
+    if v == nil then return nil end
+    local okx, x = pcall(m_field, v, "X")
+    local oky, y = pcall(m_field, v, "Y")
+    local okz, z = pcall(m_field, v, "Z")
+    if okx and oky and okz and type(x) == "number" and type(y) == "number" and type(z) == "number" then
+        return { X = x, Y = y, Z = z }
+    end
+    return nil
+end
+
+-- Live actors of the class at `class_path` in this world (the engine's
+-- iterator: pending-kill ones left out), as the engine's out-array (read each
+-- element with M.elem). nil when the class, the statics or the controller is
+-- not there yet; false, error when the call failed.
+local function m_all_actors(gps, wc, cls, out) gps:GetAllActorsOfClass(wc, cls, out) end
+function M.actors_of(class_path)
+    local cls = M.find_object(class_path)
+    local gps = M.gameplay_statics()
+    local wc = M.local_pc()
+    if not cls or not gps or not wc then return nil end
+    local out = {}
+    local ok, err = pcall(m_all_actors, gps, wc, cls, out)
+    if not ok then return false, err end
+    return out
+end
+
+-- Retry pacing for a hook whose Blueprint class is not loaded yet (it loads
+-- with its first actor, maybe much later): the next try `base` s after the
+-- first miss, then twice as long each time, at most `cap` s. `rec` is the
+-- caller's record ({ next_try, wait }); clear rec.wait to start over (a new
+-- world). Returns the wait.
+function M.backoff(rec, now, base, cap)
+    local w = rec.wait and math.min(cap, rec.wait * 2) or base
+    rec.wait, rec.next_try = w, now + w
+    return w
+end
+
+-- ---------------------------------------------------------------------------
+-- Game-thread scheduling
+-- ---------------------------------------------------------------------------
 
 -- [SLOW]: a scheduled task of the mod that held the game thread for longer
 -- than SLOW_MS (a freeze or a stutter shows up with the task's name); the
@@ -626,7 +698,6 @@ M.last_done = { label = nil, at = 0, ms = 0 }
 M.task_stats = {}   -- label -> { calls, ms } (sdc_perf)
 local function guarded(label, fn)
     return function(...)
-        if M.disabled_loops[label] then return end
         local t0 = os.clock()
         M.last_task.label, M.last_task.at = label, t0
         -- tasks run from the engine's timers, never inside a hook: a hook

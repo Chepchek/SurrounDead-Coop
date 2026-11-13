@@ -54,6 +54,9 @@
 --   The blood splatter on a hit (human: ReceiveAnyDamage -> Event_BloodSplatter
 --   @966; boss: StandardDamage -> DamageComponent.Event_BloodSplatterFX
 --   @6821) also runs on the host only: NPCBLOOD, the client calls the same event.
+--   The boss's hit comes from its own StandardDamage bound event (@6953 ->
+--   @6821, every hit); until 0.7.3 the hook was DamageComponent.
+--   Event_BloodSplatterFX, which runs on every hit of every zombie as well.
 -- npc_health. BP_SmartAIComponent.MaxHealth is not replicated. Each machine
 --   computes it in BeginPlay (AI_Health -> HealthMultiplier ->
 --   ScalingHealthMultiplier: a random factor, player 0's level and days
@@ -67,7 +70,28 @@
 --   backpack + its transform; soldiers: body material, headwear, mask): a
 --   client saw other clothes. NPCSET carries the host's look; the client
 --   applies it with the functions SetMeshAndMaterial uses (SetSkinnedAssetAndUpdate,
---   SetStaticMesh, SetMaterial, the relative transform).
+--   SetStaticMesh, SetMaterial, the relative transform), with assets already
+--   in memory only (never a load in the hook; a part whose asset is not there
+--   waits for the host's next NPCSET).
+--   Also the settlements' civilians (BP_RandomCivilian: body, hair, beard,
+--   backpack, and the name on their name plate, SetName @515 / @782: a random
+--   first name and surname per machine) and the pet dog (BP_AnimalDog
+--   SetMeshAndMaterial: model and material), every FRIENDLY_PASS_S (GetAllActorsOfClass,
+--   not FindAllOf); their name goes as the host shows it (its language).
+--   Not synced: petting the dog (the petting player's own montage and the
+--   dog's, OnExecuteInteract on that machine only).
+-- npc_marker (client). The enemy marker (MarkEnemy key) is local to the
+--   marking machine; the AI's Event_Marker timer (1 s) keeps it while
+--   GetPlayerController(0).LineOfSightTo(GetAIController(self)) and removes
+--   it 60 s after the last sight (RetriggerableDelay 60: @3874 boss, @29294
+--   zombie, bandits / traders / soldiers / scavengers, wolf / bear / deer /
+--   rabbit the same). A client's copy has no AI controller: the line of sight
+--   was never true, the marker never went (until the AI died). Post-hook
+--   Event_Marker on the copies: the line of sight to the copy itself; 60 s
+--   after the last sight the game's own removal (@581: the marker component
+--   destroyed, CanAddMarker? = true where the class has it, the Event_Marker
+--   timer cleared and its handle invalidated - a zombie's CanAddMarkerToAI?
+--   is "no valid MarkerTimer").
 --
 -- Object identity host -> client as sdc_ai does it: the payload (ClientMessage)
 -- and right after it the NPC as the parameter of PlayerController.
@@ -75,9 +99,15 @@
 -- it to ITS copy, or nil when it has none. The client checks the class name.
 -- No NPC wrapper is kept beyond the call that got it; kept state is strings
 -- and numbers. Every hook callback returns nothing and never throws.
+-- Hooks: this module's own (installed from the tick, retried with a growing
+-- wait while their Blueprint class is not loaded), and the ones sdc_ai's
+-- features hook too (the boss's MeleeAttack / DeathEvent, the humans'
+-- StopBurning), which sdc_ai installs once for both (shared_hook).
+-- The host's offscreen ticking of human NPCs is given back when the last
+-- client leaves.
 --
 -- Messages host -> client:
---   NPCSET|<class>|<max health>|<health>|<look>   + ClientRepObjRef(npc)
+--   NPCSET|<class>|<max health>|<health>|<look>[|<name>]   + ClientRepObjRef(npc)
 --   NPCFIRE|<class>|1/0                            + ClientRepObjRef(npc)
 --   NPCBLOOD|<class>                               + ClientRepObjRef(npc)
 --   NPCROCK|ox|oy|oz|tx|ty|tz
@@ -87,12 +117,15 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local net = require("sdc_net")
 local cfg = require("sdc_config")
+local ai = require("sdc_ai")   -- shared helpers (ai.core) and the hooks it installs for both (M.hook_external)
+local core = ai.core
 
 local M = {
     stats = { boss_tick = 0, human_tick = 0, human_back = 0, rocks_sent = 0, rocks_spawned = 0, rocks_failed = 0,
               sounds = 0, fire_sent = 0, fire_applied = 0, blood_sent = 0, blood_applied = 0,
-              set_sent = 0, set_applied = 0, looks = 0, look_parts = 0, look_failed = 0,
-              objref_got = 0, objref_nil = 0, objref_stale = 0, objref_other = 0, objref_failed = 0 },
+              set_sent = 0, set_applied = 0, looks = 0, look_parts = 0, look_failed = 0, look_later = 0,
+              objref_got = 0, objref_nil = 0, objref_stale = 0, objref_other = 0, objref_failed = 0,
+              friendly_set = 0, names = 0, marks_seen = 0, marks_removed = 0, marks_failed = 0, slow_objref = 0 },
 }
 
 local S = nil   -- sdc_session.state
@@ -102,7 +135,8 @@ local clock = os.clock
 -- Settings (defaults apply until the keys are in sdc_config's SCHEMA)
 -- ---------------------------------------------------------------------------
 
-local DEFAULTS = { npc_offscreen = true, npc_boss_fx = true, npc_effects = true, npc_health = true, npc_looks = true }
+local DEFAULTS = { npc_offscreen = true, npc_boss_fx = true, npc_effects = true, npc_health = true, npc_looks = true,
+                   npc_marker = true }
 
 local function opt(key)
     local v = cfg.get(key)
@@ -117,7 +151,8 @@ end
 local BOSS = "/Game/AI/Zombies/Boss/BP_ZombieBoss.BP_ZombieBoss_C"
 local ROCK = "/Game/AI/Zombies/Boss/BP_ZombieBossRock.BP_ZombieBossRock_C"
 local HUMAN = "/Game/SmartAI/Blueprints/AI/AICharacters/BP_MasterAICharacter.BP_MasterAICharacter_C"
-local DMG = "/Game/Blueprints/Components/DamageComponent.DamageComponent_C"
+-- the boss's DamageComponent.StandardDamage bound event (@6953 -> @6821 Event_BloodSplatterFX)
+local BOSS_HIT = "BndEvt__DamageTester_DamageComponent_K2Node_ComponentBoundEvent_0_StandardDamage__DelegateSignature"
 local HUMANS = {   -- each defines its own SetBurning / StopBurning
     "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C",
     "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C",
@@ -125,6 +160,16 @@ local HUMANS = {   -- each defines its own SetBurning / StopBurning
     "/Game/AI/Humans/Scavengers/BP_MasterScavenger.BP_MasterScavenger_C",
 }
 local HUMAN_CLASS = "BP_MasterAICharacter_C"
+-- friendly NPCs whose look (and the civilian's name) is rolled per machine
+local CIVILIAN = "/Game/AI/SafeZoneAndCivilians/RandomCivilian/BP_RandomCivilian.BP_RandomCivilian_C"
+local DOG = "/Game/AI/Animals/Dog/BP_AnimalDog.BP_AnimalDog_C"
+-- every class with its own Event_Marker (the enemy marker's 1 s timer)
+local MARKED = {
+    "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C", BOSS,
+    HUMANS[1], HUMANS[2], HUMANS[3], HUMANS[4],
+    "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C", "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
+    "/Game/AI/Animals/Deer/BP_AnimalDeer.BP_AnimalDeer_C", "/Game/AI/Animals/Rabbit/BP_AnimalRabbit.BP_AnimalRabbit_C",
+}
 local OBJREF_FN = "/Script/Engine.PlayerController:ClientRepObjRef"
 -- SND paths (sdc_sync adds /Game/): BP_ZombieBoss @2953 / @11532, @3549
 local GROWL = "Audio/Zombie/ZombieGrowlShort.ZombieGrowlShort"
@@ -132,8 +177,8 @@ local ROAR = "Audio/Zombie/ZombieDeathShort.ZombieDeathShort"
 -- what SetMeshAndMaterial changes (bandit, trader, scavenger, soldier, civilian)
 local LOOK_PARTS = { "Mesh", "HairMesh", "BeardMesh", "BackpackMesh", "HeadwearMesh", "MaskMesh" }
 
-local ALWAYS = 0                       -- EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
-local TICK_PROP = "VisibilityBasedAnimTickOption"
+local ALWAYS = core.ALWAYS_TICK        -- EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
+local TICK_PROP = core.TICK_PROP
 
 local PASS_S = 1.0          -- host pass over the human NPCs
 local TICK_NEAR = 6000      -- cm: a human NPC this close to a remote player animates unseen on the host
@@ -152,7 +197,11 @@ local FRESH_S = 0.2         -- a montage this call started
 local OBJ_TTL = 2.0
 local ROCK_LIFE_S = 8.0
 local ROCKS_PER_S = 4
-local LOADS_PER_S = 12      -- client: synchronous asset loads for looks
+local BP_RETRY_S, BP_RETRY_MAX_S = 2, 30   -- a hook whose Blueprint class is not loaded yet: retry, doubling
+local FRIENDLY_PASS_S = 3   -- host: civilians / dogs looked at this often (their look is sent once, then every 30 s)
+local MAX_FRIENDLY = 48     -- ... at most this many per pass
+local MARK_KEEP_S = 60      -- the marker goes this long after the last sight (the game's RetriggerableDelay)
+local MARKS_PRUNE_S = 60    -- client: marks of copies gone (no timer any more) forgotten after 10 min
 
 -- ---------------------------------------------------------------------------
 -- Small helpers
@@ -165,19 +214,8 @@ local function addr(o)
     return nil
 end
 
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
-
-local function vec_of(v)
-    if v == nil then return nil end
-    local x, y, z = ue.try(function() return v.X end), ue.try(function() return v.Y end), ue.try(function() return v.Z end)
-    if type(x) == "number" and type(y) == "number" and type(z) == "number" then return { X = x, Y = y, Z = z } end
-    return nil
-end
+local get = ue.param
+local vec_of = ue.vec
 
 local function d2(a, b)
     local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
@@ -196,30 +234,11 @@ local function full_path(p)
     return "/Game/" .. p
 end
 
-local first_counts = {}
-local function first(key, n)
-    local c = (first_counts[key] or 0) + 1
-    first_counts[key] = c
-    return c <= (n or 3) or log.debug_enabled == true
-end
+-- true for the first `n` calls with this key (sdc_ai's counter; keys "npc.*")
+local function first(key, n) return core.first("npc." .. key, n) end
 
--- Is `o` an instance of the Blueprint class at `path`? Cached by class name.
-local isa_cache = {}
-local function isa(o, path)
-    local cn = ue.class_name(o)
-    if cn == "" then return false end
-    local key = cn .. "|" .. path
-    local c = isa_cache[key]
-    if c ~= nil then return c end
-    local cls = ue.find_object(path)
-    if not cls then return false end   -- not loaded: no instance can exist; not cached
-    local ok, r = pcall(function() return o:IsA(cls) end)
-    if not ok then return false end
-    isa_cache[key] = r == true
-    return r == true
-end
-local function is_boss(o) return isa(o, BOSS) end
-local function is_human(o) return isa(o, HUMAN) end
+-- Is `o` an instance of the Blueprint class at `path`? (sdc_ai's test, cached by class name)
+local function is_boss(o) return ai.isa(o, BOSS) end
 
 local function human_dead(npc)
     return ue.prop(ue.prop(npc, "BP_AIComponent"), "Dead") == true
@@ -230,11 +249,14 @@ end
 -- needs them; Blueprint classes load late, so those are retried)
 -- ---------------------------------------------------------------------------
 
-local HOOKS = {}   -- { path, kind = "bp" | "pre", role, keys = { config keys }, fn, installed, next_try, logged }
+local HOOKS = {}   -- { path, kind = "bp" | "pre", role, keys = { config keys }, fn, installed, next_try, wait, logged }
+local SHARED = {}  -- handles of the hooks sdc_ai installs for this module too (shared_hook below)
+
+local function label_of(path) return path:match("([^%.]+:[^:]+)$") or path end
 
 local function hook(path, kind, role, keys, fn)
     HOOKS[#HOOKS + 1] = { path = path, kind = kind, role = role, keys = keys, fn = fn,
-                          installed = false, next_try = 0, label = path:match("([^%.]+:[^:]+)$") or path }
+                          installed = false, next_try = 0, label = label_of(path) }
 end
 
 local function keys_any(keys)
@@ -271,7 +293,9 @@ local function install_hooks(now, role)
                 h.next_try = now + 60
                 log.warn("npc: hook %s FAILED: %s", h.label, tostring(err))
             else
-                h.next_try = now + 2   -- the Blueprint class is not loaded yet
+                -- the Blueprint class is not loaded yet (it loads with its first
+                -- actor): retry, less often each time
+                ue.backoff(h, now, BP_RETRY_S, BP_RETRY_MAX_S)
                 if not h.logged then
                     h.logged = true
                     log.debug("npc: hook %s not ready yet (%s)", h.label, tostring(err))
@@ -296,6 +320,8 @@ local host = {
     roared = {},    -- [boss full name] = clock
     blood = {},     -- [npc full name] = clock
     burning = {},   -- [npc full name] = true (NPCFIRE 1 sent)
+    friendly = {},  -- [civilian / dog full name] = true: seen in the last friendly pass (its sent / looks entries kept)
+    last_friendly = -1000,
 }
 
 local function viewers_near(loc, range)
@@ -349,15 +375,9 @@ local function send_sound(path, loc, range)
 end
 
 -- The mesh of `actor` -> full ticking. Returns its previous value when this
--- changed it, nil when it was already set (or there is no mesh).
-local function full_pose(actor)
-    local mesh = ue.prop(actor, "Mesh")
-    if not ue.valid(mesh) then return nil end
-    local v = ue.prop(mesh, TICK_PROP)
-    if v == ALWAYS then return nil end
-    if not ue.set_prop(mesh, TICK_PROP, ALWAYS) then return nil end
-    return type(v) == "number" and v or 3
-end
+-- changed it (3, OnlyTickPoseWhenRendered, when unreadable), nil when it was
+-- already set (or there is no mesh).
+local function full_pose(actor) return core.full_pose(actor, 3) end
 
 local function keep_ticking(boss, why)
     if not opt("npc_offscreen") or ue.prop(boss, "IsDead?") == true then return end
@@ -370,16 +390,6 @@ local function keep_ticking(boss, why)
     end
 end
 
--- the montage `npc` plays if it just started (position <= FRESH_S), or nil
-local function fresh_montage(npc)
-    local m = ue.try(function() return npc:GetCurrentMontage() end)
-    if not ue.valid(m) then return nil end
-    local mesh = ue.prop(npc, "Mesh")
-    local anim = ue.valid(mesh) and ue.try(function() return mesh:GetAnimInstance() end) or nil
-    local pos = ue.valid(anim) and ue.try(function() return anim:Montage_GetPosition(m) end) or nil
-    if type(pos) == "number" and pos > FRESH_S then return nil end
-    return m
-end
 
 -- BP_ZombieBoss.MeleeAttack, post (host)
 local function on_boss_melee(c)
@@ -387,7 +397,8 @@ local function on_boss_melee(c)
     local boss = c:get()
     if not ue.valid(boss) then return end
     keep_ticking(boss, "attacks")
-    if not opt("npc_boss_fx") or #host.viewers == 0 or not fresh_montage(boss) then return end
+    -- a growl only with a montage this call started (position <= FRESH_S)
+    if not opt("npc_boss_fx") or #host.viewers == 0 or not core.fresh_montage(boss, FRESH_S) then return end
     local key = ue.name(boss)
     local now = clock()
     if host.growl[key] and now - host.growl[key] < GROWL_GAP_S then return end
@@ -483,13 +494,11 @@ local function on_human_blood(c)
     send_blood(c:get())
 end
 
--- DamageComponent.Event_BloodSplatterFX, post (host): context = the component.
--- Bosses only (zombies are sdc_ai's).
-local function on_dmg_blood(c)
+-- BP_ZombieBoss's StandardDamage bound event, post (host): the boss was hit
+-- (its handler runs DamageComponent.Event_BloodSplatterFX on every hit).
+local function on_boss_hit(c)
     if not host.active then return end
-    local comp = c:get()
-    local owner = ue.valid(comp) and ue.try(function() return comp:GetOwner() end) or nil
-    if ue.valid(owner) and is_boss(owner) then send_blood(owner) end
+    send_blood(c:get())
 end
 
 -- -- the pass over the human NPCs (once a second) ----------------------------
@@ -562,6 +571,24 @@ local function look_of(npc)
     return table.concat(parts, ";")
 end
 
+-- The text on a civilian's name plate (NameWidget -> BP_InteractWidgetCivilian
+-- .Txt, set by its SetName in BeginPlay), or nil.
+local function name_plate(npc)
+    local wc = ue.prop(npc, "NameWidget")
+    if not ue.valid(wc) then return nil end
+    local w = ue.try(function() return wc:GetUserWidgetObject() end)
+    local txt = ue.valid(w) and ue.prop(w, "Txt") or nil
+    if not ue.valid(txt) then return nil end
+    return txt
+end
+
+local function civilian_name(npc)
+    local txt = name_plate(npc)
+    if not txt then return "" end
+    local s = ue.str(ue.try(function() return txt:GetText() end))
+    return (s:gsub("[|;%c]", " "))
+end
+
 local function send_set(v, npc, key)
     local comp = ue.prop(npc, "BP_AIComponent")
     local max, hp = "", ""
@@ -578,8 +605,16 @@ local function send_set(v, npc, key)
             host.looks[key] = look
         end
     end
-    if max == "" and look == "" then return false end
-    if not send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look) then return false end
+    local name = ""
+    if opt("npc_looks") and host.friendly[key] and ue.has_prop(npc, "NameWidget") then name = civilian_name(npc) end
+    if max == "" and look == "" and name == "" then return false end
+    local ok
+    if name ~= "" then
+        ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look, name)
+    else
+        ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look)
+    end
+    if not ok then return false end
     M.stats.set_sent = M.stats.set_sent + 1
     if first("set", 3) then
         log.info("npc: set: %s -> %s: max health %s, health %s, look %d chars", ue.short(npc), ue.short(v.pc), max, hp,
@@ -588,13 +623,67 @@ local function send_set(v, npc, key)
     return true
 end
 
+-- NPCSET of one NPC to each viewer: 1.5 s after it came within SET_RANGE,
+-- again every RESEND_S; forgotten for a viewer beyond GONE_RANGE.
+local function set_for_viewers(npc, key, loc, now)
+    local set2, gone2 = SET_RANGE * SET_RANGE, GONE_RANGE * GONE_RANGE
+    local per = host.sent[key]
+    for _, v in ipairs(host.viewers) do
+        local d = d2(v, loc)
+        local st = per and per[v.key]
+        if d > gone2 then
+            if st then per[v.key] = nil end
+        elseif d <= set2 then
+            if not per then
+                per = {}
+                host.sent[key] = per
+            end
+            if not st then
+                per[v.key] = { first = now }
+            elseif v.budget > 0 and ((not st.at and now - st.first >= SET_DELAY_S)
+                    or (st.at and now - st.at >= RESEND_S)) then
+                v.budget = v.budget - 1
+                if send_set(v, npc, key) then st.at = now else st.at = now - RESEND_S + 5 end
+            end
+        end
+    end
+end
+
+-- Civilians and pet dogs (look, the civilian's name), every FRIENDLY_PASS_S:
+-- the engine's actor list of their class (nil while the class is not loaded).
+local function friendly_pass(now)
+    host.last_friendly = now
+    local seen, n = {}, 0
+    for _, path in ipairs({ CIVILIAN, DOG }) do
+        local out = ue.actors_of(path)
+        if type(out) == "table" then
+            for i = 1, #out do
+                if n >= MAX_FRIENDLY then break end
+                local a = ue.elem(out[i])
+                local loc = ue.valid(a) and ue.location(a) or nil
+                if loc then
+                    n = n + 1
+                    local key = ue.name(a)
+                    seen[key] = true
+                    host.friendly[key] = true
+                    set_for_viewers(a, key, loc, now)
+                end
+            end
+        end
+    end
+    for k in pairs(host.friendly) do
+        if not seen[k] then
+            host.friendly[k], host.sent[k], host.looks[k] = nil, nil, nil
+        end
+    end
+end
+
 local function host_pass(now)
     host.viewers = build_viewers()
     local seen = {}
     local tick_on = opt("npc_offscreen")
     local set_on = opt("npc_health") or opt("npc_looks")
     local near2, far2 = TICK_NEAR * TICK_NEAR, TICK_FAR * TICK_FAR
-    local set2, gone2 = SET_RANGE * SET_RANGE, GONE_RANGE * GONE_RANGE
     for i, npc in ipairs(ue.find_all(HUMAN_CLASS)) do
         if i > MAX_NPCS then break end
         local loc = ue.valid(npc) and ue.location(npc) or nil
@@ -627,34 +716,14 @@ local function host_pass(now)
                 host.ticking[key] = nil
             end
             -- health / look per client
-            if set_on then
-                local per = host.sent[key]
-                for _, v in ipairs(host.viewers) do
-                    local d = d2(v, loc)
-                    local st = per and per[v.key]
-                    if d > gone2 then
-                        if st then per[v.key] = nil end
-                    elseif d <= set2 then
-                        if not per then
-                            per = {}
-                            host.sent[key] = per
-                        end
-                        if not st then
-                            per[v.key] = { first = now }
-                        elseif v.budget > 0 and ((not st.at and now - st.first >= SET_DELAY_S)
-                                or (st.at and now - st.at >= RESEND_S)) then
-                            v.budget = v.budget - 1
-                            if send_set(v, npc, key) then st.at = now else st.at = now - RESEND_S + 5 end
-                        end
-                    end
-                end
-            end
+            if set_on then set_for_viewers(npc, key, loc, now) end
         end
     end
-    -- NPCs that are gone: their strings go
+    if opt("npc_looks") and now - host.last_friendly >= FRIENDLY_PASS_S then friendly_pass(now) end
+    -- NPCs that are gone: their strings go (civilians / dogs: their own pass)
     for _, t in ipairs({ host.ticking, host.sent, host.looks }) do
         for k in pairs(t) do
-            if not seen[k] then t[k] = nil end
+            if not seen[k] and not host.friendly[k] then t[k] = nil end
         end
     end
     for _, t in ipairs({ host.growl, host.roared, host.blood }) do
@@ -672,37 +741,27 @@ local client = {
     pending = nil,     -- { kind, cls, data, t }: payload waiting for its object
     applied = {},      -- [copy full name] = look string applied completely
     applied_n = 0,
-    bad = {},          -- [asset path] = true: could not be loaded / is not that kind
-    loads = { t = 0, n = 0 },
+    bad = {},          -- [asset path] = true: not an asset of the kind the part needs
     rocks = { t = 0, n = 0 },
+    marks = {},        -- [copy full name] = clock of the last sight of its marker's AI (npc_marker)
+    marks_pruned = 0,
 }
 
 local function expect(kind, cls, data)
     client.pending = { kind = kind, cls = cls or "", data = data, t = clock() }
 end
 
-local function load_budget()
-    local now = clock()
-    if now - client.loads.t >= 1 then client.loads.t, client.loads.n = now, 0 end
-    if client.loads.n >= LOADS_PER_S then return false end
-    client.loads.n = client.loads.n + 1
-    return true
-end
-
--- An asset by path (/Game/ only) whose class contains `class_part`; nil and
--- `true` when only the load budget stopped it.
+-- An asset by path (/Game/ only) whose class contains `class_part`, from
+-- memory only: this runs in the ClientRepObjRef hook, where a synchronous
+-- load could wait for the world's streaming and freeze the client. nil and
+-- `true` when it is not in memory (yet): the look stays incomplete, and the
+-- host's next NPCSET (every RESEND_S while the client is near) tries again.
+-- (The NPC classes refer to their look assets directly, so they are normally
+-- in memory with the class.)
 local function asset(path, class_part)
     if type(path) ~= "string" or path:sub(1, 6) ~= "/Game/" or client.bad[path] then return nil end
-    local a = ue.find_object(path)
-    if not a then
-        if not load_budget() then return nil, true end
-        local ok, l = ue.load_asset(path, "npc")
-        if ok and ue.valid(l) then a = l end
-    end
-    if not a then
-        client.bad[path] = true
-        return nil
-    end
+    local a = ue.loaded_asset(path, "npc looks")
+    if not a then return nil, true end
     local cn = ue.class_name(a)
     local good = cn:find(class_part, 1, true) ~= nil
     if class_part == "Material" then good = cn == "Material" or cn:find("MaterialInstance", 1, true) ~= nil end
@@ -739,21 +798,23 @@ local function apply_part(npc, entry)
     local complete = true
     local a_path, m_path = full_path(f[1] or ""), full_path(f[2] or "")
     if a_path ~= "" and asset_path_of(comp) ~= a_path then
-        local a, budget = asset(a_path, skeletal and "SkeletalMesh" or "StaticMesh")
+        local a, later = asset(a_path, skeletal and "SkeletalMesh" or "StaticMesh")
         if a and set_mesh(comp, a, skeletal) then
             M.stats.look_parts = M.stats.look_parts + 1
-        elseif budget then
+        elseif later then
             complete = false
+            M.stats.look_later = M.stats.look_later + 1
         else
             M.stats.look_failed = M.stats.look_failed + 1
         end
     end
     if m_path ~= "" and material_path_of(comp) ~= m_path then
-        local m, budget = asset(m_path, "Material")
+        local m, later = asset(m_path, "Material")
         if m and pcall(function() comp:SetMaterial(0, m) end) then
             M.stats.look_parts = M.stats.look_parts + 1
-        elseif budget then
+        elseif later then
             complete = false
+            M.stats.look_later = M.stats.look_later + 1
         else
             M.stats.look_failed = M.stats.look_failed + 1
         end
@@ -807,6 +868,16 @@ local function apply_set(npc, d)
                 M.stats.looks = M.stats.looks + 1
                 if first("look.applied", 3) then log.info("npc: looks: %s now looks as on the host", ue.short(npc)) end
             end
+        end
+    end
+    -- a civilian's name plate: the host's name (its own SetName rolled another)
+    local name = d.name or ""
+    if name ~= "" and opt("npc_looks") then
+        local txt = name_plate(npc)
+        local now_name = txt and ue.str(ue.try(function() return txt:GetText() end)) or nil
+        if txt and now_name ~= name and pcall(function() txt:SetText(FText(name)) end) then
+            M.stats.names = M.stats.names + 1
+            if first("name.applied", 3) then log.info("npc: looks: %s: name plate as on the host", ue.short(npc)) end
         end
     end
     M.stats.set_applied = M.stats.set_applied + 1
@@ -863,7 +934,66 @@ local function on_objref(_, obj_p)
     end
     M.stats.objref_got = M.stats.objref_got + 1
     local fn = APPLY[p.kind]
-    if fn then fn(o, p.data) end
+    if not fn then return end
+    local t0 = clock()
+    fn(o, p.data)
+    -- one 104 ms hitch at a ClientRepObjRef was seen once (0.7.1, not explained):
+    -- name what it was if it happens again
+    local ms = (clock() - t0) * 1000
+    if ms >= 30 then
+        M.stats.slow_objref = M.stats.slow_objref + 1
+        log.info("npc: [SLOW] %s on %s took %.0f ms (look %d chars, %d look parts applied so far, %d not in memory)",
+            p.kind, ue.short(o), ms, #(p.data and p.data.look or ""), M.stats.look_parts, M.stats.look_later)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Client: the enemy marker (npc_marker)
+-- ---------------------------------------------------------------------------
+
+local function m_los(pc, a) return pc:LineOfSightTo(a, { X = 0, Y = 0, Z = 0 }, false) end
+
+-- What the game does 60 s after the last sight (@581 boss, @5242 zombie,
+-- @247 bandit, @341 wolf): the marker component destroyed, the marker allowed
+-- again, its timer cleared and the handle invalidated.
+local function remove_marker(a, marker)
+    local ok = pcall(function() marker:K2_DestroyComponent(a) end)
+    if ue.has_prop(a, "CanAddMarker?") then ue.set_prop(a, "CanAddMarker?", true) end
+    local ksl = ue.ksl()
+    if ksl then pcall(function() ksl:K2_ClearTimer(a, "Event_Marker") end) end
+    ue.set_prop(a, "MarkerTimer", { Handle = 0 })
+    return ok
+end
+
+-- <AI>.Event_Marker, post (client): the marker's 1 s timer on a host copy.
+local function on_marker(c)
+    local a = c:get()
+    if not ue.valid(a) or ue.role(a) == ue.ROLE_AUTHORITY then return end
+    local marker = ue.prop(a, "Marker")
+    if not ue.valid(marker) then return end
+    local pc = ue.local_pc()
+    if not pc then return end
+    local key = ue.name(a)
+    local now = clock()
+    local ok, seen = pcall(m_los, pc, a)
+    if ok and seen == true then
+        if not client.marks[key] then M.stats.marks_seen = M.stats.marks_seen + 1 end
+        client.marks[key] = now
+        return
+    end
+    local last = client.marks[key]
+    if not last or now - last < MARK_KEEP_S then return end
+    client.marks[key] = nil
+    if remove_marker(a, marker) then
+        M.stats.marks_removed = M.stats.marks_removed + 1
+        if first("marker", 3) then
+            log.info("npc: marker: %s out of sight for %.0f s: its enemy marker removed here (the game's own"
+                .. " removal; a client's copy has no AI controller to check the sight with)", ue.short(a), now - last)
+        end
+    else
+        M.stats.marks_failed = M.stats.marks_failed + 1
+        log.err_throttled("npc.marker", "npc: marker: %s: the marker could not be removed", ue.short(a))
+    end
 end
 
 -- NPCROCK|ox|oy|oz|tx|ty|tz: the boss's throw, spawned here the boss's way
@@ -908,7 +1038,7 @@ local function client_message(kind, f)
         if opt("npc_boss_fx") then spawn_rock(f) end
     elseif kind == "NPCSET" then
         if opt("npc_health") or opt("npc_looks") then
-            expect("set", f[1], { max = f[2], hp = f[3], look = f[4] or "" })
+            expect("set", f[1], { max = f[2], hp = f[3], look = f[4] or "", name = f[5] or "" })
         end
     elseif kind == "NPCFIRE" then
         if opt("npc_effects") then expect("fire", f[1], { on = f[2] == "1" }) end
@@ -921,21 +1051,61 @@ end
 -- Wiring
 -- ---------------------------------------------------------------------------
 
-hook(BOSS .. ":MeleeAttack", "bp", "host", { "npc_offscreen", "npc_boss_fx" }, on_boss_melee)
+-- A Blueprint function sdc_ai's features hook too: sdc_ai installs ONE engine
+-- hook for both and runs this callback while the gate says so (host, one of
+-- `keys` on), installed once a remote player is here (host.active).
+local function shared_hook(path, keys, fn)
+    SHARED[#SHARED + 1] = ai.hook_external({ path = path, kind = "bp", name = "npc." .. label_of(path), fn = fn,
+        gate = function() return S ~= nil and S.role == "host" and keys_any(keys) end,
+        need = function() return host.active end })
+end
+
+local function shared_missing()
+    for _, h in ipairs(SHARED) do
+        if not h.installed then return true end
+    end
+    return false
+end
+
+shared_hook(BOSS .. ":MeleeAttack", { "npc_offscreen", "npc_boss_fx" }, on_boss_melee)   -- sdc_ai_attacks
 hook(BOSS .. ":RangedAttack", "bp", "host", { "npc_offscreen" }, on_boss_ranged)
-hook(BOSS .. ":DeathEvent", "bp", "host", { "npc_boss_fx" }, on_boss_death)
+shared_hook(BOSS .. ":DeathEvent", { "npc_boss_fx" }, on_boss_death)                     -- sdc_ai_kills, _killlog
 hook(ROCK .. ":Launch", "bp", "host", { "npc_boss_fx" }, on_rock_launch)
 hook(BOSS .. ":SetBurning", "bp", "host", { "npc_effects" }, on_set_burning)
 hook(BOSS .. ":StopBurning", "bp", "host", { "npc_effects" }, on_stop_burning)
 for _, path in ipairs(HUMANS) do
     hook(path .. ":SetBurning", "bp", "host", { "npc_effects" }, on_set_burning)
-    hook(path .. ":StopBurning", "bp", "host", { "npc_effects" }, on_stop_burning)
+    shared_hook(path .. ":StopBurning", { "npc_effects" }, on_stop_burning)               -- sdc_ai_kills
 end
 hook(HUMAN .. ":Event_BloodSplatter", "bp", "host", { "npc_effects" }, on_human_blood)
-hook(DMG .. ":Event_BloodSplatterFX", "bp", "host", { "npc_effects" }, on_dmg_blood)
+hook(BOSS .. ":" .. BOSS_HIT, "bp", "host", { "npc_effects" }, on_boss_hit)
 hook(OBJREF_FN, "pre", "client", { "npc_health", "npc_looks", "npc_effects" }, on_objref)
+for _, path in ipairs(MARKED) do
+    hook(path .. ":Event_Marker", "bp", "client", { "npc_marker" }, on_marker)
+end
 
 local last_role, last_world = nil, nil
+
+-- Host: the human NPCs this module set to AlwaysTickPoseAndRefreshBones get
+-- their own value back at once (the last client left, or the role changed in
+-- this world): host_pass, which does it by distance, runs only with a client.
+local function revert_ticking(why)
+    if next(host.ticking) == nil then return end
+    local n = 0
+    for _, npc in ipairs(ue.find_all(HUMAN_CLASS)) do
+        local key = ue.valid(npc) and ue.name(npc) or nil
+        local was = key and host.ticking[key]
+        if was ~= nil then
+            local mesh = ue.prop(npc, "Mesh")
+            if ue.valid(mesh) and ue.prop(mesh, TICK_PROP) == ALWAYS and ue.set_prop(mesh, TICK_PROP, was) then
+                n = n + 1
+            end
+        end
+    end
+    host.ticking = {}
+    M.stats.human_back = M.stats.human_back + n
+    if n > 0 then log.info("npc: offscreen: %d human NPC(s) back to their own pose ticking (%s)", n, why) end
+end
 
 -- Role or world change: every string of the old session goes; no object is
 -- touched. Hooks stay registered (gated by role and config).
@@ -943,6 +1113,12 @@ function M.reset(why)
     host.active, host.viewers, host.last_pass = false, {}, -1000
     host.ticking, host.sent, host.looks, host.growl, host.roared, host.blood, host.burning = {}, {}, {}, {}, {}, {}, {}
     client.pending, client.applied, client.applied_n, client.bad = nil, {}, 0, {}
+    client.marks, client.marks_pruned = {}, 0
+    host.friendly, host.last_friendly = {}, -1000
+    -- a new world loads its classes again: hooks still missing are retried soon
+    for _, h in ipairs(HOOKS) do
+        if not h.installed then h.wait, h.next_try = nil, 0 end
+    end
     log.debug("npc: reset (%s)", tostring(why))
 end
 
@@ -953,6 +1129,10 @@ function M.tick()
     local pc = ue.local_pc()
     local world = pc and addr(pc) or nil
     if S.role ~= last_role or world ~= last_world then
+        if last_role == "host" and world == last_world then
+            local ok, err = pcall(revert_ticking, "no longer the host")
+            if not ok then log.err_throttled("npc.revert", "npc: tick revert: %s", tostring(err)) end
+        end
         if last_role ~= nil then M.reset(S.role ~= last_role and "role" or "world") end
         last_role, last_world = S.role, world
     end
@@ -960,9 +1140,14 @@ function M.tick()
         host.active = #(S.remote_pcs or {}) > 0
         if not host.active then
             host.viewers = {}
+            if next(host.ticking) ~= nil then
+                local ok, err = pcall(revert_ticking, "no client connected")
+                if not ok then log.err_throttled("npc.revert", "npc: tick revert: %s", tostring(err)) end
+            end
             return
         end
         install_hooks(now, "host")
+        if shared_missing() then ai.install_now() end
         if now - host.last_pass >= PASS_S then
             host.last_pass = now
             local ok, err = pcall(host_pass, now)
@@ -976,6 +1161,13 @@ function M.tick()
             client.pending = nil
             M.stats.objref_stale = M.stats.objref_stale + 1
         end
+        -- marks of copies gone (their timer stopped with them): forgotten
+        if now - client.marks_pruned >= MARKS_PRUNE_S then
+            client.marks_pruned = now
+            for k, t in pairs(client.marks) do
+                if now - t > 10 * MARKS_PRUNE_S then client.marks[k] = nil end
+            end
+        end
     end
 end
 
@@ -984,20 +1176,23 @@ function M.install(state)
     for _, kind in ipairs({ "NPCROCK", "NPCSET", "NPCFIRE", "NPCBLOOD" }) do
         net.on(kind, function(f) client_message(kind, f) end)
     end
-    log.info("npc: installed (offscreen=%s boss_fx=%s effects=%s health=%s looks=%s)", tostring(opt("npc_offscreen")),
-        tostring(opt("npc_boss_fx")), tostring(opt("npc_effects")), tostring(opt("npc_health")), tostring(opt("npc_looks")))
+    log.info("npc: installed (offscreen=%s boss_fx=%s effects=%s health=%s looks=%s marker=%s)", tostring(opt("npc_offscreen")),
+        tostring(opt("npc_boss_fx")), tostring(opt("npc_effects")), tostring(opt("npc_health")), tostring(opt("npc_looks")),
+        tostring(opt("npc_marker")))
     log.info("sound relay SND (boss growl / roar, host): to the clients within the sound's range + %.0f m (ZombieGrowlShort / ZombieDeathShort: FootSteps %.0f m; before: %.0f m); the rock itself still goes %.0f m",
         SOUND_MARGIN / 100, SOUND_RANGE / 100, FX_RANGE / 100, FX_RANGE / 100)
 end
 
 function M.status_line()
     local s = M.stats
-    local n = 0
+    local n, shared = 0, 0
     for _, h in ipairs(HOOKS) do if h.installed then n = n + 1 end end
-    return string.format("npc: hooks=%d | host: boss ticking=%d humans ticking=%d back=%d rocks=%d sounds=%d fire=%d blood=%d set=%d objref failed=%d | client: rocks=%d failed=%d fire=%d blood=%d set=%d looks=%d parts=%d failed=%d objref got=%d nil=%d stale=%d other=%d",
-        n, s.boss_tick, s.human_tick, s.human_back, s.rocks_sent, s.sounds, s.fire_sent, s.blood_sent, s.set_sent,
+    for _, h in ipairs(SHARED) do if h.installed then shared = shared + 1 end end
+    return string.format("npc: hooks=%d (+%d shared with sdc_ai) | host: boss ticking=%d humans ticking=%d back=%d rocks=%d sounds=%d fire=%d blood=%d set=%d objref failed=%d | client: rocks=%d failed=%d fire=%d blood=%d set=%d looks=%d parts=%d failed=%d not in memory=%d names=%d objref got=%d nil=%d stale=%d other=%d slow=%d | markers seen=%d removed=%d failed=%d",
+        n, shared, s.boss_tick, s.human_tick, s.human_back, s.rocks_sent, s.sounds, s.fire_sent, s.blood_sent, s.set_sent,
         s.objref_failed, s.rocks_spawned, s.rocks_failed, s.fire_applied, s.blood_applied, s.set_applied, s.looks,
-        s.look_parts, s.look_failed, s.objref_got, s.objref_nil, s.objref_stale, s.objref_other)
+        s.look_parts, s.look_failed, s.look_later, s.names, s.objref_got, s.objref_nil, s.objref_stale, s.objref_other,
+        s.slow_objref, s.marks_seen, s.marks_removed, s.marks_failed)
 end
 
 return M

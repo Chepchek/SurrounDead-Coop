@@ -41,6 +41,17 @@
 --     client's list (config skilltree_sync). The C++ tree of that copy is not
 --     touched (AssignTechTree needs the journal widget the host does not have
 --     for a client).
+--   * one report, not two (2026-11-13, backlog 9.4): the client's
+--     progression report (sdc_persist PSPROG, every 3 s check, checked against
+--     the record's generation) carries the same skill list. The host takes it
+--     from there too (M.report, "PSPROG"), and says so in its answer to the
+--     player's id (sdc_persist: PSSET flag / PSFRESH field "tree"). Once such a
+--     report went out for the current record (sdc_persist.carries_tree), the
+--     client neither polls its tree here nor sends SKTREE; a change here
+--     (M.relock / M.unlock) asks for the next report at once
+--     (sdc_persist.prog_soon). SKTREE stays for the time before the record
+--     is applied (a new connection, a 2nd verdict after the host loaded a
+--     save) and for a host without that flag (an older mod).
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -48,7 +59,7 @@ local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 
-local M = { stats = { sent = 0, received = 0, answers = 0, relocked = 0, loads_blocked = 0 } }
+local M = { stats = { sent = 0, received = 0, answers = 0, relocked = 0, loads_blocked = 0, from_prog = 0, carried = 0 } }
 
 local SKILL_DIR = "/Game/Blueprints/SkillTree/Skills/"
 local SKILLS = { "Skill_CombatRoll", "Skill_CriticalHitter", "Skill_Deathbringer", "Skill_DemolitionExpert",
@@ -185,6 +196,26 @@ function M.mark_dirty() client.dirty = true end
 local function client_tick(now)
     if S.client ~= client.conn then
         client.conn, client.last, client.last_t, client.dirty = S.client, nil, 0, true
+        client.carried = false
+    end
+    -- the host takes this player's skills from the progression report
+    -- (sdc_persist PSPROG): no poll and no SKTREE of its own meanwhile
+    local per = package.loaded["sdc_persist"]
+    if type(per) == "table" and type(per.carries_tree) == "function" and per.carries_tree() == true then
+        if not client.carried then
+            client.carried = true
+            M.stats.carried = M.stats.carried + 1
+            log.info("skilltree: the host takes this player's skills from the progression report (PSPROG): no separate SKTREE from now on")
+        end
+        if client.dirty then
+            client.dirty = false
+            if type(per.prog_soon) == "function" then pcall(per.prog_soon) end
+        end
+        return
+    end
+    if client.carried then
+        client.carried, client.dirty = false, true
+        log.info("skilltree: the progression report does not carry the skills now (a new record from the host): SKTREE again until it does")
     end
     if now - client.poll_t < POLL_S and not client.dirty then return end
     client.poll_t = now
@@ -226,11 +257,14 @@ end
 -- Host
 -- ---------------------------------------------------------------------------
 
-local function on_sktree(f, pc)
+-- Host: a client's unlocked skills, "name,name,..." or "-": its SKTREE, or
+-- the skill list of its progression report (sdc_persist on_prog, `via`
+-- "PSPROG", already checked against the record's generation).
+function M.report(pc, list, via)
     if not S or S.role ~= "host" or not ue.valid(pc) then return end
     local key = ue.name(pc)
     local r = S.remote and S.remote[key]
-    local list = tostring(f[1] or "-")
+    list = tostring(list or "-")
     local set = {}
     for n in list:gmatch("[^,]+") do
         if n ~= "-" then set[n] = true end
@@ -241,16 +275,19 @@ local function on_sktree(f, pc)
         trees[key] = t
     end
     M.stats.received = M.stats.received + 1
+    if via == "PSPROG" then M.stats.from_prog = M.stats.from_prog + 1 end
     t.name = r and r.name or ue.short(pc)
     t.set = set
     t.reported = true
     if t.list ~= list then
         t.list = list
         t.logged = {}
-        log.info("skilltree: %s's unlocked skills: %s (the host's skill checks for this player answer from them)",
-            tostring(t.name), list)
+        log.info("skilltree: %s's unlocked skills: %s (from %s; the host's skill checks for this player answer from them)",
+            tostring(t.name), list, tostring(via or "SKTREE"))
     end
 end
+
+local function on_sktree(f, pc) M.report(pc, f[1], "SKTREE") end
 
 -- Post-hook: (Context, ReturnValue, Technology). A non-nil return replaces
 -- the result; nil leaves the engine's answer.
@@ -294,10 +331,8 @@ end
 local function install_load_hook()
     if hooks.load or not ue.find_object(LOAD_STATE_FN) then return end
     hooks.load = true
-    local ok, err = pcall(RegisterHook, LOAD_STATE_FN, function(ctx_p, slot_p)
-        local okc, e = pcall(on_load_state, ctx_p, slot_p)
-        if not okc then log.err_throttled("skilltree-load", "skilltree: LoadTechStateFromSlot hook: %s", tostring(e)) end
-    end, function() end)
+    -- native, pre only: one shared engine hook (sdc_ue.hook_native, a pcall per subscriber)
+    local ok, err = ue.hook_native(LOAD_STATE_FN, "skilltree", on_load_state)
     log.info("skilltree: LoadTechStateFromSlot pre-hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
 end
 
@@ -341,15 +376,15 @@ end
 function M.reset_world()
     active, by_comp, name_of = false, {}, {}
     trees = {}
-    client.last, client.dirty = nil, true
+    client.last, client.dirty, client.carried = nil, true, false
 end
 
 function M.status_line()
     local n = 0
     for _ in pairs(trees) do n = n + 1 end
-    return string.format("skilltree: sent=%d received=%d players=%d answers=%d relocked=%d loads blocked=%d hooks=%s/%s",
+    return string.format("skilltree: sent=%d received=%d players=%d answers=%d relocked=%d loads blocked=%d hooks=%s/%s from PSPROG=%d carried by PSPROG=%s",
         M.stats.sent, M.stats.received, n, M.stats.answers, M.stats.relocked, M.stats.loads_blocked,
-        tostring(hooks.unlocked), tostring(hooks.load))
+        tostring(hooks.unlocked), tostring(hooks.load), M.stats.from_prog, tostring(client.carried == true))
 end
 
 local installed = false

@@ -54,15 +54,25 @@ end
 local FREQUENT = {
     MYSTATE = true, PSTATE = true, PPOS = true, MYGPS = true, STEALTH = true, ENV = true,
     PCVAR = true, PINFO = true, PEQUIP = true, VSTATE = true, VCAP = true, AIHP = true,
+    VOCC = true,   -- sdc_vehicles: the seats 3+ of a car (next to its VSTATE records)
     AIHPQ = true, AIM = true, DXP = true, SKL = true, WSTAT = true, ITEMS = true, UIDS = true,
     PTOOLS = true, QS = true, QH = true, SKTREE = true, AIAPP = true, SND = true, MHIT = true,
     GWEAR = true,   -- sdc_wear: a client's gun / muzzle wear, ~2/s while firing
     TURFIRE = true, TURHIT = true,   -- sdc_turrets: turret shots / a client's hits, up to 4/s while firing
     VRADIO = true,   -- sdc_vehradio: a slider drag 2/s, each playing radio again every 10 s (it logs its own changes)
     RESPUI = true,   -- sdc_hudmods: a client's respirator filter percent, ~every 2-5 s in a radiation zone (it logs its own changes)
+    DOWN = true,     -- sdc_down: a downed player's state, again every 10 s (it logs its own changes)
 }
 local function net_log(kind)
     return log.debug_enabled and (log.net_enabled or not FREQUENT[kind])
+end
+
+-- Kinds whose fields never go to the log (sdc_admin's JPW: a join password;
+-- sdc_chat's CHAT / CHATM: what players write and their names).
+M.SECRET = { JPW = true, CHAT = true, CHATM = true }
+local function shown(kind, msg)
+    if M.SECRET[kind] then return M.PREFIX .. SEP .. kind .. SEP .. "<hidden>" end
+    return msg
 end
 
 -- [PERF] "msgs in": time spent in each kind's handler (sdc_perf).
@@ -72,7 +82,7 @@ local function dispatch(direction, pc, raw)
     local kind, fields = M.decode(raw)
     if not kind then return end
     M.stats.received = M.stats.received + 1
-    if net_log(kind) then log.debug("net <- %s %s", direction, raw) end
+    if net_log(kind) then log.debug("net <- %s %s", direction, shown(kind, raw)) end
     local h = M.handlers[kind]
     if not h then
         log.debug("net: no handler for %s", kind)
@@ -107,7 +117,7 @@ local function raw_send(pc, to_host, kind, msg, waited)
     if ok then
         M.stats.sent = M.stats.sent + 1
         if net_log(kind) then
-            log.debug("net -> %s %s%s", to_host and "host" or "client", sent_text(msg),
+            log.debug("net -> %s %s%s", to_host and "host" or "client", sent_text(shown(kind, msg)),
                 waited and string.format(" (queued %.1f s)", waited) or "")
         end
     elseif to_host then
@@ -157,15 +167,18 @@ for _, k in ipairs({
     "NPCROCK", "MHIT", "MONT", "EXPL", "WMINE", "DMGNUM", "THROW", "THROWN", "THRFX", "THRACK", "OSND", "SND",
     "WHISTLE", "RLSTOP", "RADZ", "TURFIRE", "TURHIT",
     -- vehicles and seats
-    "VENTER", "VEXIT", "VSEAT", "VSTATE", "VCAP", "VHORN", "VLIGHT", "VFLIP", "VPUSH", "VTOW", "VFUEL",
-    "VREPAIR", "VBOXR", "VBUY", "VBUYR", "VRADIO", "VRADIOQ",
+    "VENTER", "VEXIT", "VSEAT", "VSTATE", "VOCC", "VCAP", "VHORN", "VLIGHT", "VFLIP", "VPUSH", "VTOW", "VFUEL",
+    "VREPAIR", "VBOXR", "VBUY", "VBUYR", "VRADIO", "VRADIOQ", "VSWITCH", "VSWR",
     -- session, respawn, character
-    "HI", "HELLO", "RESPAWN", "RSPCAP", "UNSTUCK", "UNSTUCKOK", "UNSTUCKTO", "SPAWNED", "SPAWNPT", "BED",
+    "HI", "HELLO", "RESPAWN", "RSPCAP", "UNSTUCK", "UNSTUCKOK", "UNSTUCKTO", "PULLACK", "SPAWNED", "SPAWNPT", "BED",
     "SLEEP", "CHAR", "CHARACK", "CHARNONE", "MSG",
+    "CHATON", "CHAT", "CHATM",   -- sdc_chat: rare and small, never behind a world snapshot
+    "DOWN", "DOWNCAP", "REVIVE", "GIVEUP", "DOWNQ",   -- sdc_down: knockdown state, revive key, give up
     -- world: rare replies to a player's own action, sent past sdc_world's own
     -- queue (its queued kinds - WLOOT WLOOTR WLOOTS WINF WRINF WBMOON, snapshots
     -- - stay in this queue class: their order among themselves is kept)
     "WBUILT", "WMOVE", "WFOL", "WHHIT", "WDMG",
+    "SHWR", "SHWRQ", "SHWRR", "SHWRV",   -- sdc_shower: a start's water, the cooldown a press needs, small and rare
 }) do NOW[k] = true end
 M.NOW = NOW
 

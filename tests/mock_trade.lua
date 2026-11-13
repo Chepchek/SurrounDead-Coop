@@ -243,9 +243,16 @@ local function fresh_modules()
             return ow and ctx_map[ow] or nil
         end,
         classify = function(o) return ctx_map[o] and "remote" or "local" end,
+        -- (sdc_dialogue takes addr from sdc_ctx)
+        addr = function(o)
+            local ok, a = pcall(function() return o:GetAddress() end)
+            if ok then return a end
+        end,
     }
     local cfg = require("sdc_config")
     cfg.values = {}
+    -- the log-only dialogue hooks (BeginDialogue, ClientBegin / ClientExit) need debug_probes
+    require("sdc_log").probes_enabled = true
     return require("sdc_dialogue"), require("sdc_net")
 end
 
@@ -369,10 +376,7 @@ deliver("SDC1|QF|nonpc")
 check(logged("dialogue not started: the host found no such NPC") ~= nil, "client: QF logged / shown")
 
 -- role check: a host machine's GetNarrativeComponent does not use the client path
-check(dlg.stats.requested == 2, "client: stats requested = 2")
-local lines = {}
-dlg.status_lines(lines)
-check(#lines == 2 and lines[2]:find("Торговля", 1, true) ~= nil, "client: status lines (Russian)")
+check(#msgs("QD", true) == 2, "client: two requests (QD) in all")
 
 -- ============================================================== host
 quiet_print("== host")
@@ -433,6 +437,65 @@ rpawn._p._loc = { X = 9000, Y = 0, Z = 0 }
 dlg.host_tick(os.time())
 check(n_called(hwcm, "SetMovementMode") == 2 and logged("its player walked away") ~= nil, "host: client walked away: walks again")
 rpawn._p._loc = { X = 1000, Y = 0, Z = 0 }
+
+-- 13.11 (host log 17:22:41-45): the client closed its window while the host's
+-- own player still traded with the trader; it walked off under the host.
+-- The host's F set the trader's CurrentActor to the host's character (@5682).
+local function n_smm_now() return n_called(hwcm, "SetMovementMode") end
+advance(4.0)
+from_client("SDC1|QD|" .. W.dlg_wand:GetFullName() .. "|1500|0|0")
+hw._p.CurrentActor = hpawn
+local s0 = n_smm_now()
+from_client("SDC1|QE|BP_MasterTrader_C|1500|0|0")
+check(n_smm_now() == s0 and logged("stays stopped (its player closed the trade window): the host's player still talks / trades with it") ~= nil,
+    "host: QE while the host's player trades with it: stays stopped")
+dlg.host_tick(os.time())
+check(n_smm_now() == s0, "host: next second, the host still trading: still stopped")
+-- the host closes its own window: the game lets it walk (@5545); the waiting release is dropped
+hw._p.CurrentActor = nil
+fire(WEND, param(hw))
+dlg.host_tick(os.time())
+check(n_smm_now() == s0, "host: the host's own window closed: the game's own walk, nothing more from the mod")
+-- again, and the host walks off without closing (CurrentActor left behind): it walks once the host is away
+advance(4.0)
+from_client("SDC1|QD|" .. W.dlg_wand:GetFullName() .. "|1500|0|0")
+hw._p.CurrentActor = hpawn
+from_client("SDC1|QE|BP_MasterTrader_C|1500|0|0")
+dlg.host_tick(os.time())
+check(n_smm_now() == s0, "host: (stays stopped while the host is near)")
+hpawn._p._loc = { X = 9000, Y = 0, Z = 0 }
+dlg.host_tick(os.time())
+check(n_smm_now() == s0 + 1 and logged("walks again (the host's player is done with it") ~= nil, "host: the host walked away: walks again")
+dlg.host_tick(os.time())
+check(n_smm_now() == s0 + 1, "host: once")
+hpawn._p._loc = { X = 0, Y = 0, Z = 0 }
+hw._p.CurrentActor = nil
+-- two clients at one trader: the first one's QE does not let it go
+local rpc2, rpawn2 = make_pc(false, { X = 1300, Y = 100, Z = 0 })
+ctx_map[rpawn2] = { pc = rpc2, pawn = rpawn2 }
+ctx_map[rpc2] = { pc = rpc2, pawn = rpawn2 }
+S.remote_pcs = { rpc, rpc2 }
+local function from_client2(msg)
+    local kind, fields = net.decode(msg)
+    net.handlers[kind](fields, rpc2)
+end
+from_client2("SDC1|QH|1")
+advance(4.0)
+from_client("SDC1|QD|" .. W.dlg_wand:GetFullName() .. "|1500|0|0")
+advance(4.0)
+from_client2("SDC1|QD|" .. W.dlg_wand:GetFullName() .. "|1500|0|0")
+local s1 = n_smm_now()
+from_client("SDC1|QE|BP_MasterTrader_C|1500|0|0")
+check(n_smm_now() == s1 and logged("still talks / trades with it") ~= nil and logged("another player (" .. rpc2._name .. ")") ~= nil,
+    "host: two clients, the first closes: stays stopped for the second")
+-- the host's own trade ends while a client still trades: stopped again
+local d0 = n_called(hwcm, "DisableMovement")
+fire(WEND, param(hw))
+check(n_called(hwcm, "DisableMovement") == d0 + 1 and logged("it stays stopped for " .. rpc2._name) ~= nil,
+    "host: the host's own window closed while a client trades: DisableMovement again")
+from_client2("SDC1|QE|BP_MasterTrader_C|1500|0|0")
+check(n_smm_now() == s1 + 1, "host: the second client closes too: walks again")
+S.remote_pcs = { rpc }
 
 -- a purchase: Handle Comp to Comp Move (From = the trader's component), post
 local uid = { A = 1, B = 2, C = 3, D = 4 }

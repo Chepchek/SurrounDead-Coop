@@ -170,7 +170,7 @@ check(capsent, "RSPCAP sent to the client")
 -- BeginPlay-time call (no character yet): nothing
 r.spawned_once = false
 local gih = hooks["/Script/Engine.GameplayStatics:GetGameInstance"]
-check(gih ~= nil and gih.post ~= nil, "GetGameInstance native pre-hook registered")
+check(gih ~= nil and gih.post == nil, "GetGameInstance native pre-hook registered (sdc_ue.hook_native: pre only, no empty post)")
 gih.pre(nil, param(rpc))
 check(ctx.scope_resolver(gi) == nil, "BeginPlay GetGameInstance: no scope")
 r.spawned_once = true

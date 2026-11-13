@@ -3,10 +3,11 @@
 -- Every hook the mod registers (RegisterHook, native and Blueprint, and
 -- NotifyOnNewObject) is counted: calls and time spent in its Lua callbacks.
 -- Scheduled tasks are timed in sdc_ue.guarded (ue.task_stats). Frames are
--- counted from main.lua's per-frame loop. Every `perf_report` seconds (and in
--- sdcoop_status) one "[PERF]" line lists the fps and the most expensive hooks
--- and tasks of that window, in calls/s and ms/s (ms of game time per second:
--- 16 ms/s is a full frame at 60 fps every second).
+-- counted from main.lua's per-frame loop. Every `perf_report` seconds one
+-- "[PERF]" line lists the fps and the most expensive hooks and tasks of that
+-- window, in calls/s and ms/s (ms of game time per second: 16 ms/s is a full
+-- frame at 60 fps every second). sdcoop_status shows the running window so
+-- far, read-only (M.peek: the window and its maxima go on).
 -- os.clock has ~1 ms steps on Windows; summed over many calls it still gives
 -- an unbiased total. The line ends with the Lua heap and collector (mode,
 -- cycles finished, worst sampled step) and the UE4SS.log writes of the window
@@ -15,7 +16,9 @@
 -- A single hook call of 100 ms or more is logged as "[SLOW] mod hook" (like
 -- sdc_ue's tasks); the hook running now is M.current (sdc_ue.activity).
 -- While sdc_ctx's player-0 hooks run, the line ends with "ctx:" (calls,
--- cache misses, redirects and their ms, the argument-read floor per call).
+-- cache misses, redirects and their ms, the argument-read floor per call);
+-- before it, how fast the world ran here (sdc_speed: game speed, dilation,
+-- world time lost to hitches, pauses, how far apart the 1 s timer ran).
 -- Hooks are counted by kind (M.reg: Blueprint / native / new-object). Debug
 -- switch perf_bench_no_bp_hooks: the mod registers NO Blueprint hook (UE4SS
 -- then skips its search after every Blueprint call) - a single-player A/B
@@ -58,10 +61,16 @@ function M.take_worst_hook()
     return w
 end
 
+-- "Class:Function" of a hook path; a shared native hook's subscriber
+-- (sdc_ue.hook_native: "<path>#<key>", the key may hold dots and colons, e.g.
+-- "ai.PlayerController:ClientRepObjRef") keeps its key: "Class:Function#key".
 local function short(path)
-    local cls, fn = tostring(path):match("([%w_]+):([%w_ #%-]+)$")
+    path = tostring(path)
+    local base, key = path:match("^(.-)#(.*)$")
+    if base then return short(base) .. "#" .. key end
+    local cls, fn = path:match("([%w_]+):([%w_ %-]+)$")
     if cls then return cls:gsub("_C$", "") .. ":" .. fn end
-    return tostring(path):match("[^/.]+$") or tostring(path)
+    return path:match("[^/.]+$") or path
 end
 
 local function record(path)
@@ -325,8 +334,11 @@ local function top(list, n)
     return out
 end
 
--- The window since the last report: deltas of every counter.
-function M.report(why, tasks)
+-- The window since the last report: deltas of every counter. `commit` =
+-- a real window ([PERF] line): the window starts again and the maxima reset.
+-- Without it (sdcoop_status) the same line is built read-only: the running
+-- window, its maxima and sdc_ctx's counters stay as they are.
+local function build(why, tasks, commit)
     local now = os.clock()
     local dt = math.max(0.001, now - win.t0)
     local fps = (M.frames - win.frames) / dt
@@ -338,7 +350,7 @@ function M.report(why, tasks)
             hl[#hl + 1] = { name = r.name, calls = dc, ms = dm }
             total_ms = total_ms + dm
         end
-        win.hooks[path] = { calls = r.calls, ms = r.ms }
+        if commit then win.hooks[path] = { calls = r.calls, ms = r.ms } end
     end
     local tl, task_ms = {}, 0
     for label, r in pairs(tasks or {}) do
@@ -348,7 +360,7 @@ function M.report(why, tasks)
             tl[#tl + 1] = { name = label, calls = dc, ms = dm }
             task_ms = task_ms + dm
         end
-        win.tasks[label] = { calls = r.calls, ms = r.ms }
+        if commit then win.tasks[label] = { calls = r.calls, ms = r.ms } end
     end
     local hs, ts = {}, {}
     for _, e in ipairs(top(hl, 8)) do
@@ -364,15 +376,18 @@ function M.report(why, tasks)
     local net = package.loaded["sdc_net"]
     local function window_of(key, src, n, fmt_fn)
         local list = {}
-        win[key] = win[key] or {}
+        local wk = win[key] or {}
+        if commit then win[key] = wk end
         for label, r in pairs(type(src) == "table" and src or {}) do
-            local prev = win[key][label] or { calls = 0, ms = 0, n = 0 }
+            local prev = wk[label] or { calls = 0, ms = 0, n = 0 }
             local dc, dm = r.calls - prev.calls, r.ms - prev.ms
             if dc > 0 then
                 list[#list + 1] = { name = label, calls = dc, ms = dm, n = (r.n or 0) - (prev.n or 0), max = r.wmax or 0 }
             end
-            r.wmax = 0   -- the worst single call of the next window
-            win[key][label] = { calls = r.calls, ms = r.ms, n = r.n or 0 }
+            if commit then
+                r.wmax = 0   -- the worst single call of the next window
+                wk[label] = { calls = r.calls, ms = r.ms, n = r.n or 0 }
+            end
         end
         local out = {}
         for _, e in ipairs(top(list, n)) do out[#out + 1] = fmt_fn(e) end
@@ -388,42 +403,50 @@ function M.report(why, tasks)
         return string.format("%s %.1f/s %.1fms/s (%d objs/call)", e.name, e.calls / dt, e.ms / dt,
             math.floor(e.n / math.max(1, e.calls)))
     end)
-    win.t0, win.frames = now, M.frames
+    if commit then win.t0, win.frames = now, M.frames end
     -- Lua heap: its growth is garbage the collector has to walk (hook
     -- parameters, closures); a GC step lands in whatever callback allocates
     local kb = collectgarbage("count")
     local grow = kb - (win.kb or kb)
-    win.kb = kb
     -- collector: cycles finished in the window, worst sampled step
     local cycles = M.gc_cycles - (win.gc_cycles or M.gc_cycles)
-    win.gc_cycles = M.gc_cycles
     local step = gc_steps.n > 0 and string.format(", step max %.0f ms", gc_steps.max) or ""
-    gc_steps.n, gc_steps.ms, gc_steps.max = 0, 0, 0
     -- UE4SS.log writes in the window (sdc_log): rate, time, the slowest one
     local lw = win.log or { n = 0, bytes = 0, ms = 0, slow = 0 }
     local wn, wb, wms = (writes.n or 0) - lw.n, (writes.bytes or 0) - lw.bytes, (writes.ms or 0) - lw.ms
     local wslow = (writes.slow or 0) - lw.slow
-    win.log = { n = writes.n or 0, bytes = writes.bytes or 0, ms = writes.ms or 0, slow = writes.slow or 0 }
     local wmax = writes.max or 0
-    writes.max = 0
+    if commit then
+        win.kb, win.gc_cycles = kb, M.gc_cycles
+        gc_steps.n, gc_steps.ms, gc_steps.max = 0, 0, 0
+        win.log = { n = writes.n or 0, bytes = writes.bytes or 0, ms = writes.ms or 0, slow = writes.slow or 0 }
+        writes.max = 0
+    end
     -- sdc_net send budget: messages that waited in this window (only when any)
     local queued = ""
     local bs = type(net) == "table" and type(net.budget_stats) == "table" and net.budget_stats or nil
     if bs then
         local prev = win.budget or { queued = 0, dropped = 0 }
         local dq, dd = (bs.queued or 0) - prev.queued, (bs.dropped or 0) - prev.dropped
-        win.budget = { queued = bs.queued or 0, dropped = bs.dropped or 0 }
+        if commit then win.budget = { queued = bs.queued or 0, dropped = bs.dropped or 0 } end
         if dq > 0 or dd > 0 then
             queued = string.format(" | net send queue: %d waited, %d dropped, %d waiting now", dq, dd,
                 type(net.queued_count) == "function" and net.queued_count() or 0)
         end
     end
-    -- sdc_ctx's player-0 hooks: where their time goes (only while they ran)
+    -- sdc_ctx's player-0 hooks: where their time goes (only while they ran);
+    -- its text starts a new window of its own counters, so a real window only
     local ctxs = ""
     local cx = package.loaded["sdc_ctx"]
-    if type(cx) == "table" and type(cx.perf_text) == "function" then
+    if commit and type(cx) == "table" and type(cx.perf_text) == "function" then
         local okc, s = pcall(cx.perf_text, dt)
         if okc and s then ctxs = " | ctx: " .. s end
+    end
+    -- sdc_speed: how fast the world ran here in this window (read-only without commit)
+    local sp = package.loaded["sdc_speed"]
+    if type(sp) == "table" and type(sp.window_text) == "function" then
+        local oks, s = pcall(sp.window_text, commit)
+        if oks and s then ctxs = " | " .. s .. ctxs end
     end
     if M.reg.skipped_bp > 0 then
         ctxs = ctxs .. string.format(" | BENCH MODE: %d Blueprint hooks not registered", M.reg.skipped_bp)
@@ -436,11 +459,23 @@ function M.report(why, tasks)
         kb / 1024, grow / 1024, M.gc_desc or M.gc_mode or "incremental", cycles, step,
         wn / dt, wb / 1024 / dt, wms / dt, wmax, wslow > 0 and string.format(", %d slow (>= %d ms)", wslow,
             log.SLOW_WRITE_MS or 100) or "", (log.batching and log.batching()) and ", batched" or "", queued, ctxs)
+    return line
+end
+
+-- A [PERF] window: logged, and the next window starts now.
+function M.report(why, tasks)
+    local line = build(why, tasks, true)
     log.info("%s", line)
     -- every 10th window: which mod tables are big (the heap floor's suspects)
     win.reports = (win.reports or 0) + 1
     if why == "window" and win.reports % 10 == 0 then pcall(M.mem_census) end
     return line
+end
+
+-- The running window so far, read-only (sdcoop_status): not logged here, the
+-- next [PERF] window still covers its whole time.
+function M.peek(why, tasks)
+    return build(why, tasks, false)
 end
 
 -- ---------------------------------------------------------------------------
@@ -462,6 +497,21 @@ end
 -- count as it was ("released") - "KEPT" means this UE4SS keeps them.
 -- (Process memory - working set, private bytes - has no API reachable from
 -- Lua here: no UE4SS global and no Blueprint function returns it.)
+-- The same UE4SS call never destroys its parameter block either (zeroed,
+-- filled by the engine, dropped): the heap buffer of a TArray the engine
+-- fills for an out parameter stays allocated for good. The line estimates
+-- it for GetAllActorsOfClass through sdc_ue.actors_of (the AI passes every
+-- 2-3 s, hundreds of zombies): at least 8 bytes per actor returned
+-- (watch_out_arrays below, installed by main.lua). Overlap queries, widget
+-- lists and returned arrays elsewhere leave theirs too and are not counted.
+-- A C++ fix must NOT just destroy the block right after the call: the
+-- elements of an out-array reach Lua as RemoteUnrealParams that point into
+-- that very buffer (push_arrayproperty, GetNonTrivialLocal -> each element
+-- GetParam at array_data + i * size), and the mod reads them later with
+-- :get() (sdc_ue.elem; the AI passes). Freed, every such read would see
+-- freed memory. Copy the values first (the inner property with
+-- Operation::Get: objects by value) and destroy after, or keep the buffer
+-- alive as long as the Lua table that refers into it.
 local COUNT_CAP = 200000
 local REG_FREELIST = 3     -- lauxlib (Lua 5.4.3+): registry slot of luaL_ref's free list head
 local reg_prev = nil
@@ -516,6 +566,35 @@ local function registry_text()
     return string.format("lua registry %d slots, %d free, %d references held%s; %s", n, free, used, grow, probe)
 end
 M.registry_refs = registry_refs
+
+-- Out-array buffers UE4SS leaves allocated (estimate, see above).
+local oa = { calls = 0, elems = 0, prev_elems = nil, wrapped = false }
+M.out_arrays = oa
+local function count_out(out, ...)
+    if type(out) == "table" then
+        oa.calls = oa.calls + 1
+        oa.elems = oa.elems + #out
+    end
+    return out, ...
+end
+-- main.lua, right after sdc_ue loads (before the AI modules keep their copy
+-- of ue.actors_of): every call is counted, its results passed on unchanged.
+function M.watch_out_arrays(ue)
+    if oa.wrapped or type(ue) ~= "table" or type(ue.actors_of) ~= "function" then return false end
+    local orig = ue.actors_of
+    ue.actors_of = function(...) return count_out(orig(...)) end
+    oa.wrapped = true
+    return true
+end
+
+local function out_array_text()
+    if not oa.wrapped then return "out-array buffers: not counted" end
+    local kb = oa.elems * 8 / 1024
+    local grow = oa.prev_elems and string.format(", %+.0f KB since the last [MEM]", (oa.elems - oa.prev_elems) * 8 / 1024) or ""
+    oa.prev_elems = oa.elems
+    return string.format("out-array buffers UE4SS keeps (estimate): >= %.0f KB from %d GetAllActorsOfClass calls"
+        .. " (%d actors)%s", kb, oa.calls, oa.elems, grow)
+end
 
 function M.mem_census()
     if type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then return end
@@ -575,9 +654,10 @@ function M.mem_census()
     local out = {}
     for i = 1, math.min(10, #list) do out[i] = list[i].name .. " " .. list[i].n end
     local okr, reg = pcall(registry_text)
-    log.info("[MEM] lua heap %.1f MB; largest mod tables (entries): %s (%d tables looked at, %.0f ms) | %s",
+    local oko, oat = pcall(out_array_text)
+    log.info("[MEM] lua heap %.1f MB; largest mod tables (entries): %s (%d tables looked at, %.0f ms) | %s | %s",
         collectgarbage("count") / 1024, #out > 0 and table.concat(out, ", ") or "-", ntab, (clock() - t0) * 1000,
-        okr and reg or ("lua registry: " .. tostring(reg)))
+        okr and reg or ("lua registry: " .. tostring(reg)), oko and oat or ("out-array buffers: " .. tostring(oat)))
 end
 
 return M

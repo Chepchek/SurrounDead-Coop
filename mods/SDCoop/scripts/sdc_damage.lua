@@ -74,6 +74,7 @@ local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 local items = require("sdc_items")
+local consume = require("sdc_consume")
 
 local M = { stats = {} }
 for _, k in ipairs({ "fixed", "replaced", "absent", "missing", "distance", "differ",
@@ -160,9 +161,7 @@ local function xp_active()
     return S ~= nil and S.role == "host" and #(S.remote_pcs or {}) > 0 and xp_enabled()
 end
 
-local function guid_str(g)
-    return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D)
-end
+local guid_str = consume.guid_str
 
 -- nil for an unknown / empty UID
 local function known_uid(u)
@@ -193,11 +192,6 @@ local function slot_short(slot)
     return (tostring(slot or "?"):gsub("^Jig%.PlayerSlot%.", ""))
 end
 
-local function count(t)
-    local n = 0
-    if t then for _ in pairs(t) do n = n + 1 end end
-    return n
-end
 
 -- ---------------------------------------------------------------------------
 -- Item stats as the host has them
@@ -412,7 +406,7 @@ end
 local function fix_weapon_skills(w, pc)
     if not ue.valid(w) or not ue.valid(pc) then return end
     local cur = ue.prop(w, "PassiveSkillsComponent")
-    if cur == nil then return end                      -- no such property
+    if ue.missing(cur) then return end                 -- no such property
     local want = ue.prop(pc, "PassiveSkillsComponent")
     if not ue.valid(want) then return end
     if ue.valid(cur) and addr(cur) == addr(want) then return end
@@ -750,14 +744,9 @@ end
 
 local hooked = {}   -- [key] = true once registered
 
-local function try_hook(key, path, pre, post)
+local function try_hook(key, path, pre)
     if hooked[key] then return end
-    local ok, err
-    if post then
-        ok, err = pcall(RegisterHook, path, pre, post)
-    else
-        ok, err = pcall(RegisterHook, path, pre)
-    end
+    local ok, err = pcall(RegisterHook, path, pre)
     if ok then
         hooked[key] = true
         log.info("damage: %s hook ok", key)
@@ -773,7 +762,17 @@ local function try_hooks()
     try_hook("melee", MELEE_FINDSTAT, guarded("melee", function(c, t, f, lo, hi)
         on_find_stat("melee", c, t, f, lo, hi)
     end))
-    try_hook("report", REPORT_DAMAGE, guarded("report", on_report_damage), function() end)
+    -- a native: one shared pre-only engine hook (sdc_ue.hook_native, each
+    -- subscriber in its own pcall), no post callback
+    if not hooked.report then
+        local ok, err = ue.hook_native(REPORT_DAMAGE, "damage.report", on_report_damage)
+        if ok then
+            hooked.report = true
+            log.info("damage: report hook ok")
+        else
+            log.debug("damage: report hook not ready (%s)", tostring(err))
+        end
+    end
 end
 
 -- The skills component class is loaded once a controller exists; retried
@@ -976,24 +975,6 @@ function M.register_handlers()
             log.err_throttled("damage.dxp", "damage: %s(%.2f) failed: %s", fn, amount, tostring(err))
         end
     end)
-end
-
--- Console / debug: what the host uses for each remote weapon.
-function M.report(reply)
-    reply = reply or function(s) log.info("%s", s) end
-    local st = M.stats
-    reply(string.format("damage: fixed=%d replaced=%d absent=%d missing=%d distance=%d differ=%d xp_sent=%d xp_added=%d reports=%d resets_sent=%d resets_done=%d",
-        st.fixed, st.replaced, st.absent, st.missing, st.distance, st.differ, st.xp_sent, st.xp_added, st.reports,
-        st.resets_sent, st.resets_done))
-    for _, e in pairs(entries) do
-        if e.remote then
-            local dmg = e.use and (e.use["Jig.Stat.FirearmDamage"] or e.use["Jig.Stat.MeleeDamage"])
-            reply(string.format("  %s %s %s uid=%s src=%s stats=%d host=%s/%d damage=%s", e.pawn_name,
-                slot_short(e.slot), e.weapon_name, tostring(e.uid), tostring(e.use_src), count(e.use),
-                tostring(e.host_src), e.host_n or 0,
-                dmg and string.format("%.2f/%.2f", dmg.min, dmg.max) or "-"))
-        end
-    end
 end
 
 function M.reset()

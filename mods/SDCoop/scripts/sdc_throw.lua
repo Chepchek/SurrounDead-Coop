@@ -113,12 +113,16 @@
 --     goes 2 s later, as in the game), and the shooter gets its hit marker
 --     (sdc_dmgnum) for a bolt that hit flesh.
 -- Config: launcher_sync.
+-- sdc_ffire (friendly fire) asks who threw a blast that just went off and
+-- whose Molotov fire burns near a player (M.blast_now, M.fires_near).
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
+local appearance = require("sdc_appearance")   -- player_id
+local consume = require("sdc_consume")         -- shared helpers (param)
 
 local M = {
     stats = {
@@ -140,11 +144,14 @@ local clock = os.clock
 
 local THROW_DIR = "/Game/Blueprints/Throwables/"
 local PREFIX = "BP_Throwable_"
--- fuse: set off by the event bound to Event_Throw; impact: by the capsule hit
+-- fuse: set off by the event bound to Event_Throw; impact: by the capsule hit.
+-- harmless: its "boom" (the firecracker) hurts nobody - not a blast for
+-- sdc_ffire (M.blast_now). No flare or smoke throwable exists (the flare gun's
+-- round is a "stick" projectile below, silent).
 local KNOWN = {
     BP_Throwable_Frag_C        = { kind = "fuse", event = "Frag" },
     BP_Throwable_PipeBomb_C    = { kind = "fuse", event = "PipeBomb" },
-    BP_Throwable_NoiseMaker_C  = { kind = "fuse", event = "NoiseMaker" },
+    BP_Throwable_NoiseMaker_C  = { kind = "fuse", event = "NoiseMaker", harmless = true },
     BP_Throwable_Molotov_C     = { kind = "impact" },
     BP_Throwable_GlassBottle_C = { kind = "impact" },
 }
@@ -173,6 +180,10 @@ local BLAST_S = 0.5          -- s after a client's blast on the host in which st
 local ALIGN_S = 3            -- s a local throw montage waits for the server's MC_Montage
 local MONTAGE_LEN = 2.18     -- s, Chr_Throw_Montage (fallback when GetPlayLength fails)
 local SEQ_KEEP = 64          -- host: client sequence numbers remembered per player
+-- sdc_ffire (friendly fire): who threw a blast / a Molotov fire
+local MOLOTOV = "BP_Throwable_Molotov_C"
+local BOOM_MATCH_S = 0.25    -- a blast's damage loop runs right after its sound (one Blueprint call)
+local FIRE_LIFE_S = 11       -- the Molotov's fire: 0.2 s after its hit, then 10 s (@837)
 
 -- Launcher / bow projectiles (BP_ProjectileMaster children). blast: goes off
 -- on its first hit (its hit event); stick: stops where it hits.
@@ -219,6 +230,8 @@ local st = {
     cap_at = {},                -- host: [pc address] = clock() of that PRJCAP
     host_proj = false,          -- client: the host handles projectiles (PRJCAP 1)
     damage_hooked = false, damage_next = 0,
+    hooks_at = -100,            -- clock() of the last install_hooks pass
+    last_boom = nil,            -- host: { pc, who, short, loc, t } of the last tracked blast (sdc_ffire)
 }
 
 local function coop() return S ~= nil and (S.role == "host" or S.role == "client") end
@@ -243,12 +256,7 @@ local function num(v)
     return n
 end
 
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
+local get = consume.param
 
 local function vec(v)
     if v == nil then return nil end
@@ -306,14 +314,6 @@ local function quat(r)
              Z = cr * cp * sy - sr * sp * cy, W = cr * cp * cy + sr * sp * sy }
 end
 
-local function player_id(pawn)
-    local ps = ue.prop(pawn, "PlayerState")
-    if not ue.valid(ps) then return "?" end
-    local ok, id = pcall(function() return ps:GetPlayerId() end)
-    if ok and type(id) == "number" then return tostring(math.floor(id)) end
-    return "?"
-end
-
 local function pc_by_addr(a)
     if not a or not S then return nil end
     for _, pc in ipairs(S.remote_pcs or {}) do
@@ -346,7 +346,7 @@ local function class_info(short)
     local path = THROW_DIR .. base .. "." .. short
     local k = KNOWN[short]
     if k then
-        i = { short = short, path = path, kind = k.kind, event = k.event }
+        i = { short = short, path = path, kind = k.kind, event = k.event, harmless = k.harmless }
     else
         -- a throwable added later: a function named after it means a fuse
         local ev = base:sub(#PREFIX + 1)
@@ -363,7 +363,13 @@ local function class_info(short)
     return i
 end
 
+-- The class of a throwable / projectile. Host: loaded if needed (a client's
+-- throw spawns there); client: only one already in memory - its copies come
+-- from messages (THROWN / THRFX), and a synchronous load there can wait for
+-- the world's streaming. A projectile's class comes with its weapon (a hard
+-- reference), a throwable's with its item.
 local function load_class(info)
+    if S and S.role == "client" then return ue.loaded_asset(info.path, "throw") end
     local c = ue.find_object(info.path)
     if c then return c end
     local ok, l = ue.load_asset(info.path, "throw")
@@ -429,15 +435,6 @@ end
 -- Projectiles: spawning, holding, setting off (the game's own code)
 -- ---------------------------------------------------------------------------
 
--- The class of a projectile. Host: loaded if needed (as for throws); client:
--- only one already in memory (its weapon's ProjectileClass is a hard
--- reference, so a replicated launcher brings it) - no synchronous load on a
--- message path.
-local function proj_class(info)
-    if S and S.role == "client" then return ue.loaded_asset(info.path, "throw") end
-    return load_class(info)
-end
-
 local function proj_mesh(actor)
     local m = ue.prop(actor, "StaticMesh")   -- the root: ProjectileMovement sweeps it
     if ue.valid(m) then return m end
@@ -453,7 +450,7 @@ end
 -- opt.ignore: actors its movement ignores.
 local function spawn_proj(info, loc, rot, opt)
     opt = opt or {}
-    local cls = proj_class(info)
+    local cls = load_class(info)
     local gs = ue.gameplay_statics()
     local wc = (opt.weapon and ue.valid(opt.weapon)) and opt.weapon or ue.world_context()
     if not cls then return nil, "class " .. info.short .. " not loaded" end
@@ -747,6 +744,7 @@ local function apply_fx(key, g, e, info, phase, loc)
         if e and e.hit_at then
             if copy and clock() - e.hit_at < FIRE_WINDOW then
                 freeze_at(copy, loc)
+                e.fire_loc = loc
                 M.stats.fire_moved = M.stats.fire_moved + 1
                 log.debug("throw: %s fire point from the host applied before the fire started", info.short)
             end
@@ -773,7 +771,7 @@ local function apply_fx(key, g, e, info, phase, loc)
     local before = ue.location(copy)
     freeze_at(copy, loc)
     local ok, err = set_off(copy, info)
-    e.done, e.hit_at = true, clock()
+    e.done, e.hit_at, e.fire_loc = true, clock(), loc
     if ok then
         M.stats.set_off = M.stats.set_off + 1
         counted(M.stats.set_off, 10, "throw: %s %s (host's %d%s) at %.0f,%.0f,%.0f: copy moved %.0f cm and set off by the game's %s",
@@ -800,7 +798,8 @@ end
 
 local function announce(e, loc, rot, vel, pawn)
     local n = 0
-    local who = pawn and player_id(pawn) or "?"
+    local id = pawn and appearance.player_id(pawn)
+    local who = id and tostring(id) or "?"
     for _, pc in ipairs(S.remote_pcs or {}) do
         if addr(pc) ~= e.pc and net.send_to(pc, "THROWN", tostring(e.g), e.info.short, f3(loc), r3(rot), f3(vel), who) then
             n = n + 1
@@ -1027,6 +1026,18 @@ local function host_throw(f, pc)
     pcall(ctx.bind, pawn, pc)
     local actor, why = spawn(info, loc, rot, vel, { owner = pawn })
     if not actor then return refuse("spawn failed: " .. tostring(why)) end
+    -- a fuse class only starts its fuse on Event_Throw, which the thrower's
+    -- character broadcasts after its own spawn (BP_PlayerCharacter @14507;
+    -- BP_Throwable_Frag binds Event_Throw -> Frag @2788). Spawned here, nobody
+    -- broadcast it: up to 0.7.2 a client's frag / pipe bomb / noise maker lay
+    -- on the host without going off (no damage, no THRFX boom; the clients'
+    -- copies "never went off"). The event bound to it, with its own
+    -- ExplosionDelay, as the game's throw.
+    if info.kind == "fuse" then
+        local okf, errf = pcall(function() actor[info.event](actor) end)
+        if not okf then log.warn("throw: %s's %s: its fuse (%s) did not start: %s", ue.short(pc), info.short, info.event,
+            tostring(errf)) end
+    end
     local e = host_track(actor, info, pc, seq)
     net.send_to(pc, "THRACK", tostring(seq), tostring(e.g), "1", "")
     local n = announce(e, loc, rot, vel, pawn)
@@ -1059,6 +1070,14 @@ local function on_sound(fn, wco_p, loc_p)
     local l = vec(get(loc_p)) or ue.location(w)
     if not l then return end
     if e.pc and phase == "boom" then st.blast_until = clock() + BLAST_S end
+    -- sdc_ffire: the blast's damage loop runs right after this sound (not
+    -- the noise maker's firecracker: no damage); the Molotov's fire burns
+    -- players around this point
+    if phase == "boom" then
+        if not e.info.harmless then st.last_boom = { pc = e.pc, who = e.who, short = e.info.short, loc = l, t = clock() } end
+    elseif phase == "fire" and e.info.short == MOLOTOV then
+        e.fire_loc, e.fire_at = l, clock()
+    end
     local n = 0
     for _, pc in ipairs(S.remote_pcs or {}) do
         if net.send_to(pc, "THRFX", tostring(e.g), e.info.short, phase, f3(l)) then n = n + 1 end
@@ -1175,13 +1194,12 @@ end
 
 -- Runs for every K2_SetWorldRotation on the client (the sky's lights turn
 -- every frame): the context's address is compared without making a closure.
-local function p_get(p) return p:get() end
 local function o_addr(o) return o:GetAddress() end
 local function on_rotate(ctx_p)
     local cap = st.my_capsule
     if not cap or not S or S.role ~= "client" then return end
-    local okc, c = pcall(p_get, ctx_p)
-    if not okc or c == nil then return end
+    local c = get(ctx_p)
+    if c == nil then return end
     local oka, a = pcall(o_addr, c)
     if not oka or a ~= cap or not gate_on() then return end
     throw_started()
@@ -1342,24 +1360,37 @@ local function send_caps(now)
     for k in pairs(st.cap_sent) do
         if not live[k] then st.cap_sent[k], st.cap_at[k] = nil, nil end
     end
+    return live
 end
 
 local function host_tick(now)
     if next(st.sticks) ~= nil then stick_tick() end
     if now - st.host_at < 1 then return end
     st.host_at = now
-    send_caps(now)
+    local live = send_caps(now)
     for a, e in pairs(st.tracked) do
         if now - e.t0 > LIFE_S then st.tracked[a] = nil end
     end
+    -- seqs of a player who left go: a client restarted at a reused controller
+    -- address numbers its throws from 1 again, and its first throws were
+    -- taken for repeats and dropped (the item already used up)
+    local connected = {}
+    for _, pc in ipairs(S.remote_pcs or {}) do
+        local k = addr(pc)
+        if k then connected[k] = true end
+    end
     for pk, seqs in pairs(st.seqs) do
-        local n, oldest, oldest_t = 0, nil, math.huge
-        for s, t in pairs(seqs) do
-            n = n + 1
-            if t < oldest_t then oldest, oldest_t = s, t end
+        if not connected[pk] then
+            st.seqs[pk] = nil
+        else
+            local n, oldest, oldest_t = 0, nil, math.huge
+            for s, t in pairs(seqs) do
+                n = n + 1
+                if t < oldest_t then oldest, oldest_t = s, t end
+            end
+            if n > SEQ_KEEP and oldest then seqs[oldest] = nil end
+            if n == 0 then st.seqs[pk] = nil end
         end
-        if n > SEQ_KEEP and oldest then seqs[oldest] = nil end
-        if n == 0 then st.seqs[pk] = nil end
     end
     for pk, r in pairs(st.rate) do
         if now - r.t > 60 then st.rate[pk] = nil end
@@ -1369,18 +1400,48 @@ local function host_tick(now)
     end
 end
 
+-- Client: the throwable classes, loaded once per world 10 s after this
+-- player's character exists, one a second. load_class takes only classes
+-- already in memory on a client (no synchronous load on a message path), so
+-- a class nobody here has used yet would leave a teammate's throw invisible.
+-- These five are small and loaded once, off the message path.
+local PRELOAD = { "BP_Throwable_Frag_C", "BP_Throwable_PipeBomb_C", "BP_Throwable_NoiseMaker_C",
+                  "BP_Throwable_Molotov_C", "BP_Throwable_GlassBottle_C" }
+local function client_preload(now)
+    if st.preload_done then return end
+    if not ue.local_pawn() then st.preload_from = nil return end
+    st.preload_from = st.preload_from or now
+    if now - st.preload_from < 10 or now - (st.preload_at or -100) < 1 then return end
+    st.preload_at = now
+    st.preload_i = (st.preload_i or 0) + 1
+    local short = PRELOAD[st.preload_i]
+    if not short then
+        st.preload_done = true
+        log.debug("throw: throwable classes preloaded here")
+        return
+    end
+    local info = class_info(short)
+    if info and info.path and not ue.find_object(info.path) then ue.load_asset(info.path, "throw preload") end
+end
+M._client_preload = client_preload
+
 function M.tick()
     if not coop() then
         if next(st.copies) or next(st.tracked) then M.reset("not in co-op") end
         return
     end
     local now = clock()
-    install_hooks(now)
+    -- (each call builds the hook closures: once a second, not every 100 ms)
+    if now - st.hooks_at >= 1 then
+        st.hooks_at = now
+        install_hooks(now)
+    end
     for name, t in pairs(st.seen) do
         if now - t > SEEN_S then st.seen[name] = nil end
     end
     if S.role == "client" then
         refresh_own(now)
+        client_preload(now)
         client_tick(now)
     else
         host_tick(now)
@@ -1444,7 +1505,9 @@ function M.install(state)
             return
         end
         local copy, why = spawn(info, loc, rot, vel, { quiet = true })
-        st.copies[key] = { key = key, g = g, info = info, t0 = clock(), own = false, path = copy and ue.path(copy) or nil }
+        -- who: the thrower's PlayerId (sdc_ffire: whose Molotov fire this is)
+        st.copies[key] = { key = key, g = g, info = info, t0 = clock(), own = false, path = copy and ue.path(copy) or nil,
+                           who = tonumber(f[6]) and tostring(math.floor(tonumber(f[6]))) or nil }
         if copy then
             M.stats.copies = M.stats.copies + 1
             counted(M.stats.copies, 10, "throw: player %s's %s (host's %d) flies here as %s", tostring(f[6]), info.short, g,
@@ -1498,14 +1561,61 @@ function M.host_drives_projectiles()
     return S ~= nil and S.role == "client" and proj_on() and st.host_proj == true and st.last_proj_kept ~= true
 end
 
+-- sdc_ffire, host: the tracked blast (frag, pipe bomb, launcher grenade /
+-- rocket; not the harmless noise maker) that went off within max_s (default
+-- BOOM_MATCH_S): { pc = the thrower's controller address (nil: the host),
+-- who, short, loc, t }, else nil. Its explosion sound comes first, then its
+-- damage loop in the same Blueprint call (BP_Throwable_Frag @355 / @2411).
+function M.blast_now(max_s)
+    local b = st.last_boom
+    if not b or clock() - b.t > (max_s or BOOM_MATCH_S) then return nil end
+    return b
+end
+
+-- sdc_ffire: Molotov fires burning within `radius` cm of loc now:
+-- { { pc, own, who, d } }. Host: its tracked throws (their fire sound's
+-- point), pc = the thrower's controller address, nil = the host. Client:
+-- its copies (frozen at the host's fire point), own = this player's throw,
+-- who = the thrower's PlayerId (THROWN) or nil.
+function M.fires_near(loc, radius)
+    local out = {}
+    if not S or not loc then return out end
+    local now = clock()
+    if S.role == "host" then
+        for _, e in pairs(st.tracked) do
+            if e.fire_loc and now - e.fire_at <= FIRE_LIFE_S then
+                local d = dist(e.fire_loc, loc)
+                if d <= radius then out[#out + 1] = { pc = e.pc, own = false, who = e.who, d = d } end
+            end
+        end
+    elseif S.role == "client" then
+        local seen = {}   -- an own throw is kept under two keys
+        for _, e in pairs(st.copies) do
+            if not seen[e] and e.info.short == MOLOTOV and e.hit_at and now - e.hit_at <= FIRE_LIFE_S then
+                seen[e] = true
+                local l = e.fire_loc
+                if not l then
+                    local copy = find_actor(e.path, e.info.short)
+                    l = copy and ue.location(copy) or nil
+                end
+                local d = l and dist(l, loc) or math.huge
+                if d <= radius then out[#out + 1] = { own = e.own == true, who = e.who, d = d } end
+            end
+        end
+    end
+    return out
+end
+
 -- Level change / role change: every remembered object is dropped untouched.
 function M.reset(why)
     st.copies, st.tracked, st.seen, st.rate, st.seqs = {}, {}, {}, {}, {}
     st.sticks, st.prate, st.cap_sent, st.cap_at, st.host_proj = {}, {}, {}, {}, false
-    st.last_proj_kept = nil
+    st.last_proj_kept, st.last_boom = nil, nil
     st.my_pawn, st.my_capsule, st.my_mesh, st.own_at = nil, nil, nil, -100
     st.montage_at, st.align_pending, st.montage_addr = nil, false, nil
     st.blast_until = 0
+    st.hooks_at = -100   -- a new role: its hooks right away
+    st.preload_done, st.preload_from, st.preload_at, st.preload_i = nil, nil, nil, nil
     log.debug("throw: reset (%s)", tostring(why))
 end
 

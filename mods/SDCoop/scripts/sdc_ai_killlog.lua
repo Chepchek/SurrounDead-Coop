@@ -1,7 +1,8 @@
 -- SDCoop zombie feature ai_kill_log: one log line per zombie death, on the host
 -- and on every client that had that zombie in view, plus kills per type.
 --
--- Host (also without a client connected):
+-- Host (only while a client is connected: diagnostics of co-op; the hooks are
+-- installed with the first remote player):
 --   DamageComponent_C.DamageTaken(DmgAmount, DmgType, DmgCauser, IsHeadshot),
 --   post: the zombie's last hit (damage type, causer, headshot) and its capsule
 --   height while it still has one. BP_MasterZombie.Death(Actor, Headshot),
@@ -16,6 +17,13 @@
 --   .DeathEvent(Player), post.
 --   Clients within 150 m get AIKL|killer|headshot|dmg|causer|arch|mesh|mat|
 --   crawler + the zombie (ClientRepObjRef).
+--   One death, one line and one AIKL: DamageTaken broadcasts Death on every
+--   hit that leaves the health below 0 (it lets hits through while
+--   "CanDamage? or IsAlive?"), so a shotgun's pellets call Death 4-6 times in
+--   one frame (0.8.1 session: four lines and four AIKL for one zombie), and a
+--   shot corpse may call it again.
+--   Later calls on a zombie already logged are only counted (DEAD_TTL: the
+--   corpse is destroyed 1200 s after its Death, BP_MasterZombie @16610).
 -- Client: the copy's OnRep_IsDead? (post; IsDead? is the one replicated zombie
 --   variable) logs what this machine shows, with the host's killer and look:
 --     ai: kill [client]: <copy> <type> "<Name>" ... | by <killer> (...) at X Y Z
@@ -31,7 +39,7 @@ local ctx = require("sdc_ctx")
 local zi = require("sdc_ai_zombie")
 
 local M = {
-    stats = { host = 0, client = 0, sent = 0, got = 0, corpses_in_view = 0 },
+    stats = { host = 0, client = 0, sent = 0, got = 0, corpses_in_view = 0, repeats = 0 },
 }
 local core
 
@@ -45,8 +53,10 @@ local INFO_TTL = 10.0          -- client: the host's note waits this long for it
 local LINE_DELAY_MS = 500      -- client: OnRep before the host's note: wait a little
 local BORN_MIN_S = 0.5         -- client: OnRep this soon after BeginPlay = a corpse coming into view
 local SUMMARY_S = 60
+local DEAD_TTL = 1260          -- host: a logged death is remembered this long (corpse lives 1200 s)
 
 local hits = {}                -- host: [zombie address] = { t, dmg, causer, hs, hh }
+local dead = {}                -- host: [zombie full name @ address] = clock (its death is logged and sent)
 local counts = {}              -- [type label] = kills
 local born = {}                -- client: [copy full name] = clock (BeginPlay seen)
 local notes = {}               -- client: [copy full name] = the host's AIKL
@@ -138,6 +148,7 @@ end
 
 -- DamageComponent_C.DamageTaken(DmgAmount, DmgType, DmgCauser, IsHeadshot), post (host)
 local function on_damage_taken(c, _, type_p, causer_p, hs_p)
+    if not core.host.active then return end
     local comp = c:get()
     local z = ue.valid(comp) and ue.try(function() return comp:GetOwner() end) or nil
     if not ue.valid(z) or not (core.is_zombie(z) or core.is_boss(z)) then return end
@@ -161,8 +172,20 @@ local function send_note(z, d, k)
 end
 
 local function host_death(z, killer_obj, headshot)
-    if not ue.valid(z) or ue.role(z) ~= ue.ROLE_AUTHORITY then return end
+    if not core.host.active or not ue.valid(z) or ue.role(z) ~= ue.ROLE_AUTHORITY then return end
     local a = addr(z)
+    -- name and address: an actor placed in a level can stream back in under
+    -- the same name, a new actor can reuse a freed address; both at once
+    -- practically never
+    local key = ue.name(z)
+    if key == "<?>" or key == "<none>" or not a then key = nil else key = key .. "@" .. tostring(a) end
+    if key and dead[key] then
+        -- the same death again (another pellet, a shot corpse): see the header
+        M.stats.repeats = M.stats.repeats + 1
+        if a then hits[a] = nil end
+        return
+    end
+    if key then dead[key] = clock() end
     local h = a and hits[a]
     if a then hits[a] = nil end
     if h and clock() - h.t > HIT_TTL then h = nil end
@@ -266,11 +289,11 @@ function M.init(c)
     if core.forget_gone then
         core.forget_gone("killlog", function() return { born = born, notes = notes, logged = logged } end)
     end
-    core.hook({ path = DMG .. "DamageTaken", kind = "bp", role = "host", feature = "killlog", alone = true,
+    core.hook({ path = DMG .. "DamageTaken", kind = "bp", role = "host", feature = "killlog",
                 name = "killlog.damage", fn = on_damage_taken })
-    core.hook({ path = core.ZM .. "Death", kind = "bp", role = "host", feature = "killlog", alone = true,
+    core.hook({ path = core.ZM .. "Death", kind = "bp", role = "host", feature = "killlog",
                 name = "killlog.death", fn = on_zombie_death })
-    core.hook({ path = core.BOSS .. "DeathEvent", kind = "bp", role = "host", feature = "killlog", alone = true,
+    core.hook({ path = core.BOSS .. "DeathEvent", kind = "bp", role = "host", feature = "killlog",
                 name = "killlog.boss", fn = on_boss_death })
     for _, cls in ipairs({ core.ZM, core.BOSS }) do
         core.hook({ path = cls .. "ReceiveBeginPlay", kind = "bp", role = "client", feature = "killlog",
@@ -292,8 +315,8 @@ end
 
 function M.status_line()
     local s = M.stats
-    return string.format("ai: kill log: host=%d client=%d (notes sent=%d got=%d, corpses come into view=%d) | %s",
-        s.host, s.client, s.sent, s.got, s.corpses_in_view, counts_text())
+    return string.format("ai: kill log: host=%d client=%d (notes sent=%d got=%d, corpses come into view=%d, repeated Death calls=%d) | %s",
+        s.host, s.client, s.sent, s.got, s.corpses_in_view, s.repeats, counts_text())
 end
 
 local function maybe_summary(now)
@@ -308,6 +331,9 @@ end
 function M.host_tick(now)
     for a, h in pairs(hits) do
         if now - h.t > 30 then hits[a] = nil end
+    end
+    for k, t in pairs(dead) do
+        if now - t > DEAD_TTL then dead[k] = nil end
     end
     maybe_summary(now)
 end
@@ -331,7 +357,7 @@ end
 
 -- Role / world change: the counts stay for the whole game session.
 function M.reset()
-    hits, born, notes, logged = {}, {}, {}, {}
+    hits, born, notes, logged, dead = {}, {}, {}, {}, {}
 end
 
 return M

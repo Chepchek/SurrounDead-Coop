@@ -45,8 +45,19 @@ package.loaded["sdc_log"] = log
 package.loaded["sdc_ue"] = ue
 local cfgv = {}
 package.loaded["sdc_config"] = { get = function(k) if cfgv[k] ~= nil then return cfgv[k] end return true end }
+-- (0.7.3: JMC|*|<key>|<op,args>|...: one entry per op, as the single form JMC|<op>|<key>|<args> was;
+-- whole numbers as numbers, as the host passed them before)
+local function jmc_ops(pc, f)
+  if f[1] ~= "*" then to_client[#to_client + 1] = { pc = pc, kind = "JMC", f = f }; return end
+  for i = 3, #f do
+    local one = {}
+    for part in (f[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = part:match("^%-?%d+$") and tonumber(part) or part end
+    table.insert(one, 2, f[2])
+    to_client[#to_client + 1] = { pc = pc, kind = "JMC", f = one }
+  end
+end
 package.loaded["sdc_net"] = { broadcast = function() end,
-  send_to = function(pc, kind, ...) if kind == "JMC" then to_client[#to_client + 1] = { pc = pc, kind = kind, f = { ... } } end end,
+  send_to = function(pc, kind, ...) if kind == "JMC" then jmc_ops(pc, { ... }) end end,
   send_to_host = function(kind, ...) to_host[#to_host + 1] = { kind, ... } end, on = function(k, h) handlers[k] = h end }
 package.loaded["sdc_ctx"] = { addr = function(o) return o and (o.__name or tostring(o)) end }
 local hooks = {}
@@ -110,6 +121,9 @@ local chest = { __name = "ChestJig", GetOwner = function() return crate end, Mai
     f(2, { get = function() return { [F_CONT_UID] = G(600), [F_ITEMS] = arr(bag_items) } end })
   end } }
 items.host_tick({ pc })
+-- (0.7.3: the JMC ops of a tick go together a moment later; here right after each call)
+local containers = require("sdc_containers")
+for p, fn in pairs(hooks) do hooks[p] = function(...) fn(...); containers.flush_viewers() end end
 for _, f in ipairs({ "MC_MoveItemToIndex", "MC_ItemRemoved", "MC_AddNewItem", "MC_UpdateStack", "MC_UpdateCount",
     "MC_UpdateCounts", "MC_SameCompUpdateSplitRequest", "MC_NewItemAdded", "MC_UpdateDurability", "MC_OnPendingDone",
     "SERVER_RequestSplitItem",
@@ -152,7 +166,8 @@ hooks[JIG .. "SERVER_SameContainer_MoveToIndex"](C(djig), P(chest), P(G(7)), P(G
 assert(#failed == 0 and has_log("guest moved Rags (uid 7:0:0:0) inside Container_MedicalLoot_MedicalCrate2_C_33 to slot 4: done"), "done move")
 hooks[JIG .. "SERVER_SameContainer_MoveToIndex"](C(djig), P(chest), P(G(7)), P(G(500)), P(9), P(false), P(4))
 assert(#failed == 1 and failed[1].a == 7 and failed[1].target == chest, "refused move not answered")
-assert(has_log("to slot 9: NOT moved (still at slot 4) - the client was told (CLIENT_MoveToIndexFailed)", "warn"), "refused log")
+-- (0.9.x: the log names the count and what the target slot holds on the host)
+assert(has_log("to slot 9: NOT moved (still at slot 4, x3; slot 9 there holds nothing) - the client was told (CLIENT_MoveToIndexFailed)", "warn"), "refused log")
 -- chest -> inventory: still in the chest = refused; the pending slot is in the receiving component
 hooks[JIG .. "SERVER_RequestMoveItemToAnotherComp"](C(djig), P(chest), P(djig), P(G(8)), P(false), P(3), P(G(1)), P(0), P(G(0)), P(0))
 assert(#failed == 2 and failed[2].a == 8 and failed[2].target == djig, "refused comp move not answered")
@@ -211,6 +226,8 @@ local me = { __name = "Me", __cls = "BP_PlayerCharacter_C", IsLocallyControlled 
 ue.__me = me
 local mycomp = { __name = "MyJig", GetOwner = function() return me end, LocalJSIContainers = arr({}), PendingRequests = arr({}) }
 me.BP_JigMultiplayer = mycomp
+-- (0.7.3: the Jig_UnhandledEvent hook, which only logs this player's move requests, is on with config debug)
+log.debug_enabled = true
 items.client_tick()
 assert(hooks[JIG .. "Jig_UnhandledEvent"] and hooks[JIG .. "CLIENT_ContainerDataResponse"], "client hooks missing")
 local ccrate = { __name = "Container_MedicalLoot_MedicalCrate2_C_33", __cls = "Container_MedicalLoot_MedicalCrate2_C" }

@@ -104,12 +104,15 @@ local INT_FIELDS = {
     AnimalKills = true, HumanKills = true, DaysSurvived = true, InfestationsDestroyed = true,
 }
 -- a change of these is reported to the host at once (sdc_persist); XP that
--- trickles in (sprinting) waits for the next regular report
+-- trickles in (sprinting) waits for the next regular report, and so does
+-- DistanceTravelled (it changes all the time a player moves)
 local MAJOR = { ["L.CurrentLevel"] = true, ["T.SkillPoints"] = true, ["T.CurrentPoints"] = true }
-for _, j in ipairs(JOURNAL) do MAJOR["J." .. j[1]] = true end
+for _, j in ipairs(JOURNAL) do
+    if j[1] ~= "DistanceTravelled" then MAJOR["J." .. j[1]] = true end
+end
 
 local st = {
-    started = false, conn = nil, conn_cleared = false, pawn_key = nil, pawn_since = 0, done = false,
+    started = false, conn = nil, pawn_key = nil, pawn_since = 0, done = false,
     host_checked = {}, load_hook = false, sig_logged = false, verdict = nil, applied_gen = nil,
 }
 

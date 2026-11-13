@@ -299,6 +299,7 @@ local function load_mods(w)
     for _, name in ipairs(MODS) do m[name:gsub("^sdc_", "")] = require(name) end
     for _, k in ipairs(OFF) do m.config.values[k] = false end
     m.config.values.player_name = "Boss"
+    m.config.values.ai_kill_log = true   -- default off since 2026-11-13 (a debug log); this test covers it
     leave(w)
     return m
 end
@@ -684,10 +685,8 @@ check(level_zombie._valid and boss_copy._valid, "level-placed actor and host cop
 check(find_log("removed 2 AI that existed only on this client: BP_ZombieBoss_Survivor_Small_C_%d+%(dead=false at 2010 0 400%) BP_AnimalWolf_C_2147470001", mark) ~= nil,
     "ghosts named in the log")
 check(boss_copy._p.SD_AIComponent._p["CanSystemDespawnAI?"] == false, "boss copy: CanSystemDespawnAI? = false")
--- the client's optimizer despawning a host copy is logged
-local subj = new(CW, { "AIOSubjectComponent" }, "AIOSubject_1", { _owner = boss_copy })
-fire(CW, "/Script/AIOptimizer.AIOptimizerSubsystem:K2_DespawnSubject", "pre", param(nil), param({}), param(1), param(subj), param(-1), param(false))
-check(find_log("this client's AI optimizer despawns the host's BP_ZombieBoss_Survivor_Small_C", mark) ~= nil, "optimizer despawn of a host copy logged")
+-- 2026-11-13 (critic B8): the client's optimizer despawns are no longer hooked (that was evidence only)
+check(CW.hooks["/Script/AIOptimizer.AIOptimizerSubsystem:K2_DespawnSubject"] == nil, "no K2_DespawnSubject hook on the client")
 
 say("== 11. client: an attack already playing on a copy is not restarted")
 enter(CW); C.config.values.ai_attack_montages = true; leave(CW)
@@ -934,6 +933,92 @@ fire(HW, GS .. "PlaySoundAtLocation", "pre", param(hgps), param(hg), param(HW.pa
 deliver()
 check(#fx_of("sound") == 1 and fx_of("sound")[1][2] == CW.paths[FXP.beep], "beep played once in memory")
 check(LOADS == LOADS0, "still no LoadAsset on the client")
+
+say("== 13b. (13.11) a missing asset looked for 10 min, the pass not every second meanwhile, the asset named when given up")
+-- 13.11 client: 26 copies gave up after 2 min ("never came into memory").
+-- Both looks arrive first; then only the client ticks (the end of the test:
+-- the host's link is not simulated during the 10 min).
+local GPS = "/Script/Engine.Default__GameplayStatics"
+local gaa0 = CW.paths[GPS]._m.GetAllActorsOfClass
+local npass = 0
+CW.paths[GPS]._m.GetAllActorsOfClass = function(...)
+    if debug.traceback():find("sdc_ai_looks", 1, true) then npass = npass + 1 end
+    return gaa0(...)
+end
+local PUNK = "/Game/AI/Zombies/SK_Zombie_Punk_Male_01.SK_Zombie_Punk_Male_01"
+local BRIDE = "/Game/AI/Zombies/SK_Zombie_Bride_Female_01.SK_Zombie_Bride_Female_01"
+local hpk = make_zombie(HW, 3, { name = "Undead Shambler", loc = { X = 1000, Y = 700, Z = 75 } })
+local cpk = make_zombie(CW, 1, { name = "Undead Shambler", loc = { X = 1000, Y = 700, Z = 75 } })
+local hbr = make_zombie(HW, 3, { name = "Undead Shambler", loc = { X = 1050, Y = 700, Z = 75 } })
+local cbr = make_zombie(CW, 1, { name = "Undead Shambler", loc = { X = 1050, Y = 700, Z = 75 } })
+NETMAP[hpk], NETMAP[hbr] = cpk, cbr
+asset(HW, "SkeletalMesh", PUNK)
+asset(HW, "SkeletalMesh", BRIDE)
+hpk._mesh._p.SkeletalMeshAsset = HW.paths[PUNK]
+hbr._mesh._p.SkeletalMeshAsset = HW.paths[BRIDE]
+local mark13 = #LOG + 1
+advance(0.2)
+HW.outbox = {}
+fire(HW, ZM .. "SelectArchetype", "bp", param(hpk))
+fire(HW, ZM .. "SelectArchetype", "bp", param(hbr))
+deliver()
+check(find_log("mesh of the host's look not in memory here yet %(SK_Zombie_Punk_Male_01%)", mark13) ~= nil
+    and find_log("mesh of the host's look not in memory here yet %(SK_Zombie_Bride_Female_01%)", mark13) ~= nil,
+    "(both meshes not here: they wait)")
+npass = 0
+for _ = 1, 60 do advance(1); client_tick() end
+check(npass <= 30, "a minute of copies that only wait: the looks pass not every second (" .. npass .. " passes)")
+for _ = 1, 150 do advance(1); client_tick() end
+check(cpk._mesh._p.SkeletalMeshAsset ~= CW.paths[PUNK] and find_log("never came into memory", mark13) == nil,
+    "3.5 min, still not here: still looked for (0.8.1 gave up at 2 min)")
+asset(CW, "SkeletalMesh", PUNK)              -- a new copy's own async load brought it in
+for _ = 1, 31 do advance(1); client_tick() end
+check(cpk._mesh._p.SkeletalMeshAsset == CW.paths[PUNK], "the punk's mesh came after 3.5 min: applied")
+for _ = 1, 320 do advance(1); client_tick() end
+check(find_log("never came into memory", mark13) == nil, "9.5 min: the bride's still looked for")
+for _ = 1, 40 do advance(1); client_tick() end
+check(cbr._mesh._p.SkeletalMeshAsset ~= CW.paths[BRIDE]
+    and find_log("BP_Zombie_Roamer_C_%d+: mesh %(SK_Zombie_Bride_Female_01%) never came into memory here in 600 s; left as it is", mark13) ~= nil,
+    "10 min: given up, the asset named")
+enter(CW)
+local looks_line
+for _, l in ipairs(C.ai.status_lines()) do if l:find("ai: looks", 1, true) then looks_line = l end end
+leave(CW)
+check(looks_line and looks_line:find("never came into memory here: SK_Zombie_Bride_Female_01", 1, true) ~= nil,
+    "status line lists the asset that never came")
+CW.paths[GPS]._m.GetAllActorsOfClass = gaa0
+
+say("== 13c. an effect that never came is named whole in the status line ('spit fx', not 'spit, fx')")
+-- review of 13b: note_never split the names on spaces too, so an acidic
+-- zombie's missing spit effect showed as "spit, fx" in the status line.
+local SPITTER = "/Game/AI/Zombies/SK_Zombie_Spitter_01.SK_Zombie_Spitter_01"
+local spit_obj = CW.paths[FXP.spit]
+CW.paths[FXP.spit] = nil                     -- NS_BloodSpit not in memory here
+asset(HW, "SkeletalMesh", SPITTER)           -- the spitter's mesh only on the host
+local hsp = make_zombie(HW, 3, { name = "Acidic Undead", loc = { X = 1100, Y = 700, Z = 75 } })
+local csp = make_zombie(CW, 1, { name = "Undead Shambler", loc = { X = 1100, Y = 700, Z = 75 } })
+NETMAP[hsp] = csp
+hsp._mesh._p.SkeletalMeshAsset = HW.paths[SPITTER]
+local mark13c = #LOG + 1
+advance(0.2)
+HW.outbox = {}
+fire(HW, ZM .. "Archetype_Acidic", "bp", param(hsp))
+fire(HW, ZM .. "SelectArchetype", "bp", param(hsp))
+deliver()
+for _ = 1, 615 do advance(1); client_tick() end
+check(find_log("mesh,spit fx %(SK_Zombie_Spitter_01, spit fx%) never came into memory here in 600 s", mark13c) ~= nil,
+    "10 min: the spitter gave up, its mesh and spit effect named in the line")
+enter(CW)
+local looks13c
+for _, l in ipairs(C.ai.status_lines()) do if l:find("ai: looks", 1, true) then looks13c = l end end
+leave(CW)
+local never13c = looks13c and looks13c:match("never came into memory here: (.*)$") or ""
+local has13c = {}
+for n in (never13c .. ", "):gmatch("(.-), ") do has13c[n] = true end   -- exactly ", " between names
+check(has13c["spit fx"] and has13c["SK_Zombie_Spitter_01"] and has13c["SK_Zombie_Bride_Female_01"]
+    and not has13c["spit"] and not has13c["fx"],
+    "status line: 'spit fx' is one entry next to the meshes (" .. never13c .. ")")
+CW.paths[FXP.spit] = spit_obj
 
 say("== 9. objects never kept; reset")
 enter(CW); C.ai.reset("world:loadmap"); leave(CW)

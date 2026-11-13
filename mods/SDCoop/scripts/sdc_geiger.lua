@@ -93,13 +93,15 @@
 --
 -- This module also drives sdc_hudmods (install / tick / reset / status line):
 -- the HUD's respirator / flashlight / NVG icons on a client's screen; the
--- UseFilter hook below hands it the filter's durability.
+-- UseFilter hook below hands it the filter's durability. And sdc_infui the
+-- same way: the infection bar on a client's screen.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
 local hud = require("sdc_hudmods")   -- equipment status icons on a client's HUD
+local infui = require("sdc_infui")   -- the infection bar on a client's HUD
 
 local M = {
     stats = {
@@ -390,11 +392,12 @@ local function try_hooks(now)
     if now - st.hook_at < HOOK_RETRY_S then return end
     st.hook_at = now
     if not st.hooks.spawn then
-        local ok, err = pcall(RegisterHook, SPAWN2D_FN, function(ctx, wco_p, sound_p)
+        -- shared pre-only engine hook (sdc_ue.hook_native): no empty post callback
+        local ok, err = ue.hook_native(SPAWN2D_FN, "geiger.spawn2d", function(ctx, wco_p, sound_p)
             local okc, e = pcall(on_spawn2d, ctx, wco_p, sound_p)
             if not okc then log.err_throttled("geiger.spawn", "geiger: SpawnSound2D hook: %s", tostring(e)) end
-        end, function() end)
-        st.hooks.spawn = ok
+        end)
+        st.hooks.spawn = ok == true
         log.info("geiger: SpawnSound2D hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
     end
     -- the Blueprint hooks fail quietly until RadiationComponent_C is loaded
@@ -718,6 +721,8 @@ function M.tick()
     try_hooks(now)
     local okh, eh = pcall(hud.tick, now)
     if not okh then log.err_throttled("geiger.hudmods-tick", "geiger: hudmods tick: %s", tostring(eh)) end
+    local oki, ei = pcall(infui.tick, now)
+    if not oki then log.err_throttled("geiger.infui-tick", "geiger: infui tick: %s", tostring(ei)) end
     prune(now)
     if role == "host" then
         sweep(now)
@@ -734,6 +739,7 @@ function M.install(state)
         if not ok then log.err_throttled("geiger.radz", "geiger: RADZ: %s", tostring(err)) end
     end)
     hud.install(state)   -- RESPUI handler
+    infui.install(state)   -- INFUI handler
     log.info("geiger: installed (geiger_own_only=%s, radiation_exit_sync=%s, client_gear_hud=%s)", tostring(own_only()),
         tostring(exit_sync()), tostring(cfg.get("client_gear_hud") ~= false))
 end
@@ -748,6 +754,7 @@ function M.reset(why)
     st.pawn_since, st.pawn_name, st.alive_loc, st.alive_inzone = nil, nil, nil, false
     st.cue = nil
     pcall(hud.reset, why)
+    pcall(infui.reset, why)
     log.debug("geiger: reset (%s)", tostring(why))
 end
 
@@ -759,7 +766,7 @@ function M.status_line()
         s.muted, s.stopped, s.swept, s.played, s.faded, s.failed,
         s.radz_sent, s.radz_stops, s.radz_idle, s.radz_soon,
         s.zone_rechecks, s.zone_resets, s.zone_entries, s.zone_blocked, s.host_entries, s.filter_uses)
-        .. " || " .. hud.status_line()
+        .. " || " .. hud.status_line() .. " || " .. infui.status_line()
 end
 
 return M

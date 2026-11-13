@@ -9,14 +9,22 @@
 -- Each call is attributed with sdc_ctx.classify:
 --   host:   remote (a remote player's object) / local (the host player's) / world
 --   client: own / other / world
+-- Rows "clock" (sdc_speed, one count per measured second): game_speed by
+-- band (x1.00 = normal; a time dilation or hitches make it lower), paused,
+-- dilation when not 1, hitches (seconds that lost >= 0.05 s of world time to
+-- frames over 0.4 s, by how much), timer_period (how far apart the 1 s
+-- timer ran). tools/gapdiff.py shows them in its CLOCK section.
+-- Host and client side by side show a world that runs slower on one of them.
 -- Rows go to Mods/SDCoop/gaptrace_<role>.csv every WRITE_S seconds.
 -- tools/gapdiff.py joins the host's and the client's file:
 --   host "remote" rows with no client "own" row = logic that runs only on the
 --   host for a client's action: what that client never sees.
 --
--- Off unless config gap_trace = true. Read-only: hooks return nothing and
--- never throw. Note: a second RegisterHook on the same BP function can
--- replace the first; the BP sinks below are hooked by nothing else in the mod.
+-- Off unless config gap_trace = true: main.lua loads this module and starts
+-- its 1 s tick only then (at start, or when sdcoop_set turns the key on); the
+-- tick stops counting when the key goes off again. Read-only: hooks return
+-- nothing and never throw. A second RegisterHook on a function the mod hooks
+-- elsewhere adds one more callback (UE4SS keeps both).
 
 local log = require("sdc_log")
 local ue  = require("sdc_ue")
@@ -127,26 +135,19 @@ local function describe(v)
     return s and tostring(s) or ""
 end
 
-local function arg_value(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
-
 local function on_sink(spec, sink, context, ...)
     if not M.enabled then return end
     local n = select("#", ...)
     local cobj
     if spec.ctx == 0 then
-        cobj = arg_value(context)
+        cobj = ue.param(context)
     elseif spec.ctx == "last" then
-        cobj = arg_value((select(n, ...)))
+        cobj = ue.param((select(n, ...)))
     else
-        cobj = arg_value((select(spec.ctx, ...)))
+        cobj = ue.param((select(spec.ctx, ...)))
     end
     local detail = ""
-    if spec.detail and spec.detail <= n then detail = clean(describe(arg_value((select(spec.detail, ...))))) end
+    if spec.detail and spec.detail <= n then detail = clean(describe(ue.param((select(spec.detail, ...))))) end
     if not ue.valid(cobj) then
         count("none", sink, "-", detail)
         return
@@ -159,6 +160,39 @@ local function on_player0(fname, wco, tag)
     local w = tag or who(wco)
     count(w, "p0:" .. fname, cls(wco), "")
 end
+
+-- sdc_speed's per-second records not counted yet: rows "clock".
+M.clock_seen = 0
+local function period_band(dt)
+    local ms = dt * 1000
+    if ms < 1020 then return "<1.02s" elseif ms < 1050 then return "1.02-1.05s"
+    elseif ms < 1100 then return "1.05-1.10s" elseif ms < 1250 then return "1.10-1.25s" end
+    return ">=1.25s"
+end
+local function lost_band(s)
+    if s < 0.5 then return "0.05-0.5s" elseif s < 2 then return "0.5-2s" end
+    return ">=2s"
+end
+local function count_clock()
+    local sp = package.loaded["sdc_speed"]
+    if type(sp) ~= "table" or type(sp.recent) ~= "table" then return end
+    for _, r in ipairs(sp.recent) do
+        if r.seq > M.clock_seen then
+            M.clock_seen = r.seq
+            if r.paused then
+                count("clock", "paused", "-", "")
+            else
+                -- 0.05 bands: x1.00 normal, x0.50 half speed
+                count("clock", "game_speed", string.format("x%.2f", math.floor(r.speed * 20 + 0.5) / 20), "")
+                if (r.lost or 0) >= 0.05 then count("clock", "hitches", lost_band(r.lost), "") end
+            end
+            if r.dil and math.abs(r.dil - 1) > 0.001 then count("clock", "dilation", string.format("%.2f", r.dil), "") end
+            count("clock", "timer_period", period_band(r.dt), "")
+        end
+    end
+end
+M._count_clock = count_clock   -- tests
+M._rows = function() return rows end
 
 local function install()
     for _, spec in ipairs(SINKS) do
@@ -202,12 +236,15 @@ function M.init(state, dir)
     S, mod_dir = state, dir
 end
 
--- Every second from the session tick (any role).
+-- Every second from main.lua while started (any role).
 function M.tick(now)
     local on = cfg.get("gap_trace") == true
     if on ~= M.enabled then
         M.enabled = on
         ctx.observer = on and on_player0 or nil
+        -- clock rows from the seconds after the switch only
+        local sp = package.loaded["sdc_speed"]
+        if on and type(sp) == "table" then M.clock_seen = tonumber(sp.seq) or 0 end
         log.info("gaptrace: %s", on and "on (writes gaptrace_<role>.csv)" or "off")
     end
     if not on then return end
@@ -216,6 +253,8 @@ function M.tick(now)
         M.reset()
     end
     install()
+    local okc, errc = pcall(count_clock)
+    if not okc then log.err_throttled("gaptrace.clock", "gaptrace: clock rows: %s", tostring(errc)) end
     if now - cache_at >= CACHE_S then
         cache_at = now
         cls_cache, who_cache = {}, {}

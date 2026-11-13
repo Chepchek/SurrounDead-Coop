@@ -34,20 +34,52 @@
 --     position (bServerAcceptClientAuthoritativePosition off) so the driver
 --     does not hover beside the car. Exit (VEXIT): Event_ExitVehicle + the
 --     ExitVehicle tail on the host, owner and flags back.
---   Passengers (vehicle_passengers): the game has one seat. A second player
---     gets the mirrored seat next to the driver (attach + SitInCar montage +
---     VehicleInteraction on the host); the host becomes a passenger the same
---     way when it enters a client-driven car. When the driver leaves, a
---     passenger moves to the driver seat.
+--   Passengers (vehicle_passengers, vehicle_seats; module sdc_vehseats): the
+--     game has one seat. Seat 2 is the mirror of the driver's next to it,
+--     seats 3+ come from a table per vehicle class (the rear row of six cars;
+--     beds / benches of the others once tuned). A newcomer takes the first
+--     free seat (attach + sit montage + VehicleInteraction on the host; the
+--     host the same way when it enters a client-driven car) and is told
+--     "Seat N of M" where a car has more than 2. The wheel is the first free
+--     seat (the game's only seat in single player): whoever gets into a car
+--     nobody drives drives it. When the driver gets out (its exit key, death,
+--     disconnect) every passenger stays in its seat and the car stands
+--     parked as after the game's own exit - handbrake on, engine and timers
+--     off (SEATK.wheel_free; a host passenger's own driving keys do not move
+--     it, SEATK.hold_frame) - until somebody drives; the passengers are told
+--     once "The wheel is free: press G". A passenger moves only with the
+--     seat key (config vehicle_seat_key, G; read on the game thread,
+--     SEATK.frame): to the wheel when nobody drives, else to the next free
+--     seat in seat order, round; none free: a notice (SEATK.host_key /
+--     client_key, VSWITCH, the host decides: SEATK.client_switch). The user,
+--     13.11: up to then the passenger was moved to the wheel 1.5 s after the
+--     driver got out, also when it was getting out itself. The last one out
+--     of a car nobody drives parks it (SEATK.park_empty). One
+--     player per seat: in a full car the newcomer is refused ("No free
+--     seat"), the host too (the game's get-in it ran is undone,
+--     SEATK.host_out); SEATK.free_seat decides. A rear seat gets out at its
+--     own (rear) door when that is free.
 --   Client: vehicles it does not drive use the replicated inputs (no local
 --     handbrake fighting the physics replication, no ServerUpdateState
 --     spam); its own driven vehicle predicts locally. Lights / horn / flip /
 --     tow / push / refuel / repair / trader purchases done on the client are
 --     sent to the host, which runs the game's function on its copy.
+--   Driver only (every machine): lights, horn and flip are the driver's; a
+--     passenger's (a client, or the host in a client-driven car, any seat)
+--     lights are switched back at once (a wreck's too: SEATK.lights_back),
+--     its horn is muted - no sound, no AI noise (SEATK.hush_snd / hush_ai) -
+--     and not passed on, its flip key meets the game's "Cannot flip vehicle"
+--     (SEATK.pass_block / flip_hold); the host takes VLIGHT / VHORN / VFLIP
+--     only from the driver (SEATK.not_driver logs a refusal). Log lines:
+--     "driver only:".
 --   Refuel / repair (every machine): the game's own flow where the key was
 --     pressed (option, timer bar, montage, hold). Its last step cannot take
---     the gas can / repair kit on a client (the host's data): the client's
---     note of that asks the host (VFUEL / VREPAIR), which takes the item from
+--     the gas can / repair kit on a client (the host's data): the client asks
+--     the host (VFUEL / VREPAIR) - from the game's note of that, UseGasCan's
+--     hook (refuel) or, as the note never reached the mod in the game (13.11:
+--     no client repair ever asked), its tick at the hold's end (fx.hold_end:
+--     time up, the game's flag down, nothing added, not outside the box;
+--     one ask per hold) - and the host takes the item from
 --     that player's inventory, adds the fuel (FuelComponent.AddFuel) / health,
 --     sends the state to everyone and answers (VBOXR: the game's success step
 --     on the client's copy, or the game's note). Another player's
@@ -60,7 +92,9 @@
 --     spawns the car with the trader spawner's SpawnVehicle and answers
 --     VBUYR (ok / refused: shown in Russian, the host's money numbers sent).
 --   State (vehicle_state): the host sends each vehicle's colour, fuel,
---     health, lights, engine and "has a driver" (VSTATE); clients apply them
+--     health, lights, engine and "has a driver" (VSTATE: per client, only
+--     the vehicles within ~200 m of its character, packed into one message
+--     a tick, see vsync); clients apply them
 --     and show other players' driving: engine sound + RPM timer, sit montage,
 --     InVehicle? for the AnimBP, weapons hidden, and the vehicle mesh ignoring
 --     the attached characters (Pawn / Camera, as the game does on entry).
@@ -88,7 +122,8 @@ local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 
 local M = {
-    stats = { enters = 0, passengers = 0, exits = 0, rejected = 0, promoted = 0, relays = 0,
+    -- promoted: a passenger took the wheel (its seat key); switches: every seat key move
+    stats = { enters = 0, passengers = 0, exits = 0, rejected = 0, promoted = 0, switches = 0, relays = 0,
               states_sent = 0, states_applied = 0, ghosts = 0, spawners = 0, buys = 0,
               stray_vi = 0, stray_exits = 0, inv_keys = 0, inv_fixed = 0, inv_lost = 0 },
 }
@@ -99,6 +134,10 @@ local S = nil   -- sdc_session.state
 -- module's pieces in M.install and run from tick / reset / the handlers (a
 -- field, not a local: this chunk is at Lua's 200-locals limit).
 M.radio = require("sdc_vehradio")
+-- The seats of a vehicle (config vehicle_seats): the table per class, the
+-- seat a newcomer gets, where it is, the seat messages' fields, the host's
+-- console command sdcoop_seat (a field too).
+M.vseats = require("sdc_vehseats")
 
 -- ---------------------------------------------------------------------------
 -- Constants
@@ -139,6 +178,7 @@ local TEXT = {
                         "Покупка отменена: на хосте у вас %d денег, машина стоит %d." },
     veh_buy_failed  = { "The vehicle purchase did not go through on the host (%s).",
                         "Покупка машины не прошла на хосте (%s)." },
+    veh_driver_only = { "Only the driver uses the lights and the horn.", "Фарами и сигналом управляет только водитель." },
 }
 for k, v in pairs(TEXT) do
     if not log.TEXT[k] then log.TEXT[k] = v end
@@ -256,16 +296,17 @@ local function vehicle_by(a, name)
 end
 
 -- The copy of one vehicle on this machine: nearest, same class preferred.
--- (VSTATE on a client: ~25 vehicles per message; the location in one call,
--- the class from discover's cache)
+-- (a packed VSTATE matches several records against one list: the location
+-- in one call, the class from discover's cache; `nodisc`: the caller keeps
+-- the list fresh itself)
 local function loc_xyz(v)
     local l = v:K2_GetActorLocation()
     return l.X, l.Y, l.Z
 end
 
-local function vehicle_at(x, y, z, cls, maxd)
+local function vehicle_at(x, y, z, cls, maxd, nodisc)
     if not (x and y and z) then return nil end
-    discover(false)
+    if not nodisc then discover(false) end
     local best, bestd = nil, (maxd or MATCH_M) ^ 2
     for _, v in ipairs(cur.list) do
         if ue.valid(v) then
@@ -286,7 +327,7 @@ end
 local function chars()
     local t = {}
     -- (shared with the other ticks for a quarter second)
-    for _, c in ipairs(((ue.find_all_recent or ue.find_all)(CHAR_CLASS) or {})) do
+    for _, c in ipairs(ue.find_all_recent(CHAR_CLASS) or {}) do
         if ue.valid(c) and not ue.short(c):find("^Default__") then t[#t + 1] = c end
     end
     return t
@@ -362,7 +403,15 @@ local function engine_sound(v, run)
     if not ue.valid(snd) then return false end
     local active = ue.try(function() return snd:IsActive() end) == true
     if run then
-        if not active then pcall(function() snd:Activate(true) end) end
+        -- A FadeOut (the game's exit @23409, its death in a vehicle @9456,
+        -- stop_services) keeps the component active until the sound has
+        -- faded, 2.5 s: GetPlayState() is then FadingOut (4). Started again
+        -- at once (Activate(true) restarts it): a car that keeps its driver
+        -- went quiet for ~3 s on the host after the host's refused get-in or
+        -- its exit as a passenger (up to 0.7.3).
+        if not active or ue.try(function() return snd:GetPlayState() end) == 4 then
+            pcall(function() snd:Activate(true) end)
+        end
         if not timer_active(v, "VehicleSound") then set_timer(v, "VehicleSound", 0.2) end
     else
         if active then pcall(function() snd:FadeOut(2.5, 0, 0) end) end
@@ -427,22 +476,44 @@ local function strip_tags(v)
     end)
 end
 
+-- The sit montage. The host may load it once (a host that never ran an entry
+-- itself); a client takes it only from memory (no synchronous load there: it
+-- is in memory once that machine ran any get-in).
 local sit = { obj = nil, tried = false }
 local function sit_montage()
     if sit.obj and ue.valid(sit.obj) then return sit.obj end
-    sit.obj = ue.find_object(SIT_MONTAGE)
-    if not sit.obj and not sit.tried and LoadAsset then
-        -- a machine that never ran an entry (a client watching the host)
+    if S and S.role == "host" and not sit.tried then
         sit.tried = true
-        pcall(LoadAsset, SIT_MONTAGE)
-        sit.obj = ue.find_object(SIT_MONTAGE)
+        ue.load_asset(SIT_MONTAGE, "vehicles")
     end
+    sit.obj = ue.loaded_asset(SIT_MONTAGE, "vehicles")
     return sit.obj
+end
+
+-- A seat's pose (sdc_vehseats: "car" | "floor"): Chr_SittingFloor_Montage
+-- for "floor" (the game's own sit-down pose, BP_PlayerCharacter @58424; same
+-- loading rule as the sit montage; its Sitting? / regeneration branch is not
+-- touched), Chr_SitInCar otherwise or when it is not in memory.
+sit.FLOOR = "/Game/Character/Anims/Interaction/Chr_SittingFloor_Montage.Chr_SittingFloor_Montage"
+function sit.pose(pose)
+    if pose == "floor" then
+        if not (sit.floor and ue.valid(sit.floor)) then
+            if S and S.role == "host" and not sit.floor_tried then
+                sit.floor_tried = true
+                ue.load_asset(sit.FLOOR, "vehicles")
+            end
+            sit.floor = ue.loaded_asset(sit.FLOOR, "vehicles")
+        end
+        if sit.floor and ue.valid(sit.floor) then return sit.floor end
+    end
+    return sit_montage()
 end
 
 local function playing_sit(ch)
     local m = ue.try(function() return ch:GetCurrentMontage() end)
-    return ue.valid(m) and ue.short(m):find("SitInCar", 1, true) ~= nil, m
+    if not ue.valid(m) then return false, m end
+    local s = ue.short(m)
+    return s:find("SitInCar", 1, true) ~= nil or s:find("SittingFloor", 1, true) ~= nil, m
 end
 
 local function stop_sit(ch)
@@ -518,11 +589,15 @@ end
 -- Host state
 -- ---------------------------------------------------------------------------
 
--- vs[vehicle address] = { name, cls, driver_key, pass_key, host_seat,
---   scope_key, scope_till, host_till, released_till, watch, dirty, sig,
---   sent_at, upd, push_at }
+-- vs[vehicle address] = { name, cls, driver_key, pax = { [seat] = client key }
+--   (the passengers, seats 2+; sdc_vehseats), host_seat ("driver" |
+--   "passenger"), host_idx / host_geo (the host's passenger seat and its
+--   geometry), scope_key, scope_till, host_till, released_till, watch,
+--   dirty, sig, got, occ_got, sent_at, upd, push_at }
 local vs = {}
--- seats[remote pc key] = { vaddr, vname, seat = "driver" | "passenger", at, accept }
+-- seats[remote pc key] = { vaddr, vname, seat = "driver" | "passenger", idx (1
+--   = driver; nil = 2), geo (its seat's geometry, a copy), cap (knows seats
+--   3+: VENTER "s2"), at, accept }
 local seats = {}
 local watch_n = 0
 local outer_cache = {}
@@ -534,9 +609,10 @@ local function state_for(a, v)
     local st = vs[a]
     local name = ue.short(v)
     if not st or st.name ~= name then
-        st = { name = name, cls = ue.class_name(v) }
+        st = { name = name, cls = ue.class_name(v), pax = {} }
         vs[a] = st
     end
+    st.pax = st.pax or {}
     return st
 end
 
@@ -615,13 +691,74 @@ local SEATK = {
     place_after = 1.5, place_every = 3,   -- s: client seat placement from VSTATE
     near = 800,                           -- cm: interact diagnostics
     helper = "/Game/JigSInventory/Jigsaw/Components/BP_JigHelperComp.BP_JigHelperComp_C",
+    -- CheckCanExitCarDriverSide / PassengerSide (@336 / @113): a capsule
+    -- r 30, half height 50, TraceTypeQuery1 (Visibility) at the door socket
+    door = { r = 30, half = 50, chan = 0, color = { R = 0, G = 0, B = 0, A = 0 } },
 }
 
+-- The door a player the mod puts out of a car steps out of (Event_ExitVehicle
+-- places player 0 at the socket GetOutPasseenger names, without a check, and
+-- resets the flag, @23482..24254). As the game's ExitVehicle picks it: the
+-- driver side unless something stands there, then the passenger side if
+-- that is free. Both blocked (the game would keep the player seated,
+-- "Cannot exit vehicle"; a refused player cannot stay): the driver side.
+-- Returns "d" / "p" and why. Up to 0.7.3 the refused host / client always
+-- went to the driver door, into a wall or the next car if it stood there.
+-- A seat 3+ (idx, geo: sdc_vehseats) gets out at its own door (its row's
+-- exit), moved back by the row's x - a rear seat at the rear door: its own
+-- side, else the other side, else the front doors; returns side, why, the
+-- point and free (true: checked free; false: all blocked - its own front
+-- door; nil: no trace).
+function SEATK.exit_side(v, ch, idx, geo)
+    local ksl = ue.ksl()
+    local d = SEATK.door
+    local function blocked_at(loc)
+        if not (ksl and loc) then return nil end
+        local ok, hit = pcall(function()
+            return ksl:CapsuleTraceSingle(v, loc, loc, d.r, d.half, d.chan, false, { ch }, 0, {}, true,
+                d.color, d.color, 0.0)
+        end)
+        if not ok or type(hit) ~= "boolean" then return nil end
+        return hit
+    end
+    if not (idx and idx >= 3 and geo) then
+        if not ksl then return "d", "no trace" end
+        local db = blocked_at(socket_loc(v, "DriverSide"))
+        if db ~= true then return "d", db == nil and "no trace" or "driver side free" end
+        if blocked_at(socket_loc(v, "PassengerSide")) == false then return "p", "driver side blocked" end
+        return "d", "both sides blocked"
+    end
+    local own = geo.exit == "p" and "p" or "d"
+    local other = own == "p" and "d" or "p"
+    local back = math.min(0, tonumber(geo.x) or 0)
+    local fwd = back ~= 0 and M.vseats.axis(v, "GetActorForwardVector") or nil
+    local function point(side, shifted)
+        local s = socket_loc(v, side == "p" and "PassengerSide" or "DriverSide")
+        if s and shifted and fwd then return { X = s.X + fwd.X * back, Y = s.Y + fwd.Y * back, Z = s.Z + fwd.Z * back } end
+        return s
+    end
+    if not ksl then return own, "no trace", point(own, true), nil end
+    for _, t in ipairs({ { own, true, "its own door" }, { other, true, "its own door blocked: the other side" },
+                         { own, false, "both doors of its row blocked: the front door" },
+                         { other, false, "both doors of its row blocked: the other front door" } }) do
+        local loc = point(t[1], t[2])
+        if loc then
+            local b = blocked_at(loc)
+            if b == false then return t[1], t[3], loc, true end
+            if b == nil then return own, "no trace", point(own, true), nil end
+        end
+    end
+    return own, "all doors blocked", point(own, false), false
+end
+
 -- Refuel / repair state of this machine's player (functions further down,
--- "Refuel / repair"). hold: { va, vname, kind, t0, till } while the game's
--- hold (RetriggerableDelay(Duration) -> UseGasCan / the repair kit) runs.
+-- "Refuel / repair"). holds[vehicle address] = { va, vname, kind, t0, till,
+-- dur, v0, has, out } while the game's hold (RetriggerableDelay(Duration) ->
+-- UseGasCan / the repair kit) runs and until a client's tick has looked at
+-- its end (fx.hold_end). One per vehicle, as the game's IsHeld and its delay:
+-- a player standing in the boxes of two cars runs a hold on each.
 local fx = {
-    hold = nil, stuck_since = nil, da = {}, box_log = {},
+    holds = {}, stuck_since = nil, da = {}, box_log = {},
     REFUEL = "Jig.InteractOptions.RefuelVehicle", REPAIR = "Jig.InteractOptions.RepairVehicle",
     GASCAN = "/Game/Inventory/Items/DataAssets/CraftingMaterials/Vehicle/DA_GasCan.DA_GasCan",
     KIT = "/Game/Inventory/Items/DataAssets/CraftingMaterials/Vehicle/DA_VehicleRepairKit.DA_VehicleRepairKit",
@@ -636,13 +773,15 @@ local fx = {
     NOTE_MSG = "Message_6_EED8ECA340EFC5752E4CA6B7B32FABBE",   -- S_NotificationDetails.Message
     asked = {},     -- [vehicle address .. kind] = os.clock() of this client's last ask
     ask_gap_s = 5,  -- s: one ask per hold (a hold lasts Duration, 10 s)
+    end_s = 0.4,    -- s past the hold's time before a client's tick looks at its end (fx.hold_end)
+    late_s = 2,     -- s past `till` with the game's flag still up: its last step never ran
 }
 
 -- Vehicle trader purchases (functions in "Vehicle trader"): asset paths and
 -- the Blueprint struct field names (S_UpdateCount, the Jig item, the
 -- DT_VehicleInfo "Trader" row).
 local buy = {
-    serial = 0, seen = {}, blocked = nil, spawn_hooked = false,
+    serial = 0, seen = {}, blocked = nil, spawn_hooked = false, spawn_tries = 0,
     MONEY = "/Game/Inventory/Items/DataAssets/Currency/DA_Money.DA_Money",
     DT = "/Game/Blueprints/Vehicles/Spawner/DT_VehicleInfo.DT_VehicleInfo",
     NOT_ACTOR = "/Script/CoreUObject.Object",
@@ -690,6 +829,16 @@ end
 -- state for it; if VehicleInteraction stopped half-way, run it again.
 local att = {}   -- [character address] = { vaddr, t, healed }
 
+-- Dead, or down (sdc_down's knockdown, any of its phases): no seat heal, no
+-- get-in; the host's tick unseats a downed client (VSEAT none|downed).
+function SEATK.out_cold(ch)
+    if ue.prop(ch, "PlayerDead?") == true then return true end
+    local dn = package.loaded["sdc_down"]
+    if type(dn) ~= "table" or type(dn.is_down) ~= "function" then return false end
+    local ok, v = pcall(dn.is_down, ch)
+    return ok and v == true
+end
+
 local function heal_seated(ch, v, who, held)
     local ca, va = addr(ch), addr(v)
     if not ca or not va then return end
@@ -700,7 +849,7 @@ local function heal_seated(ch, v, who, held)
         return
     end
     if t - r.t < SEATK.heal_after or t - (r.healed or -100) < SEATK.heal_every then return end
-    if ue.prop(ch, "PlayerDead?") == true then return end
+    if SEATK.out_cold(ch) then return end
     local inv, has = driving_state(ch, va)
     if inv and has then return end
     r.healed = t
@@ -787,7 +936,40 @@ local function unweld(ch, v)
     return ok and "re-attached unwelded" or "unweld FAILED"
 end
 
-local function seat_mark(ch, v, va, label, is_local)
+-- A seat 3+ taken (SEATK.rear_set; or three or more in one vehicle): the
+-- camera boom of a front seat passes through the players behind it, whose
+-- capsule / mesh would push the camera into the head - with two as well (the
+-- driver and seat 3 behind it, after the others got out). While so, another
+-- player's seated capsule and mesh ignore the Camera channel (as the vehicle
+-- mesh does for its seated players, @11114); back when they get out or only
+-- the front row is taken again. r.cam keeps the old responses by component
+-- name (no UObject kept).
+SEATK.CAM_PARTS = { "CapsuleComponent", "Mesh" }
+function SEATK.cam(ch, r, want)
+    if want and r.cam == nil then
+        local was = {}
+        for _, part in ipairs(SEATK.CAM_PARTS) do
+            local c = ue.prop(ch, part)
+            local cr = ue.valid(c) and ue.try(function() return c:GetCollisionResponseToChannel(ECC_CAMERA) end)
+            if type(cr) == "number" and cr ~= ECR_IGNORE then
+                was[part] = cr
+                pcall(function() c:SetCollisionResponseToChannel(ECC_CAMERA, ECR_IGNORE) end)
+            end
+        end
+        r.cam = was
+    elseif not want and r.cam ~= nil then
+        for part, cr in pairs(r.cam) do
+            local c = ue.prop(ch, part)
+            if ue.valid(c) then pcall(function() c:SetCollisionResponseToChannel(ECC_CAMERA, cr) end) end
+        end
+        r.cam = nil
+    end
+end
+
+-- pose: "car" | "floor" (the seat's, sdc_vehseats); crowd: three or more sit
+-- in this vehicle on this machine (SEATK.cam; nil: left as it is - the
+-- seat changes between ticks, seat_tick decides).
+local function seat_mark(ch, v, va, label, is_local, pose, crowd)
     local ca = addr(ch)
     if not ca then return end
     local name = ue.short(ch)
@@ -814,14 +996,16 @@ local function seat_mark(ch, v, va, label, is_local)
             ue.set_prop(mesh, "bOnlyAllowAutonomousTickPose", false)
         end
     end
-    local yes, m = playing_sit(ch)
-    if not yes then
-        local sm = sit_montage()
+    if not is_local and crowd ~= nil then SEATK.cam(ch, r, crowd) end
+    -- the seat's pose: started when another montage (or none) plays
+    local sm = sit.pose(pose)
+    local m = ue.try(function() return ch:GetCurrentMontage() end)
+    if not (sm and ue.valid(m) and ue.short(m) == ue.short(sm)) then
         if sm and pcall(function() ch:PlayAnimMontage(sm, 1.0, FName("None")) end) then
             r.sit_n = r.sit_n + 1
             if r.sit_n <= 3 or r.sit_n % 20 == 0 then
-                log.info("vehicles: pose: %s in %s: sit montage started here (%d; was playing %s)",
-                    label, r.vname, r.sit_n, ue.valid(m) and ue.short(m) or "nothing")
+                log.info("vehicles: pose: %s in %s: %s started here (%d; was playing %s)",
+                    label, r.vname, ue.short(sm), r.sit_n, ue.valid(m) and ue.short(m) or "nothing")
             end
         elseif not sm then
             info_once("nosit", "vehicles: pose: Chr_SitInCar_Montage not loaded here; seated players keep their pose")
@@ -842,6 +1026,7 @@ end
 local function seat_clear(ca, r, ch, label)
     seated[ca] = nil
     if not ch then return end
+    SEATK.cam(ch, r, false)
     local mesh = ue.prop(ch, "Mesh")
     if ue.valid(mesh) then
         if r.vis ~= nil then pcall(function() mesh:SetCollisionResponseToChannel(SEATK.vis, r.vis) end) end
@@ -865,15 +1050,26 @@ end
 local function seat_tick(list)
     local seen = {}
     local host = S and S.role == "host"
-    for _, ch in ipairs(list) do
+    -- who sits in which vehicle (one attachment read each), how many per
+    -- vehicle and which have a seat 3+ taken (SEATK.cam), whose seat has the
+    -- floor pose (SEATK.floor_set)
+    local pv, n_in = {}, {}
+    for i, ch in ipairs(list) do
         local va = parent_vehicle(ch)
+        pv[i] = va or false
+        if va then n_in[va] = (n_in[va] or 0) + 1 end
+    end
+    local floor = next(n_in) and SEATK.floor_set(list) or {}
+    local rear = next(n_in) and SEATK.rear_set() or {}
+    for i, ch in ipairs(list) do
+        local va = pv[i] or nil
         local v = va and cur.by[va]
         local ca = addr(ch)
         if ca and v and ue.valid(v) then
             seen[ca] = true
             local is_local = locally_controlled(ch)
             local first = not seated[ca] or seated[ca].vaddr ~= va
-            seat_mark(ch, v, va, char_label(ch), is_local)
+            seat_mark(ch, v, va, char_label(ch), is_local, floor[ca] and "floor" or "car", n_in[va] >= 3 or rear[va] == true)
             if not host and not is_local then
                 if ue.prop(ch, "InVehicle?") ~= true then ue.set_prop(ch, "InVehicle?", true) end
                 if first then pcall(function() ch:SetWeaponsAndBackpackVisibility(true) end) end
@@ -893,6 +1089,11 @@ local function seat_tick(list)
             if ch then seat_clear(ca, r, ch, char_label(ch)) else seated[ca] = nil end
         end
     end
+    -- seat-heal records of characters that sit nowhere now (out, or gone
+    -- while seated: a client that left had no character to forget)
+    for ca in pairs(att) do
+        if not seen[ca] then att[ca] = nil end
+    end
 end
 
 -- The game's own replicated stop (BPI_Player.StopMontage -> Svr_StopMontage
@@ -901,6 +1102,8 @@ end
 local function stop_sit_everywhere(ch)
     local sm = sit_montage()
     if ch and sm then pcall(function() ch:StopMontage(sm, false) end) end
+    -- (a floor seat's pose: only once that montage was in use here)
+    if ch and sit.floor and ue.valid(sit.floor) then pcall(function() ch:StopMontage(sit.floor, false) end) end
 end
 
 -- The host is pressing the interact key on this vehicle right now
@@ -934,7 +1137,9 @@ local function vehicle_context(wco, a0)
     local c = outer_cache[a]
     if c == nil then
         c = false
-        local o = ue.try(function() return wco:GetOuter() end)
+        -- ue.valid first: GetOuter on a null object (address 0, not nil)
+        -- crashes the game, pcall cannot catch it
+        local o = ue.valid(wco) and ue.try(function() return wco:GetOuter() end) or nil
         local oa = ue.valid(o) and addr(o)
         if oa and vs[oa] then c = oa end
         outer_cache[a] = c
@@ -984,8 +1189,8 @@ local function resolve(wco, a0)
         -- the host's own refuel / repair hold on it: UseGasCan / the repair
         -- kit (@1887 / @1923, Duration after the press) and the timer bar's
         -- GetGameHUD (every 0.01 s) are the host's, not the driver's
-        local h = fx.hold
-        if h and h.va == a and t < h.till then return false end
+        local h = fx.holds[a]
+        if h and t < h.till then return false end
         -- the host sits in it (as a passenger): its own exit / input is the host's
         if host_seated(a) then return false end
         local pc = remote_pc_of(st.driver_key)
@@ -1105,8 +1310,10 @@ end
 -- it in self.VehicleUI, over any earlier one; the exit removes only
 -- self.VehicleUI (@23977, then None @23318). A second get-in without an exit
 -- leaves the first panel on screen for good. Here: a panel only for this
--- machine's player, only for the vehicle it sits in.
-local hud = { next_at = -100, logged = {} }
+-- machine's player, only for the vehicle it sits in. The once-a-second
+-- safety net (a FindAllOf) runs only while this player sits, and AFTER_S
+-- after it got out or after any seat event (hud.check).
+local hud = { next_at = -100, logged = {}, until_at = -100, AFTER_S = 10 }
 
 function hud.widgets()
     local out = {}
@@ -1137,7 +1344,7 @@ function hud.prune(keep, why)
 end
 
 -- This machine's player: the panel of the vehicle it sits in, or none.
-function hud.check(why)
+function hud.scan(why)
     local lp = ue.local_pawn()
     local la = lp and parent_vehicle(lp)
     local v = la and cur.by[la]
@@ -1150,21 +1357,115 @@ function hud.check(why)
     return hud.prune(nil, why)
 end
 
--- Safety net, at most once a second.
+-- A seat event (get-in, exit, refusal, a seat ended): check now, and keep
+-- the safety net on for AFTER_S.
+function hud.check(why)
+    hud.until_at = math.max(hud.until_at, os.clock() + hud.AFTER_S)
+    return hud.scan(why)
+end
+
+-- Safety net, at most once a second, only while this machine's player sits
+-- or AFTER_S after it sat (0.7.3: a FindAllOf every second on every machine,
+-- 0.5-0.7 ms/s, almost always finding nothing).
 function hud.tick()
     local t = os.clock()
     if t < hud.next_at then return end
     hud.next_at = t + 1
-    hud.check("left on screen: this player sits in no vehicle, or it is another vehicle's panel")
+    local lp = ue.local_pawn()
+    if lp and parent_vehicle(lp) then hud.until_at = t + hud.AFTER_S end
+    if t >= hud.until_at then return end
+    hud.scan("left on screen: this player sits in no vehicle, or it is another vehicle's panel")
 end
 
 local host_seat_driver   -- forward (promotion calls it from host_unseat)
 
-local function send_seat(pc, kind, extra)
-    if pc then net.send_to(pc, "VSEAT", kind, extra or "") end
+-- VSEAT|kind|extra|... (the seat fields of sdc_vehseats.vseat_fields)
+local function send_seat(pc, kind, extra, ...)
+    if pc then net.send_to(pc, "VSEAT", kind, extra or "", ...) end
 end
 
-host_seat_driver = function(key, pc, ch, v, st, why)
+-- The seats that count for remote player `key` in this vehicle (`cap`: it
+-- knows seats 3+; nil = its record's).
+function SEATK.layout(st, key, cap)
+    local seat = key and seats[key]
+    if cap == nil then cap = seat and seat.cap end
+    return M.vseats.layout(st.cls, { cap = cap == true, passengers = on("vehicle_passengers") })
+end
+
+-- Somebody besides remote player `key` sits in vehicle a.
+function SEATK.others(a, st, key)
+    for _, k in pairs(st.pax or {}) do
+        if k ~= key then return true end
+    end
+    return host_seated(a)
+end
+
+-- VSEAT passenger: the driver's name, the seat, its geometry (the client
+-- sits where the host put it). tell = false: the same seat again, no notice.
+-- Nobody at the wheel (a move by the seat key while it is free, K10): no
+-- name - the client says "Seat N of M: nobody drives" (up to then the
+-- host's name, also with the host out of the car).
+function SEATK.tell_pass(pc, st, key, idx, geo, tell, driver_name)
+    local lay = SEATK.layout(st, key)
+    local seat = seats[key]
+    local dn = driver_name or (st.driver_key and name_of(st.driver_key))
+        or ((seat and host_seated(seat.vaddr) and st.host_seat ~= "passenger") and cfg.player_name()) or ""
+    send_seat(pc, "passenger", dn, table.unpack(M.vseats.vseat_fields(idx, lay.rank[idx] or idx, lay.count, geo, tell)))
+end
+
+-- VSEAT driver: "Seat 1 of M" only in a car of more than 2 seats with
+-- somebody else in it (a driver alone is told nothing, as before).
+function SEATK.tell_driver(pc, st, key, a, tell)
+    local lay = SEATK.layout(st, key)
+    if tell == nil then tell = lay.count > 2 and SEATK.others(a, st, key) end
+    send_seat(pc, "driver", "", table.unpack(M.vseats.vseat_fields(1, 1, lay.count, M.vseats.SEAT1, tell)))
+end
+
+-- The host sits in the car a client now takes the wheel of (a passenger
+-- with its seat key, or a client getting in while the host sits as a
+-- passenger): the
+-- get-in's delayed step (VehicleInteraction(true) on player 0 0.1 s later,
+-- @1706..1818) runs now for the new driver, and that client's player-0
+-- window closes at once. Kept open for the game's step, the window also took
+-- the host's own exit key (ExitVehicle asks for player 0 as that step does,
+-- the two cannot be told apart): the game's exit ran for the new driver (out
+-- of the car), the host stayed seated, 2 s later the driver was put out for
+-- good and the host moved to the wheel (3-4 players getting out together;
+-- up to 0.8.1 also with two). The game's own step still comes, to whoever player 0 is
+-- then: the host in its seat (it has that driving state already;
+-- SEATK.step_seen), the new driver again, or the host who got out in
+-- between (undone in on_vi_post).
+function SEATK.early_step(v, a, st, key, ch)
+    if parent_vehicle(ch) ~= a then return end
+    apply(function() ch:VehicleInteraction(true, v) end)
+    st.scope_till = os.clock()
+    st.step_till = os.clock() + SCOPE_S
+    log.info("vehicles: seat: the host sits in %s: the get-in's delayed step ran now for %s, its player-0 window closed (the host's own exit stays the host's)",
+        st.name, name_of(key))
+end
+
+-- The game's own delayed step of a get-in that SEATK.early_step ran already
+-- reached the host. In its seat it changed only the camera: the step plays
+-- the boom timeline from its start (@63193: the on-foot length, then out
+-- again), so it goes back to its end (the seated length). Out of the car
+-- (in_seat false) on_vi_post undid it.
+function SEATK.step_seen(hp, st, in_seat)
+    st.step_till = nil
+    local how = "undone (it got out in between)"
+    if in_seat then
+        local tl = ue.prop(hp, "TL_VehicleCameraArmLength")
+        local len = ue.valid(tl) and ue.try(function() return tl:GetTimelineLength() end)
+        local ok = type(len) == "number" and pcall(function() tl:SetNewTime(len) end)
+        how = "kept (it sits there); camera " .. (ok and "back at its seated length" or "left to the game")
+    end
+    log.info("vehicles: seat: the game's get-in step for the new driver of %s reached the host (expected, it ran for the driver already): %s",
+        st.name, how)
+end
+
+-- `cap`: the client knows seats 3+ (nil: as its record says); `tell`: nil =
+-- SEATK.tell_driver decides, "later" = no VSEAT here (the caller sends it
+-- once it checked the seat: SEATK.take_wheel). Returns the game's get-in's ok.
+host_seat_driver = function(key, pc, ch, v, st, why, cap, tell)
     local a = addr(v)
     st.driver_key = key
     st.scope_key, st.scope_till = key, os.clock() + SCOPE_S
@@ -1174,6 +1475,10 @@ host_seat_driver = function(key, pc, ch, v, st, why)
     local seat = seats[key] or {}
     seats[key] = seat
     seat.vaddr, seat.vname, seat.seat, seat.at = a, st.name, "driver", os.clock()
+    seat.idx, seat.geo = 1, nil
+    if cap ~= nil then seat.cap = cap end
+    M.vseats.drop(st, key)
+    SEATK.took(st, name_of(key))
     hold_position(ch, seat)
     local old_ui = ue.prop(v, "VehicleUI")
     if not ue.valid(old_ui) then old_ui = nil end
@@ -1183,6 +1488,10 @@ host_seat_driver = function(key, pc, ch, v, st, why)
     clear_area_flags(v, false)
     local ok, err = apply(function() v:Interact_GetInVehicle() end)
     clear_area_flags(v, false)
+    -- the host sits in this car: its own exit key must not meet this
+    -- client's player-0 window (the attachment: right after the host's own
+    -- exit as the driver its InVehicle? is still set, and its key is done)
+    if host_was then SEATK.early_step(v, a, st, key, ch) end
     drop_new_ui(v, host_seated(a) and old_ui or nil)
     hud.check("the game's get-in for " .. name_of(key) .. " ran on this machine")
     if parent_vehicle(ch) ~= a then
@@ -1193,25 +1502,41 @@ host_seat_driver = function(key, pc, ch, v, st, why)
         if hp then pcall(function() hp:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end) end
         log.err("vehicles: the game's entry for %s attached the HOST to %s; detached again", name_of(key), st.name)
     end
-    -- the game welded the character: unweld now, so its seat replicates
+    -- the game welded the character: unweld now, so its seat replicates (a
+    -- passenger taking the wheel was unwelded in its seat already: the
+    -- get-in welded it again, so its record's "unwelded" goes first - up to
+    -- 0.8.1 a promoted passenger stayed welded: the others saw it at its old
+    -- seat or under the car)
+    local r = seated[addr(ch) or -1]
+    if r then r.unwelded = nil end
     if parent_vehicle(ch) == a then seat_mark(ch, v, a, name_of(key), false) end
     local req = set_requires(v, true)
     keep_awake(v, st)
     st.dirty = true
     M.stats.enters = M.stats.enters + 1
-    send_seat(pc, "driver")
+    if tell ~= "later" then SEATK.tell_driver(pc, st, key, a, tell) end
     seat_log(name_of(key), st.name, "driver", why or "driver seat free")
     log.info("vehicles: %s drives %s (game entry ok=%s%s, replicated inputs=%s, owner set)",
         name_of(key), st.name, tostring(ok), ok and "" or (" " .. tostring(err)), tostring(req))
+    return ok
 end
 
-local function host_seat_passenger(key, pc, ch, v, st, driver_name, why)
+-- idx: the seat (2.., sdc_vehseats); cap: the client knows seats 3+.
+local function host_seat_passenger(key, pc, ch, v, st, driver_name, why, idx, cap)
     local a = addr(v)
-    local loc, rot = seat_transform(v, true)
+    idx = idx or 2
+    local geo = M.vseats.geo(st.cls, idx) or M.vseats.geo(st.cls, 2)
+    local loc, rot = M.vseats.xf_geo(v, geo)
+    if not loc then
+        loc, rot = seat_transform(v, true)
+        if idx > 2 then log.warn("vehicles: seat %d of %s has no world position here; %s put in the mirror seat", idx, st.name, name_of(key)) end
+    end
     local seat = seats[key] or {}
     seats[key] = seat
     seat.vaddr, seat.vname, seat.seat, seat.at = a, st.name, "passenger", os.clock()
-    st.pass_key = key
+    seat.idx, seat.geo = idx, geo
+    if cap ~= nil then seat.cap = cap end
+    M.vseats.set(st, idx, key)
     hold_position(ch, seat)
     -- the game's driving state first (InVehicle?, its Vehicle): then the
     -- seat's overlap with the fuel / repair box no longer counts this player
@@ -1220,55 +1545,182 @@ local function host_seat_passenger(key, pc, ch, v, st, driver_name, why)
     -- not welded: a welded seat would not replicate (see "Seated characters")
     pcall(function() ch:K2_AttachToActor(v, FName("None"), KEEP_WORLD, KEEP_WORLD, KEEP_WORLD, false) end)
     if loc then pcall(function() ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
-    local m = sit_montage()
+    local m = sit.pose(geo.pose)
     if m then pcall(function() ch:PlayMontage(m, 1.0) end) end
     clear_area_flags(v, false)
-    if parent_vehicle(ch) == a then seat_mark(ch, v, a, name_of(key), false) end
+    if parent_vehicle(ch) == a then seat_mark(ch, v, a, name_of(key), false, geo.pose) end
     set_collision(v, true)
     st.dirty = true
     M.stats.passengers = M.stats.passengers + 1
-    send_seat(pc, "passenger", driver_name)
-    seat_log(name_of(key), st.name, "passenger", why or (tostring(driver_name) .. " drives"))
-    log.info("vehicles: %s sits as a passenger in %s next to %s (seat %s)", name_of(key), st.name,
-        tostring(driver_name), loc and string.format("%.0f,%.0f,%.0f", loc.X, loc.Y, loc.Z) or "?")
+    SEATK.tell_pass(pc, st, key, idx, geo, true, driver_name)
+    seat_log(name_of(key), st.name, "passenger seat " .. idx, why or (tostring(driver_name) .. " drives"))
+    log.info("vehicles: %s sits as a passenger in %s next to %s (seat %d at %s)", name_of(key), st.name,
+        tostring(driver_name), idx, loc and string.format("%.0f,%.0f,%.0f", loc.X, loc.Y, loc.Z) or "?")
 end
 
--- Driver left: a passenger takes the driver seat.
-local function promote(v, st)
-    local a = addr(v)
-    if host_attached(a) and st.host_seat == "passenger" then
-        local hp = ue.local_pawn()
-        local loc, rot = seat_transform(v, false)
-        if hp and loc then pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
-        st.host_seat = "driver"
-        -- the client's Event_ExitVehicle stopped what the host's own entry
-        -- started; as @7820 the handbrake goes off for the new driver
-        local m = mcomp(v)
-        if m then
-            pcall(function() m:SetHandbrakeInput(false) end)
-            pcall(function() m:SetBrakeInput(0) end)
-        end
-        host_services(v)
-        M.stats.promoted = M.stats.promoted + 1
-        seat_log("host", st.name, "driver", "the driver left; the passenger takes the wheel")
-        return
-    end
-    local pkey = st.pass_key
-    if not pkey then return end
-    local pc = remote_pc_of(pkey)
-    local ch = pc and ue.pawn_of(pc)
-    if not (pc and ch and parent_vehicle(ch) == a and can_redirect(pc)) then
-        log.info("vehicles: seat: passenger %s stays a passenger in %s (cannot take the wheel here)", name_of(pkey), st.name)
-        return
-    end
-    st.pass_key = nil
-    local seat = seats[pkey]
-    if seat then seat.seat = "driver" end
+-- Client `key` in seat idx takes the wheel (its seat key, nobody drives:
+-- SEATK.client_switch) through the game's get-in (player 0 = that client).
+-- Checked after: the client at the wheel, a host passenger still in its own
+-- seat. A get-in that seated the host instead (the player-0 redirect did not
+-- work: with the host in the car the older checks in host_seat_driver cannot
+-- see it) is undone - the client back in its seat, the host in its own,
+-- nobody drives. Returns true when the client drives.
+function SEATK.take_wheel(v, a, st, key, pc, ch, idx)
+    local seat = seats[key]
+    local geo = (seat and seat.geo) or M.vseats.geo(st.cls, idx)
+    local hp = ue.local_pawn()
+    local hidx = M.vseats.host_idx(st)
+    local h0 = hidx and hp and host_attached(a) and ue.location(hp) or nil
+    local waited = st.wheel_wait
     M.stats.promoted = M.stats.promoted + 1
-    host_seat_driver(pkey, pc, ch, v, st, "the driver left; the passenger takes the wheel")
+    -- (its VSEAT driver only once the check passed: a client told "you now
+    -- drive" and put back in its seat a moment later kept that wrong notice)
+    host_seat_driver(key, pc, ch, v, st, string.format("the passenger in seat %d takes the free wheel (its seat key)", idx), nil, "later")
+    local near = M.vseats.NEAR * M.vseats.NEAR
+    local l1, cl = seat_transform(v, false), ue.location(ch)
+    local ok_c = not (l1 and cl) or d2(l1, cl) <= near
+    local h1 = h0 and ue.location(hp)
+    local ok_h = not (h0 and h1) or d2(h0, h1) <= near
+    if ok_c and ok_h then
+        SEATK.tell_driver(pc, st, key, a, nil)
+        return true
+    end
+    log.err("vehicles: seat: the game's get-in for %s (seat %d of %s) did not seat it at the wheel (it is %s cm from the wheel, the host moved %s cm): undone, %s stays a passenger",
+        name_of(key), idx, st.name, l1 and cl and f0(math.sqrt(d2(l1, cl))) or "?", h0 and h1 and f0(math.sqrt(d2(h0, h1))) or "0",
+        name_of(key))
+    st.driver_key, st.scope_key = nil, nil
+    st.released_till = os.clock() + RELEASE_S
+    -- (the wheel free again: still waited for, SEATK.took)
+    if waited then st.took_at, st.wheel_wait = nil, true end
+    pcall(function() v:SetOwner(nil) end)
+    set_requires(v, false)
+    local m = mcomp(v)
+    if m and st.upd ~= nil then ue.set_prop(m, "bUpdateOnlyIfRendered", st.upd) end
+    st.upd = nil
+    if seat then
+        seat.seat, seat.idx, seat.geo = "passenger", idx, geo
+        M.vseats.set(st, idx, key)
+        local loc, rot = M.vseats.xf_geo(v, geo)
+        if loc then pcall(function() ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
+        SEATK.tell_pass(pc, st, key, idx, geo, false)
+    end
+    if h0 then
+        local hl, hr = M.vseats.xf_geo(v, st.host_geo or M.vseats.geo(st.cls, hidx))
+        if hl then pcall(function() hp:K2_SetActorLocationAndRotation(hl, hr, false, {}, true) end) end
+        local r = seated[addr(hp) or -1]
+        if r then r.unwelded = nil end
+        if host_attached(a) then seat_mark(hp, v, a, "host", true) end
+    end
+    st.dirty = true
+    recount_watch()
+    return false
 end
 
--- opts: side ("p" = passenger side), tell (send VSEAT none), reason
+-- The driver left (its exit key, death, disconnect, a record that ended)
+-- with somebody still in the car: every passenger stays in its seat (the
+-- user, 13.11: "the player should stay in the seat it sat in and move only
+-- with a key"; up to then the lowest seat was moved to the wheel 1.5 s
+-- later - also a passenger that was getting out itself). The car stands as
+-- the game's own exit leaves it: engine sound and timers off, no fuel spent,
+-- handbrake on (the collision stays the occupied car's) until somebody
+-- drives - a newcomer (the wheel is the first free seat) or a passenger with
+-- its seat key (SEATK.host_key / client_switch). The passengers are told
+-- once: the host on its screen, a client that knows the key (VENTER "sw")
+-- by VSWR wheel; an older client is not moved and not told (it gets out
+-- and in again). A host passenger's own driving keys would still reach its
+-- copy of a car nobody drives: held parked every frame (SEATK.hold_frame).
+function SEATK.wheel_free(v, st, why)
+    local a = addr(v)
+    -- somebody holds the wheel (the host, beside which a remote driver record
+    -- just ended: demote_remote_driver), or nobody is left inside: nothing to
+    -- do. The host keeps driving: that record's Event_ExitVehicle stopped the
+    -- car's engine sound and timers - the host's car's (a remote driver's are
+    -- re-asserted each tick).
+    if st.driver_key then return end
+    local host_in_car = host_attached(a)
+    if host_in_car and st.host_seat ~= "passenger" then return host_services(v) end
+    if not (M.vseats.any(st) or host_in_car) then return end
+    stop_services(v, true)
+    st.dirty = true
+    st.wheel_wait = true   -- (SEATK.took)
+    local told = {}
+    for _, o in ipairs(M.vseats.occupants(st)) do
+        if o.who == "host" then
+            if host_in_car then
+                SEATK.hold_va = a
+                SEATK.say_wheel_free()
+                told[#told + 1] = "host"
+            end
+        else
+            local seat = seats[o.who]
+            local pc = remote_pc_of(o.who)
+            if pc and seat and seat.sw then
+                net.send_to(pc, "VSWR", "wheel")
+                told[#told + 1] = name_of(o.who)
+            end
+        end
+    end
+    log.info("vehicles: seat: the driver left %s (%s): passengers %s stay in their seats; parked (engine off, handbrake on) until somebody drives (told: %s)",
+        st.name, tostring(why), SEATK.seats_text(st), #told > 0 and table.concat(told, ", ") or "nobody - older clients only")
+end
+
+-- This machine's player (the host) told the wheel is free: with its seat
+-- key's name (none set: get out and in again).
+function SEATK.say_wheel_free()
+    local _, name = SEATK.key()
+    if name then log.say("veh_wheel_free", "info", 6, name) else log.say("veh_wheel_free_nokey", "info", 6) end
+end
+
+-- The host (a passenger, nobody drives) to the wheel with its seat key: it
+-- moves there (no get-in: the game's driving state is its own already, from
+-- its own get-in), the services the game's get-in starts for a driver run
+-- again and, as @7820, the handbrake goes off. "Seat 1 of M" in a car of more
+-- than 2, else "You now drive this vehicle".
+function SEATK.host_wheel(v, a, st, from)
+    local hp = ue.local_pawn()
+    local loc, rot = seat_transform(v, false)
+    if not (hp and loc) then return false end
+    pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+    st.host_seat, st.host_idx, st.host_geo = "driver", nil, nil
+    SEATK.took(st, cfg.player_name())
+    SEATK.hold_va = nil
+    local m = mcomp(v)
+    if m then
+        pcall(function() m:SetHandbrakeInput(false) end)
+        pcall(function() m:SetBrakeInput(0) end)
+    end
+    set_requires(v, false)
+    host_services(v)
+    -- (a floor seat's pose back to the driver's)
+    seat_mark(hp, v, a, "host", true, "car")
+    st.dirty = true
+    M.stats.promoted = M.stats.promoted + 1
+    M.stats.switches = M.stats.switches + 1
+    local n = M.vseats.layout(st.cls, { host = true }).count
+    if n > 2 then log.say("veh_seat_driver", "info", 5, n) else log.say("veh_driver_now", "info", 4) end
+    seat_log("host", st.name, "driver", string.format("its seat key in seat %s: the wheel was free", tostring(from)))
+    recount_watch()
+    return true
+end
+
+-- A passenger's seat ended (host_unseat) and the car is empty now: nobody at
+-- the wheel, no other passenger, not the host. Parked as the game's exit
+-- leaves an empty car - collision back, drive tags off (the driver's exit
+-- had left the car "occupied" for the passengers; without this the host and
+-- zombies walked through the empty car until the next get-in).
+function SEATK.park_empty(v, st, a)
+    if st.driver_key or M.vseats.any(st) or host_attached(a) then return end
+    stop_services(v, false)
+    st.dirty = true
+    st.wheel_wait = nil
+    log.info("vehicles: seat: %s: the last passenger out, nobody at the wheel: parked (engine off, handbrake on, collision back)", st.name)
+end
+
+-- opts: side ("p" = passenger side), tell (send VSEAT none), reason, count
+-- (the seats it had: "none|full|M"), exit_key (a driver's own exit key;
+-- either way its passengers stay in their seats: SEATK.wheel_free), taken
+-- (a driver's record: the host takes the wheel right after - no "wheel
+-- free" for anyone: SEATK.host_key)
 local function host_unseat(key, why, opts)
     opts = opts or {}
     local seat = seats[key]
@@ -1279,9 +1731,20 @@ local function host_unseat(key, why, opts)
     local pc = remote_pc_of(key)
     local ch = pc and ue.pawn_of(pc)
     local attached = ch ~= nil and v ~= nil and parent_vehicle(ch) == seat.vaddr
-    if seat.seat == "driver" then
+    -- A driver who left (disconnected) before the tick freed its seat: in
+    -- that half second has_driver let the next player take the wheel. The
+    -- car's driving state is the new driver's now: only this player's seat
+    -- ends (0.7.3: the late cleanup stopped the new driver's engine, took
+    -- its owner / inputs and promoted the passenger into the occupied
+    -- driver seat - two characters in one seat).
+    local other = seat.seat == "driver" and st ~= nil and st.driver_key ~= nil and st.driver_key ~= key
+    if other then
+        log.info("vehicles: seat: %s's driver seat in %s ended late: %s drives it now (its driving state stays)",
+            name_of(key), seat.vname, name_of(st.driver_key))
+    end
+    if seat.seat == "driver" and not other then
         if v then
-            local others = (st and st.pass_key ~= nil) or host_attached(seat.vaddr)
+            local others = (st ~= nil and M.vseats.any(st)) or host_attached(seat.vaddr)
             if attached and can_redirect(pc) then
                 if st then st.scope_key, st.scope_till = key, os.clock() + SCOPE_S end
                 recount_watch()
@@ -1325,15 +1788,24 @@ local function host_unseat(key, why, opts)
         end
         M.stats.exits = M.stats.exits + 1
     else
+        local idx = seat.idx or (st and M.vseats.idx_of(st, key)) or 2
         if attached and v then
             pcall(function() ch:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end)
-            local loc = socket_loc(v, "PassengerSide")
+            -- seat 2 at the passenger door (as before); a seat 3+ at its own
+            -- door, moved back to its row (the other side when that is blocked)
+            local loc, side_why = nil, nil
+            if idx >= 3 then
+                local _, sw, l = SEATK.exit_side(v, ch, idx, seat.geo or (st and M.vseats.geo(st.cls, idx)))
+                loc, side_why = l, sw
+            end
+            loc = loc or socket_loc(v, "PassengerSide")
             if loc then pcall(function() ch:K2_SetActorLocationAndRotation(loc, ue.rotation(ch), false, {}, false) end) end
+            if side_why then log.info("vehicles: seat: %s out of seat %d of %s at %s", name_of(key), idx, seat.vname, side_why) end
             stop_sit(ch)
             local cmc = ue.prop(ch, "CharacterMovement")
             if ue.valid(cmc) then pcall(function() cmc:SetMovementMode(MOVE_WALKING, 0) end) end
         end
-        if st and st.pass_key == key then st.pass_key = nil; st.dirty = true end
+        if st and M.vseats.drop(st, key) then st.dirty = true end
         M.stats.exits = M.stats.exits + 1
     end
     if ch then
@@ -1349,16 +1821,29 @@ local function host_unseat(key, why, opts)
         end
     end
     recount_watch()
-    if opts.tell then send_seat(pc, "none", opts.reason or why) end
-    seat_log(name_of(key), seat.vname, "out", "was " .. tostring(seat.seat) .. "; " .. tostring(why))
-    if seat.seat == "driver" and v and st then promote(v, st) end
+    if opts.tell then
+        if opts.count then
+            send_seat(pc, "none", opts.reason or why, tostring(opts.count))
+        else
+            send_seat(pc, "none", opts.reason or why)
+        end
+    end
+    seat_log(name_of(key), seat.vname, "out", "was " .. tostring(seat.seat)
+        .. (seat.seat == "passenger" and (" in seat " .. tostring(seat.idx or 2)) or "") .. "; " .. tostring(why))
+    if seat.seat == "driver" and v and st and not other then
+        if not opts.taken then SEATK.wheel_free(v, st, name_of(key) .. ": " .. tostring(why)) end
+    elseif v and st then
+        SEATK.park_empty(v, st, seat.vaddr)
+    end
 end
 
-local function host_reject(pc, why)
+-- count: the seats the refused player had (VSEAT none|full|M: "No free seat
+-- (M seats)" on a client that knows seats 3+).
+local function host_reject(pc, why, count)
     M.stats.rejected = M.stats.rejected + 1
-    send_seat(pc, "none", why)
+    if count then send_seat(pc, "none", why, tostring(count)) else send_seat(pc, "none", why) end
     local r = S and S.remote and S.remote[ue.name(pc)]
-    seat_log(r and r.name or ue.short(pc), "-", "refused", why)
+    seat_log(r and r.name or ue.short(pc), "-", "refused", why .. (count and (" (" .. count .. " seats)") or ""))
 end
 
 -- Who has the driver seat: a remote driver, or the host sitting in it (not
@@ -1370,9 +1855,32 @@ local function has_driver(a, st)
     return host_seated(a) and st.host_seat ~= "passenger"
 end
 
+-- The seats of a vehicle: the game's one seat (the driver's, PlayerLocation),
+-- the mod's passenger seats (sdc_vehseats: 2 = its mirror, 3+ from the table
+-- per class), held by st.driver_key / st.pax[idx] (clients) and st.host_seat
+-- / st.host_idx (the host). The seat a newcomer gets in vehicle `a`:
+-- "driver", 1 | "passenger", idx | nil (no free seat). Every entry asks this
+-- one place. `host`: the host's own get-in, which the game has already run
+-- (the host is attached; a remote driver's record counts until the tick
+-- ends it; the host's own seat does not count as taken). `cap`: the client
+-- knows seats 3+ (VENTER "s2"; an older one gets seats 1-2).
+function SEATK.free_seat(a, st, host, cap)
+    if host then
+        if not st.driver_key then return "driver", 1 end
+        local idx = M.vseats.free_idx(st, st.cls, { host = true })
+        if idx then return "passenger", idx end
+        return nil
+    end
+    if not has_driver(a, st) then return "driver", 1 end
+    if not on("vehicle_passengers") then return nil end
+    local idx = M.vseats.free_idx(st, st.cls, { cap = cap == true, passengers = true })
+    if idx then return "passenger", idx end
+    return nil
+end
+
 -- A remote driver while the host sits in the driver seat (up to 0.6.44 the
 -- seat test made a client the driver of the host's car): the client goes
--- to the passenger seat, the host keeps the wheel.
+-- to the first free passenger seat, the host keeps the wheel.
 local function demote_remote_driver(v, st, why)
     local key = st.driver_key
     local a = addr(v)
@@ -1386,18 +1894,20 @@ local function demote_remote_driver(v, st, why)
     if m and st.upd ~= nil then ue.set_prop(m, "bUpdateOnlyIfRendered", st.upd) end
     st.upd = nil
     local seat = key and seats[key]
-    if not (seat and ch and parent_vehicle(ch) == a) or st.pass_key then
-        if seat then host_unseat(key, why, { tell = true, reason = "full" }) end
+    local idx = seat and ch and parent_vehicle(ch) == a
+        and M.vseats.free_idx(st, st.cls, { cap = seat.cap == true, passengers = true }) or nil
+    if not idx then
+        if seat then host_unseat(key, why, { tell = true, reason = "full", count = SEATK.layout(st, key).count }) end
         return
     end
-    seat.seat = "passenger"
-    st.pass_key = key
-    local loc, rot = seat_transform(v, true)
+    seat.seat, seat.idx, seat.geo = "passenger", idx, M.vseats.geo(st.cls, idx)
+    M.vseats.set(st, idx, key)
+    local loc, rot = M.vseats.xf_geo(v, seat.geo)
     if loc then pcall(function() ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
     st.dirty = true
     recount_watch()
-    send_seat(pc, "passenger", cfg.player_name())
-    seat_log(name_of(key), st.name, "passenger", why)
+    SEATK.tell_pass(pc, st, key, idx, seat.geo, true, cfg.player_name())
+    seat_log(name_of(key), st.name, "passenger seat " .. idx, why)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1420,11 +1930,24 @@ local function msg_vehicle(f, pc, i)
     return v
 end
 
+-- The passengers of a vehicle for the log: "2 Friend2, 3 host".
+function SEATK.seats_text(st)
+    local parts = {}
+    for _, o in ipairs(M.vseats.occupants(st)) do
+        parts[#parts + 1] = o.idx .. " " .. (o.who == "host" and "host" or name_of(o.who))
+    end
+    return #parts > 0 and table.concat(parts, ", ") or "-"
+end
+
+-- VENTER|x|y|z|class[|s2[|sw]]: "s2" = the client knows seats 3+
+-- (sdc_vehseats; an older client sends 4 fields and gets seats 1-2), "sw" =
+-- it has the seat key (VSWITCH; it is told when the wheel is free).
 local function on_venter(f, pc)
     local key = sender(pc)
     if not key then return end
     local ch = ue.pawn_of(pc)
     if not ch or ue.prop(ch, "PlayerDead?") == true then return host_reject(pc, "no character") end
+    if SEATK.out_cold(ch) then return host_reject(pc, "downed") end
     if not ensure_resolver() then return host_reject(pc, "no scope api") end
     discover(true)
     local v = vehicle_at(tonumber(f[1]), tonumber(f[2]), tonumber(f[3]), f[4], MATCH_M)
@@ -1433,43 +1956,236 @@ local function on_venter(f, pc)
     if not (cl and vl) or d2(cl, vl) > NEAR_M * NEAR_M then return host_reject(pc, "too far") end
     local a = addr(v)
     local st = state_for(a, v)
+    local cap = f[5] == "s2"
+    local sw = f[6] == "sw"
     local had = seats[key]
     if had and had.vaddr == a and parent_vehicle(ch) == a then
         -- its game ran the get-in again while it sits here (a second press
-        -- with its in-vehicle flag unset): the seat stays, the answer repeats,
-        -- no second get-in here
-        local extra = nil
-        if had.seat == "passenger" then extra = st.driver_key and name_of(st.driver_key) or cfg.player_name() end
-        send_seat(pc, had.seat, extra)
-        log.info("vehicles: seat: %s asked again for a seat in %s while sitting there as %s: the seat stays (no second get-in)",
-            name_of(key), st.name, tostring(had.seat))
+        -- with its in-vehicle flag unset): the seat stays, the answer repeats
+        -- with the same seat (no notice there), no second get-in here
+        had.cap, had.sw = cap, sw
+        if had.seat == "passenger" then
+            local idx = had.idx or 2
+            SEATK.tell_pass(pc, st, key, idx, had.geo or M.vseats.geo(st.cls, idx), false)
+        else
+            SEATK.tell_driver(pc, st, key, a, false)
+        end
+        log.info("vehicles: seat: %s asked again for a seat in %s while sitting there as %s (seat %s): the seat stays (no second get-in)",
+            name_of(key), st.name, tostring(had.seat), tostring(had.idx or (had.seat == "driver" and 1 or 2)))
         return
     end
     if had then host_unseat(key, "re-enter") end
     local hs = host_seated(a)
-    log.info("vehicles: %s asks for a seat in %s: remote driver=%s, host seated=%s (host seat=%s, driving state=%s), passenger=%s",
+    log.info("vehicles: %s asks for a seat in %s: remote driver=%s, host seated=%s (host seat=%s %s, driving state=%s), passengers=%s, knows seats 3+=%s, seat key=%s",
         name_of(key), st.name, st.driver_key and name_of(st.driver_key) or "-", tostring(hs), tostring(st.host_seat),
-        tostring(host_in(a)), st.pass_key and name_of(st.pass_key) or "-")
-    if not has_driver(a, st) then
+        tostring(st.host_idx or ""), tostring(host_in(a)), SEATK.seats_text(st), tostring(cap), tostring(sw))
+    local free, idx = SEATK.free_seat(a, st, false, cap)
+    if free == "driver" then
         if not can_redirect(pc) then return host_reject(pc, "no player index") end
-        host_seat_driver(key, pc, ch, v, st, hs and "the host sits as a passenger; driver seat free" or "driver seat free")
-    elseif on("vehicle_passengers") and not st.pass_key and st.host_seat ~= "passenger" then
+        host_seat_driver(key, pc, ch, v, st, hs and "the host sits as a passenger; driver seat free" or "driver seat free", cap)
+    elseif free == "passenger" then
         local dn = st.driver_key and name_of(st.driver_key) or cfg.player_name()
         host_seat_passenger(key, pc, ch, v, st, dn,
-            st.driver_key and (dn .. " drives") or "the host drives")
+            st.driver_key and (dn .. " drives") or "the host drives", idx, cap)
     else
-        host_reject(pc, "full")
+        host_reject(pc, "full", SEATK.layout(st, key, cap).count)
     end
+    if seats[key] then seats[key].sw = sw end
 end
 
 local function on_vexit(f, pc)
     local key = sender(pc)
     if not key or not seats[key] then return end
-    -- f[6]: seconds the client sat in that seat, f[7]: its seat there
-    -- (both diagnostics; the exit itself is the client's interact key)
+    -- f[6]: seconds the client sat in that seat, f[7]: its seat there, f[8]:
+    -- its seat number (diagnostics; the exit itself is the client's interact key)
     local age = tonumber(f[6])
-    host_unseat(key, age and string.format("client exit with the interact key after %.1f s in its %s seat", age, tostring(f[7] or "?"))
-        or "client exit", { side = f[5] })
+    host_unseat(key, age and string.format("client exit with the interact key after %.1f s in its %s seat%s", age,
+        tostring(f[7] or "?"), (f[8] and f[8] ~= "") and (" " .. f[8]) or "")
+        or "client exit", { side = f[5], exit_key = true })
+end
+
+-- ---------------------------------------------------------------------------
+-- The seat key (config vehicle_seat_key): the host moves the passengers
+-- ---------------------------------------------------------------------------
+
+SEATK.SWITCH_GAP = 0.4   -- s: one move per client per this (a double press)
+SEATK.TOOK_S = 1.0       -- s: a seat key this soon after somebody took the free wheel moves nobody
+
+-- The free wheel (its passengers were told: SEATK.wheel_free sets
+-- st.wheel_wait) taken now - by a passenger's seat key, the host's or a
+-- newcomer's get-in: when and by whom (SEATK.too_late).
+function SEATK.took(st, name)
+    if st.wheel_wait then st.took_at, st.took_by, st.wheel_wait = os.clock(), name, nil end
+end
+
+-- Two passengers pressed their key for the free wheel together: the second
+-- press, a moment after the first took it, meant the wheel as well - it
+-- does not move that player to the next free seat (a back seat it never
+-- asked for), a notice "<name> already took the wheel" instead. The taker's
+-- name within SEATK.TOOK_S of it, else nil.
+function SEATK.too_late(st)
+    local t = st.took_at
+    if t and os.clock() - t >= 0 and os.clock() - t < SEATK.TOOK_S then return st.took_by or "?" end
+    return nil
+end
+
+-- Somebody holds the wheel for the seat key: a remote driver still
+-- connected, or the host attached at it - the attachment, not the driving
+-- state (as has_driver for a newcomer otherwise): right after the host's own
+-- exit, or with a stale one after its death, InVehicle? / Vehicle are still
+-- set although nobody sits there.
+function SEATK.wheel_taken(a, st)
+    if st.driver_key and remote_pc_of(st.driver_key) then return true end
+    return host_attached(a) and st.host_seat ~= "passenger"
+end
+
+-- The host (a passenger) to free passenger seat idx of its car: moved there
+-- in its attachment, its record (host_idx / host_geo) and the seat's pose;
+-- "Seat N of M: <driver> drives" (the wheel is taken: it would go there).
+function SEATK.move_host(v, a, st, idx, lay, from)
+    local hp = ue.local_pawn()
+    local geo = M.vseats.geo(st.cls, idx)
+    local loc, rot = M.vseats.xf_geo(v, geo)
+    if not (hp and loc) then return false end
+    pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+    st.host_idx, st.host_geo = idx, geo
+    seat_mark(hp, v, a, "host", true, geo.pose)
+    st.dirty = true
+    M.stats.switches = M.stats.switches + 1
+    log.say("veh_seat", "info", 5, lay.rank[idx] or idx, lay.count, st.driver_key and name_of(st.driver_key) or "?")
+    seat_log("host", st.name, "passenger seat " .. idx, "its seat key in seat " .. tostring(from))
+    return true
+end
+
+-- This machine's player is the host and pressed its seat key (game thread,
+-- SEATK.on_key): a passenger moves - to the wheel when nobody drives, else
+-- to the next free seat of the host's layout, round; none free: a notice.
+-- At the wheel nothing changes. Returns the log text.
+function SEATK.host_key()
+    local hp = ue.local_pawn()
+    local a = hp and parent_vehicle(hp)
+    local st = a and vs[a]
+    local v = a and cur.by[a]
+    if not (st and v and ue.valid(v)) then return "not seated" end
+    if st.host_seat ~= "passenger" then return "at the wheel of " .. st.name .. ": nothing to change (the key moves passengers)" end
+    if ue.prop(hp, "PlayerDead?") == true then return "dead" end
+    local from = M.vseats.host_idx(st)
+    local free = not SEATK.wheel_taken(a, st)
+    local late = not free and SEATK.too_late(st)
+    if late then
+        log.say("veh_wheel_taken", "info", 4, late)
+        return string.format("seat %s of %s: %s took the free wheel just before: stays (the press meant the wheel)",
+            tostring(from), st.name, tostring(late))
+    end
+    local idx, lay = M.vseats.next_idx(st, st.cls, { host = true }, from, free)
+    local ok
+    if idx == 1 then
+        -- A driver whose player left keeps its record until the tick ends
+        -- it (up to 0.5 s; wheel_taken does not count it): ended here first,
+        -- without a "wheel free" - the host takes it now. Ended by the tick
+        -- after, it stopped the host's car under it (handbrake on: the
+        -- host's W did nothing until it pressed Space).
+        local gone = st.driver_key
+        if gone then
+            host_unseat(gone, "player left (its record ended at the host's seat key, before the tick)", { taken = true })
+            if st.driver_key == gone then st.driver_key, st.scope_key = nil, nil end
+        end
+        ok = SEATK.host_wheel(v, a, st, from)
+        if not ok and gone then SEATK.wheel_free(v, st, name_of(gone) .. ": player left") end
+    elseif idx then
+        ok = SEATK.move_host(v, a, st, idx, lay, from)
+    else
+        log.say("veh_switch_none", "info", 4)
+        return string.format("seat %s of %s: no free seat (%d seats: %s)", tostring(from), st.name, lay.count, SEATK.seats_text(st))
+    end
+    if not ok then log.say("veh_switch_failed", "warn", 4) end
+    return string.format("seat %s of %s -> %s%s", tostring(from), st.name, idx == 1 and "the wheel" or ("seat " .. idx),
+        ok and "" or ": no world position for it here (stays)")
+end
+
+-- Client `key` (a passenger; its record `seat`) to free passenger seat idx:
+-- its character moved there on the host (the attachment replicates), its
+-- record, the seat's pose; VSEAT passenger with the new seat - its own copy
+-- moves it there, its notice "Seat N of M".
+function SEATK.move_client(v, a, st, key, pc, ch, seat, idx, from)
+    local geo = M.vseats.geo(st.cls, idx)
+    local loc, rot = M.vseats.xf_geo(v, geo)
+    if not loc then return false end
+    seat.seat, seat.idx, seat.geo = "passenger", idx, geo
+    M.vseats.set(st, idx, key)
+    pcall(function() ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+    seat_mark(ch, v, a, name_of(key), false, geo.pose)
+    st.dirty = true
+    recount_watch()
+    M.stats.switches = M.stats.switches + 1
+    SEATK.tell_pass(pc, st, key, idx, geo, true)
+    seat_log(name_of(key), st.name, "passenger seat " .. idx, "its seat key in seat " .. tostring(from))
+    return true
+end
+
+-- Client `key`'s seat key (VSWITCH): the wheel when nobody drives and the
+-- game's get-in can run for it here (SEATK.take_wheel, checked after), else
+-- the next free seat of its layout (seats 1-2 for a client without "s2"),
+-- round; none: VSWR full ("no" when the free wheel cannot be its). Returns
+-- the log text.
+function SEATK.client_switch(v, a, st, key, pc, ch, seat)
+    local from = seat.idx or 2
+    local free = not SEATK.wheel_taken(a, st)
+    local late = not free and SEATK.too_late(st)
+    if late then
+        net.send_to(pc, "VSWR", "taken", late)
+        return string.format("%s took the free wheel just before: stays in seat %s (the press meant the wheel)", tostring(late), tostring(from))
+    end
+    local wheel = free and can_redirect(pc)
+    local idx, lay = M.vseats.next_idx(st, st.cls, { cap = seat.cap == true, passengers = true }, from, wheel)
+    if idx == 1 then
+        if SEATK.take_wheel(v, a, st, key, pc, ch, from) then
+            M.stats.switches = M.stats.switches + 1
+            return "the wheel"
+        end
+        net.send_to(pc, "VSWR", "no", "wheel")
+        return "the wheel: the game's get-in did not seat it there (back in seat " .. from .. ")"
+    end
+    if idx then
+        if SEATK.move_client(v, a, st, key, pc, ch, seat, idx, from) then return "seat " .. idx end
+        net.send_to(pc, "VSWR", "no", "position")
+        return "seat " .. idx .. ": no world position for it here (stays)"
+    end
+    net.send_to(pc, "VSWR", free and "no" or "full", tostring(lay.count))
+    return string.format("no free seat (%d seats: %s)%s", lay.count, SEATK.seats_text(st),
+        free and "; the wheel is free but the game's get-in cannot run for this player here (no player index)" or "")
+end
+
+-- VSWITCH|x|y|z|class: a client's seat key (only a client that has one
+-- sends it; an older host has no handler). Its seat is the host's record.
+function SEATK.on_vswitch(f, pc)
+    local key = sender(pc)
+    if not key then return end
+    local seat = seats[key]
+    if not seat then
+        log.info("vehicles: seat key: %s pressed it but sits in no seat here (%s)", name_of(key), tostring(f[4]))
+        return
+    end
+    seat.sw = true
+    local t = os.clock()
+    if t - (seat.sw_at or -100) < SEATK.SWITCH_GAP then return end
+    seat.sw_at = t
+    local v = vehicle_by(seat.vaddr, seat.vname)
+    local st = vs[seat.vaddr]
+    local ch = ue.pawn_of(pc)
+    local where = string.format("the %s seat%s of %s", tostring(seat.seat),
+        seat.seat == "passenger" and (" " .. tostring(seat.idx or 2)) or "", tostring(seat.vname))
+    local res
+    if not (v and st) then
+        res = "its vehicle is gone"
+    elseif seat.seat ~= "passenger" then
+        res = "at the wheel: nothing to change (the key moves passengers)"
+    elseif not ch or parent_vehicle(ch) ~= seat.vaddr or ue.prop(ch, "PlayerDead?") == true then
+        res = "not seated here (dead / detached): stays"
+    else
+        res = "-> " .. SEATK.client_switch(v, addr(v), st, key, pc, ch, seat)
+    end
+    log.info("vehicles: seat key: %s in %s: %s", name_of(key), where, res)
 end
 
 -- The sender's seat in the vehicle the message names.
@@ -1479,10 +2195,28 @@ local function seat_in(key, v)
     return nil
 end
 
+-- VLIGHT / VHORN / VFLIP count only from the vehicle's driver (driver only,
+-- see SEATK.pass_block): true = refused. One log line per sender and kind
+-- every 5 s (the in-game check; an older client still sends its horn from a
+-- passenger seat).
+function SEATK.not_driver(kind, key, v)
+    local seat = seat_in(key, v)
+    if seat == "driver" then return false end
+    SEATK.nd_at = SEATK.nd_at or {}
+    local k, t = kind .. "|" .. tostring(key), os.clock()
+    if t - (SEATK.nd_at[k] or -100) >= 5 then
+        SEATK.nd_at[k] = t
+        local idx = seat == "passenger" and M.vseats.idx_of(vs[addr(v)] or {}, key)
+        log.info("vehicles: driver only: %s from %s refused: %s in %s, only the driver's counts", kind, name_of(key),
+            seat == "passenger" and ("a passenger, seat " .. tostring(idx or "?")) or "not seated", ue.short(v))
+    end
+    return true
+end
+
 local function on_vlight(f, pc)
     local key = sender(pc)
     local v = key and msg_vehicle(f, pc)
-    if not v or seat_in(key, v) ~= "driver" then return end
+    if not v or SEATK.not_driver("VLIGHT", key, v) then return end
     local want = f[5] == "1"
     if (ue.prop(v, "LightsOn?") == true) ~= want then
         apply(function() v:TurnOnOffLights() end)
@@ -1506,23 +2240,49 @@ end
 local function on_vflip(f, pc)
     local key = sender(pc)
     local v = key and msg_vehicle(f, pc)
-    if not v or seat_in(key, v) ~= "driver" then return end
+    if not v or SEATK.not_driver("VFLIP", key, v) then return end
+    -- the host sits in it as a passenger: its flip key's hold (SEATK.flip_hold) is not for the driver
+    if SEATK.flip_va == addr(v) then ue.set_prop(v, "Flipped", false) end
     apply(function() v:Event_FlipVehicle() end)
     M.stats.relays = M.stats.relays + 1
     log.info("vehicles: %s flipped %s", name_of(key), ue.short(v))
 end
 
+-- VTOW|x|y|z|class|1 or 0: a client chose "Tow Vehicle" / "Detach Vehicle"
+-- on its copy. The game offers that option only to a player standing at the
+-- tow box, not in a vehicle (BP_VehicleMaster @9949-10009 -> AddTowingComp
+-- @12539), so no seat is asked for: the vehicle must be near the sender's
+-- character here (msg_vehicle). The game's own steps on the host's copy; its
+-- notes (no notification for the hitch; "No vehicle to tow found", "Towed
+-- vehicle detached", "Unable to detach") are the client's, not the host's.
+fx.TOW_NOTES = { "No vehicle to tow found", "Towed vehicle detached", "Unable to detach. Try again" }
 local function on_vtow(f, pc)
     local key = sender(pc)
     local v = key and msg_vehicle(f, pc)
-    if not v or seat_in(key, v) ~= "driver" then return end
+    if not v then
+        if key then
+            log.info("vehicles: %s's tow request: no %s at %s,%s,%s near its character here: not applied",
+                name_of(key), tostring(f[4]), tostring(f[1]), tostring(f[2]), tostring(f[3]))
+        end
+        return
+    end
     local want = f[5] == "1"
     if (ue.prop(v, "TowingVehicle?") == true) == want then return end
     if want then
         apply(function() v:AddTowingComp(false, true) end)
+        -- the car it hitched may be one the host sits in as a passenger,
+        -- held parked: let go now, before the game's next-tick release of it
+        -- (SEATK.tower_of)
+        local held = SEATK.hold_va
+        if held and SEATK.towed_by(v) == held then
+            SEATK.hold_va = nil
+            log.info("vehicles: tow: %s hitched %s, where the host sits as a passenger: no longer held parked (the game releases its handbrake)",
+                name_of(key), vs[held] and vs[held].name or "?")
+        end
     else
         apply(function() v:RemoveTowingComp() end)
     end
+    for _, n in ipairs(fx.TOW_NOTES) do fx.unnote(n) end
     M.stats.relays = M.stats.relays + 1
     log.info("vehicles: %s %s towing with %s (now %s)", name_of(key), want and "started" or "stopped",
         ue.short(v), tostring(ue.prop(v, "TowingVehicle?")))
@@ -1556,6 +2316,13 @@ end
 -- it (FuelComponent.AddFuel / the kit branch's steps), sends the vehicle state
 -- to everyone and answers that client (VBOXR): the game's success step on its
 -- copy, or the game's note. The client's false note is taken off its screen.
+-- 13.11 (0.11.0, "the client cannot refuel or repair"): in the game that note
+-- never reached fx.on_note (no "its note" line in any log since 0.7.2): the
+-- refuel got through only by UseGasCan's own hook, and the repair - whose
+-- kit branch is no function to hook - never asked at all. Each ask path now:
+-- the note (fx.on_note), UseGasCan's hook (refuel), and the client's tick at
+-- the hold's end (fx.hold_end: the hold's time is up, the game's flag down,
+-- nothing added here, this player not outside the box). One ask per hold.
 -- ---------------------------------------------------------------------------
 
 function fx.kind_of(tag)
@@ -1569,12 +2336,8 @@ function fx.item_name(kind) return kind == "refuel" and "gas can" or "repair kit
 function fx.asset(kind)
     local da = fx.da[kind]
     if da and ue.valid(da) then return da end
-    local path = kind == "refuel" and fx.GASCAN or fx.KIT
-    da = ue.find_object(path)
-    if not da and LoadAsset then
-        pcall(LoadAsset, path)
-        da = ue.find_object(path)
-    end
+    -- (a client takes it only from memory: buy.asset)
+    da = buy.asset(kind == "refuel" and fx.GASCAN or fx.KIT)
     fx.da[kind] = da
     return da
 end
@@ -1789,13 +2552,16 @@ end
 -- (SetSaveProperties @7640) and sdc_persist the client's inventory.
 -- ---------------------------------------------------------------------------
 
+-- An asset by path. The host may load it (ue.load_asset: timed, logs a slow
+-- load); a client takes it only from memory (ue.loaded_asset: a synchronous
+-- load there can wait for the world's streaming and freeze the game).
 function buy.asset(path)
-    local o = ue.find_object(path)
-    if not o and LoadAsset then
-        pcall(LoadAsset, path)
-        o = ue.find_object(path)
+    if S and S.role == "host" then
+        local ok, o = ue.load_asset(path, "vehicles")
+        if ok and ue.valid(o) then return o end
+        return ue.find_object(path)
     end
-    return o
+    return ue.loaded_asset(path, "vehicles")
 end
 
 function buy.uid(g) return string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D) end
@@ -1956,12 +2722,13 @@ local function on_vbuy(f, pc)
 end
 
 -- VHORN: client -> host (the driver honked) and host -> client (play it).
+-- Only the driver's (a passenger's horn is muted on its own machine and not sent: SEATK.pass_block, hush_snd).
 local horn_client   -- forward: client handler
 local function on_vhorn(f, pc)
     if S and S.role == "client" then return horn_client(f) end
     local key = sender(pc)
     local v = key and msg_vehicle(f, pc)
-    if not v or not seat_in(key, v) then return end
+    if not v or SEATK.not_driver("VHORN", key, v) then return end
     apply(function() v:Horn() end)
     host_horn_broadcast(v, pc)
     M.stats.relays = M.stats.relays + 1
@@ -1970,6 +2737,66 @@ end
 -- ---------------------------------------------------------------------------
 -- Host: hooks for the host's own actions
 -- ---------------------------------------------------------------------------
+
+-- No free seat for the host (a client drives, another one sits next to it):
+-- the game's get-in seated the host anyway (one seat, no check). It is undone
+-- the way the game's own exit does it, as for a client the host refuses
+-- (local_force_exit): Event_ExitVehicle on player 0 = the host (host_till),
+-- the ExitVehicle tail with the car still occupied (no handbrake, the fuel
+-- keeps running), the character's own exit path, the camera back; the sit
+-- pose ends on every machine. Event_ExitVehicle also stopped the driver's
+-- engine sound and timers: back on, as after the host's own exit as a
+-- passenger. The get-in's VehicleInteraction(true) 0.1 s later still
+-- reaches the host: on_vi_post undoes it (SEATK.refused names it there).
+-- Up to 0.7.3 the host sat down in the passenger's seat (two in one seat).
+function SEATK.host_out(v, st, a)
+    local hp = ue.local_pawn()
+    -- the game's function only while player 0 is surely the host (a nil
+    -- answer would let sdc_ctx pick the car's owner: the driver)
+    local p0_host = not ctx.active or (ctx.scope_resolver == my_resolver and my_resolver(v, a) == false)
+    local how = "not run"
+    local side, side_why = SEATK.exit_side(v, hp)
+    ue.set_prop(v, "GetOutPasseenger", side == "p")
+    if p0_host then
+        apply(function() v:Event_ExitVehicle() end)
+        how = "the game's Event_ExitVehicle"
+    end
+    if hp and parent_vehicle(hp) == a then
+        -- still attached: the same steps without the game's function
+        pcall(function() hp:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end)
+        local loc = socket_loc(v, side == "p" and "PassengerSide" or "DriverSide")
+        if loc then pcall(function() hp:K2_SetActorLocationAndRotation(loc, ue.rotation(hp), false, {}, false) end) end
+        how = how .. "; detached here"
+    end
+    -- (the game's Event_ExitVehicle resets it too, @23482)
+    ue.set_prop(v, "GetOutPasseenger", false)
+    drop_new_ui(v, nil)
+    if hp then
+        stop_sit(hp)
+        exit_tail(v, hp, true)
+        apply(function() hp:ResetVehicleCameraArmLength() end)
+        char_out(hp)
+        forget_att(hp)
+        stop_sit_everywhere(hp)
+        local hca = addr(hp)
+        local hr = hca and seated[hca]
+        if hr and hr.vaddr == a then seat_clear(hca, hr, hp, "host") end
+    end
+    set_collision(v, true)
+    host_services(v)
+    if st.host_seat ~= nil then st.host_seat, st.dirty = nil, true end
+    st.host_idx, st.host_geo = nil, nil
+    st.host_at = nil
+    SEATK.refused = { va = a, till = os.clock() + SCOPE_S }
+    M.stats.rejected = M.stats.rejected + 1
+    -- "No free seat (M seats)" where a car has more than 2 (else as before)
+    local n = M.vseats.layout(st.cls, { host = true }).count
+    if n > 2 then log.say("veh_full_n", "warn", 5, n) else log.say("veh_full", "warn", 5) end
+    seat_log("host", st.name, "refused", string.format("full (%d seats): %s drives, passengers %s; the host's get-in undone (%s), out at %s",
+        n, name_of(st.driver_key), SEATK.seats_text(st), how,
+        hp and parent_vehicle(hp) == nil and ((side == "p" and "the passenger door (" or "the driver door (") .. side_why .. ")") or "?"))
+    recount_watch()
+end
 
 local function host_entered(v)
     local a = addr(v)
@@ -1988,37 +2815,71 @@ local function host_entered(v)
     -- is the host's, not a client's whose entry came earlier
     st.scope_key, st.scope_till = nil, nil
     st.host_till = os.clock() + SCOPE_S
-    st.host_at = os.clock()
+    -- (clear_area_flags: the client standing at the fuel / repair box would
+    -- stop the game's VehicleInteraction(true) for the host 0.1 s from now -
+    -- host stuck in the seat: no driving, no exit)
+    local flags = nil
     if again then
-        log.info("vehicles: seat: the host's get-in on %s ran again while it sat there as %s (the game's VehicleUI made twice: the extra one goes)",
-            st.name, tostring(st.host_seat))
+        -- The game's get-in ran again while the host sits here (its
+        -- VehicleInteraction stopped half-way, so the key offered "get in"
+        -- again): the seat stays, no new seat is asked for (with the seat
+        -- table a full car would refuse the host that sits in it, a free one
+        -- would move it). The get-in put the host at the wheel and welded
+        -- it: back in its own seat, unwelded again.
+        st.host_at = os.clock()
+        flags = clear_area_flags(v, true)
+        local hp = ue.local_pawn()
+        if hp and st.host_seat == "passenger" then
+            local hidx = M.vseats.host_idx(st)
+            local loc, rot = M.vseats.xf_geo(v, st.host_geo or M.vseats.geo(st.cls, hidx))
+            if not loc then loc, rot = seat_transform(v, true) end
+            if loc then pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
+        end
+        local r = seated[addr(hp) or -1]
+        if r then r.unwelded = nil end
+        if hp and parent_vehicle(hp) == a then seat_mark(hp, v, a, "host", true, st.host_geo and st.host_geo.pose) end
+        log.info("vehicles: seat: the host's get-in on %s ran again while it sat there as %s%s (the game's VehicleUI made twice: the extra one goes; flags cleared: %s): the seat stays",
+            st.name, tostring(st.host_seat), st.host_seat == "passenger" and (" in seat " .. tostring(M.vseats.host_idx(st))) or "",
+            #flags > 0 and table.concat(flags, ",") or "none")
+        st.dirty = true
+        recount_watch()
+        return
     end
-    -- the client standing at the fuel / repair box would stop the game's
-    -- VehicleInteraction(true) for the host 0.1 s from now (host stuck in
-    -- the seat: no driving, no exit)
-    local flags = clear_area_flags(v, true)
+    local free, idx = SEATK.free_seat(a, st, true)
+    if not free then return SEATK.host_out(v, st, a) end
+    st.host_at = os.clock()
+    flags = clear_area_flags(v, true)
     if #flags > 0 then
         log.info("vehicles: %s had %s set (another player at the car); cleared for the host's entry", st.name, table.concat(flags, ","))
     end
-    if st.driver_key then
-        -- a client drives: the host sits next to it
+    local lay = M.vseats.layout(st.cls, { host = true })
+    if free == "passenger" then
+        -- a client drives: the host sits in the first free seat
         local hp = ue.local_pawn()
-        local loc, rot = seat_transform(v, true)
+        local geo = M.vseats.geo(st.cls, idx) or M.vseats.geo(st.cls, 2)
+        local loc, rot = M.vseats.xf_geo(v, geo)
+        if not loc then loc, rot = seat_transform(v, true) end
         if hp and loc then pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
-        st.host_seat = "passenger"
-        log.say("veh_passenger", "info", 5, name_of(st.driver_key))
-        if st.pass_key then
-            log.warn("vehicles: seat: the host shares the passenger seat of %s with %s (one passenger seat)", st.name, name_of(st.pass_key))
+        st.host_seat, st.host_idx, st.host_geo = "passenger", idx, geo
+        -- "Seat N of M" where a car has more than 2 (else as before)
+        if lay.count > 2 then
+            log.say("veh_seat", "info", 5, lay.rank[idx] or idx, lay.count, name_of(st.driver_key))
+        else
+            log.say("veh_passenger", "info", 5, name_of(st.driver_key))
         end
-        seat_log("host", st.name, "passenger", name_of(st.driver_key) .. " drives")
+        seat_log("host", st.name, "passenger seat " .. tostring(idx), name_of(st.driver_key) .. " drives")
     else
-        st.host_seat = "driver"
-        seat_log("host", st.name, "driver", st.pass_key and (name_of(st.pass_key) .. " sits as a passenger; driver seat free") or "driver seat free")
+        st.host_seat, st.host_idx, st.host_geo = "driver", nil, nil
+        SEATK.took(st, cfg.player_name())
+        -- a driver is told "Seat 1 of M" only with somebody else in a car of more than 2
+        if lay.count > 2 and M.vseats.any(st) then log.say("veh_seat_driver", "info", 5, lay.count) end
+        seat_log("host", st.name, "driver", M.vseats.any(st) and ("passengers " .. SEATK.seats_text(st) .. "; driver seat free")
+            or "driver seat free")
     end
     -- the game welded the host into the car: unweld now, so the seat
     -- replicates (the clients saw the host under the car)
     local hp = ue.local_pawn()
-    if hp and parent_vehicle(hp) == a then seat_mark(hp, v, a, "host", true) end
+    if hp and parent_vehicle(hp) == a then seat_mark(hp, v, a, "host", true, st.host_geo and st.host_geo.pose) end
     st.dirty = true
     recount_watch()
 end
@@ -2040,8 +2901,8 @@ local function host_exited(v, can)
             st.name, can == nil and "?" or tostring(can), mph and string.format("%.1f", mph) or "?", tostring(st.host_seat))
         return
     end
-    local was = st.host_seat
-    st.host_seat = nil
+    local was, was_idx, was_geo = st.host_seat, M.vseats.host_idx(st), st.host_geo
+    st.host_seat, st.host_idx, st.host_geo = nil, nil, nil
     st.dirty = true
     local hp = ue.local_pawn()
     forget_att(hp)
@@ -2051,6 +2912,16 @@ local function host_exited(v, can)
     local hr = hca and seated[hca]
     local was_seated = hr ~= nil and hr.vaddr == a
     if was_seated then seat_clear(hca, hr, hp, "host") end
+    -- a seat 3+: the game put the host at a front door; its own (rear) door
+    -- when that is free
+    if hp and was == "passenger" and was_idx and was_idx >= 3 then
+        local _, sw, loc, free = SEATK.exit_side(v, hp, was_idx, was_geo or M.vseats.geo(st.cls, was_idx))
+        if loc and free == true then
+            pcall(function() hp:K2_SetActorLocationAndRotation(loc, ue.rotation(hp), false, {}, false) end)
+        end
+        log.info("vehicles: seat: the host out of seat %d of %s: %s", was_idx, st.name,
+            (loc and free == true) and ("at " .. sw) or ("left at the game's door (" .. tostring(sw) .. ")"))
+    end
     -- ExitVehicle has one caller: the interact key (BP_PlayerCharacter
     -- @108596, IA_Interact "Started", once per press)
     local how = st.host_at and string.format("interact key, %.1f s after its get-in", os.clock() - st.host_at) or "interact key"
@@ -2061,7 +2932,7 @@ local function host_exited(v, can)
         -- in it (InVehicle? / Vehicle, movement off: a delayed get-in step
         -- that reached the host). Up to 0.7.0 the host stood beside the car
         -- without control until this second press (0.7.0 16:33: "host -> out,
-        -- was passenger" 1.7 s after its real exit). Nothing to promote.
+        -- was passenger" 1.7 s after its real exit). Nothing to hand over.
         M.stats.stray_exits = M.stats.stray_exits + 1
         if st.driver_key then
             set_collision(v, true)
@@ -2079,10 +2950,99 @@ local function host_exited(v, can)
         seat_log("host", st.name, "out", "was " .. tostring(was or "passenger") .. "; " .. name_of(st.driver_key) .. " still drives; " .. how)
     else
         -- (a nil seat: the host got in before anyone joined, as the driver)
+        -- (a passenger out of a car nobody drives: the last one out parks it)
         seat_log("host", st.name, "out", "was " .. tostring(was or "driver")
-            .. (st.pass_key and ("; passenger " .. name_of(st.pass_key) .. " takes the wheel") or "") .. "; " .. how)
-        if was ~= "passenger" then promote(v, st) end
+            .. (was ~= "passenger" and M.vseats.any(st) and ("; passengers " .. SEATK.seats_text(st) .. " stay in their seats") or "") .. "; " .. how)
+        if was ~= "passenger" then
+            SEATK.wheel_free(v, st, "the host got out")
+        elseif M.vseats.any(st) then
+            -- out of a parked car the others still sit in (the game's exit
+            -- tail gave the collision back)
+            set_collision(v, true)
+        else
+            SEATK.park_empty(v, st, a)
+        end
     end
+end
+
+-- The host's seat ended without its exit key (host_exited): the host died in
+-- it - the game's death in a vehicle (@13822 -> VehicleDrivingComponent.Death)
+-- stops the car but leaves the body attached, and AfterDeath's UnPossess
+-- (@1387) leaves the host without a character, so the host holds no seat any
+-- more - or its character left the car some other way. As after its exit:
+-- the seat is free; if the host drove, its passengers stay in their seats in
+-- the parked car and are told the wheel is free (SEATK.wheel_free). Host
+-- tick, once the get-in's window (host_till) is over.
+function SEATK.host_gone(v, st)
+    local was = st.host_seat
+    st.host_seat, st.host_idx, st.host_geo, st.dirty = nil, nil, nil, true
+    st.host_at = nil
+    local why = ue.local_pawn() == nil and "the host has no character (died)" or "the host is not in it any more"
+    local left = was ~= "passenger" and not st.driver_key and M.vseats.any(st)
+    seat_log("host", st.name, "out", "was " .. tostring(was) .. "; " .. why .. ", without its exit"
+        .. (left and ("; passengers " .. SEATK.seats_text(st) .. " stay in their seats") or ""))
+    if left then
+        SEATK.wheel_free(v, st, why)
+    elseif was == "passenger" then
+        SEATK.park_empty(v, st, addr(v))
+    end
+end
+
+-- sdc_down: a client went down in its seat: out at once (the knockdown waits
+-- for it to stand outside). Returns what was done.
+function M.unseat_client(key, why)
+    if not S or S.role ~= "host" then return "not the host" end
+    if not seats[key] then return "no seat" end
+    host_unseat(key, why or "downed", { tell = true, reason = why or "downed" })
+    return "unseated"
+end
+
+-- sdc_down: the host went down in a vehicle: out the way its own exit goes
+-- (the game's Event_ExitVehicle while player 0 is surely the host, else
+-- detached at the door), then its exit's bookkeeping (host_exited): the
+-- seat free, its passengers stay in their seats, a car nobody drives is
+-- parked (engine, fuel and noise off, handbrake on), a client driver keeps
+-- its car running. Not SEATK.host_out: that one is for a get-in refused
+-- while a client drives (the car stays "occupied" and running).
+function M.force_out_host(why)
+    if not S or S.role ~= "host" then return "not the host" end
+    local hp = ue.local_pawn()
+    if not hp then return "no character" end
+    local a = parent_vehicle(hp)
+    local v = a and cur.by[a]
+    if not (v and ue.valid(v)) then
+        if ue.prop(hp, "InVehicle?") == true then
+            char_out(hp)
+            return "the game's driving state cleared (attached to no vehicle)"
+        end
+        return "not in a vehicle"
+    end
+    local st = state_for(a, v)
+    local others = st.driver_key ~= nil or M.vseats.any(st)
+    local p0_host = not ctx.active or (ctx.scope_resolver == my_resolver and my_resolver(v, a) == false)
+    local side = SEATK.exit_side(v, hp)
+    local how = "not run"
+    ue.set_prop(v, "GetOutPasseenger", side == "p")
+    if p0_host then
+        apply(function() v:Event_ExitVehicle() end)
+        how = "the game's Event_ExitVehicle"
+    end
+    if parent_vehicle(hp) == a then
+        pcall(function() hp:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end)
+        local loc = socket_loc(v, side == "p" and "PassengerSide" or "DriverSide")
+        if loc then pcall(function() hp:K2_SetActorLocationAndRotation(loc, ue.rotation(hp), false, {}, false) end) end
+        how = how .. "; detached here"
+        if not p0_host and not st.driver_key then stop_services(v, others) end
+    end
+    ue.set_prop(v, "GetOutPasseenger", false)
+    stop_sit(hp)
+    exit_tail(v, hp, others)
+    apply(function() hp:ResetVehicleCameraArmLength() end)
+    char_out(hp)
+    log.info("vehicles: seat: the host out of %s (%s): %s", st.name, tostring(why), how)
+    host_exited(v, nil)
+    pcall(hud.check, "the host got out (" .. tostring(why) .. ")")
+    return how
 end
 
 -- ---------------------------------------------------------------------------
@@ -2094,8 +3054,10 @@ local local_seat = nil      -- { vaddr, vname, seat = pending|driver|passenger|l
 local applied = {}          -- [vehicle address] = { name, fuel, health, color, drv, eng, at, lights_local }
 local obs = {}              -- [vehicle address] = { engine = bool }
 -- placed[character address] = { va, vname, name, at }: seated here from VSTATE;
--- missing[character address] = first time a VSTATE seat had no attachment here
-local cpl = { placed = {}, missing = {} }
+-- missing[character address] = first time a VSTATE seat had no attachment here;
+-- gone[ghost vehicle name] = when this client destroyed it (client_ghosts);
+-- rescan_at: the last list rescan a packed VSTATE asked for (cpl.on_state)
+local cpl = { placed = {}, missing = {}, gone = {}, rescan_at = -100, RESCAN_S = 5 }
 local spawners_done = {}
 local last_spawner_scan = -100
 local ghost_logged = {}
@@ -2124,30 +3086,78 @@ local function client_ready()
 end
 
 -- The host did not seat us: leave the way ExitVehicle would, without its
--- checks (Event_ExitVehicle + tail + the character's own exit path).
-local function local_force_exit(v, why)
+-- checks (Event_ExitVehicle + tail + the character's own exit path). Our own
+-- get-in started the sit montage on every machine (Svr_Montage ->
+-- MC_Montage) and the host never seated us, so nothing there stops it: the
+-- game's replicated stop goes after it on this character's channel (up to
+-- 0.7.3 the others saw a refused player sitting in the air beside the car).
+-- The door: the one the game's own exit would pick (SEATK.exit_side).
+local function local_force_exit(v, why, count)
     local ch = ue.local_pawn()
+    local side, side_why = SEATK.exit_side(v, ch)
+    ue.set_prop(v, "GetOutPasseenger", side == "p")
     apply(function() v:Event_ExitVehicle() end)
+    ue.set_prop(v, "GetOutPasseenger", false)
+    if side == "p" then log.info("vehicles: seat: refused: out at the passenger door of %s (%s)", ue.short(v), side_why) end
     if ch then
+        stop_sit_everywhere(ch)
         exit_tail(v, ch, false)
         apply(function() ch:ResetVehicleCameraArmLength() end)
         char_out(ch)
         forget_att(ch)
     end
     set_requires(v, true)
-    seat_log("this player", local_seat and local_seat.vname or ue.short(v), "out", "the host refused: " .. tostring(why))
+    seat_log("this player", local_seat and local_seat.vname or ue.short(v), "out", "the host refused: " .. tostring(why)
+        .. (count and (" (" .. count .. " seats)") or ""))
     local_seat = nil
     hud.check("the host refused the seat")
     if why == "full" then
-        log.say("veh_full", "warn", 5)
+        -- "No free seat (M seats)" where a car has more than 2 (else as before)
+        if count and count > 2 then log.say("veh_full_n", "warn", 5, count) else log.say("veh_full", "warn", 5) end
     else
-        log.say("veh_rejected", "warn", 5, tostring(why))
+        -- (down: sdc_down's own notice says so)
+        if why ~= "downed" then log.say("veh_rejected", "warn", 5, tostring(why)) end
     end
+end
+
+-- This machine's player in its seat on this machine's copy: a passenger at
+-- the host's numbers for its seat (local_seat.geo; none: the mirror, seat
+-- 2), the driver at the wheel.
+function SEATK.place_local(v, lp)
+    if not (local_seat and lp) then return end
+    local loc, rot
+    if local_seat.seat == "passenger" then
+        if local_seat.geo then loc, rot = M.vseats.xf_geo(v, local_seat.geo) end
+        if not loc then loc, rot = seat_transform(v, true) end
+    else
+        loc, rot = seat_transform(v, false)
+    end
+    if loc then pcall(function() lp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
 end
 
 local function client_entered(v)
     if not client_ready() then return end
     local a = addr(v)
+    local lp = ue.local_pawn()
+    if local_seat and local_seat.vaddr == a and (local_seat.seat == "driver" or local_seat.seat == "passenger") then
+        -- The game's get-in ran again while this player sits here (a second
+        -- press with its in-vehicle flag unset): the seat stays (its number
+        -- and the host's numbers for it); the get-in put this player at the
+        -- wheel and welded it: back in its seat, unwelded again. The host
+        -- answers with the same seat (no notice).
+        local r = seated[addr(lp) or -1]
+        if r then r.unwelded = nil end
+        local flags = clear_area_flags(v, true)
+        if lp and parent_vehicle(lp) == a then
+            seat_mark(lp, v, a, "this player", true, local_seat.geo and local_seat.geo.pose)
+            if local_seat.seat == "passenger" then SEATK.place_local(v, lp) end
+        end
+        to_host("VENTER", v, "s2", "sw")
+        seat_log("this player", local_seat.vname, local_seat.seat, string.format(
+            "the game's get-in ran again while sitting here in seat %s: the seat stays, asked the host again%s",
+            tostring(local_seat.idx or "?"), #flags > 0 and ("; cleared " .. table.concat(flags, ",")) or ""))
+        return
+    end
     local_seat = { vaddr = a, vname = ue.short(v), seat = host_cap and "pending" or "local", since = os.clock() }
     if host_cap then set_requires(v, true) end
     -- the host's character at the fuel / repair box of our copy would stop
@@ -2155,9 +3165,9 @@ local function client_entered(v)
     local flags = clear_area_flags(v, true)
     -- the game welded us into our copy: unweld, so our moves keep reaching
     -- the host (its copy of us animates from them)
-    local lp = ue.local_pawn()
     if lp and parent_vehicle(lp) == a then seat_mark(lp, v, a, "this player", true) end
-    to_host("VENTER", v)
+    -- "s2": this client knows seats 3+ (sdc_vehseats); "sw": it has the seat key
+    to_host("VENTER", v, "s2", "sw")
     seat_log("this player", local_seat.vname, local_seat.seat,
         "entered here, asked the host" .. (#flags > 0 and ("; cleared " .. table.concat(flags, ",")) or ""))
 end
@@ -2170,15 +3180,29 @@ local function client_exited(v)
     local cl = ch and ue.location(ch)
     local ds, ps = socket_loc(v, "DriverSide"), socket_loc(v, "PassengerSide")
     if cl and ds and ps and d2(cl, ps) < d2(cl, ds) then side = "p" end
+    -- a seat 3+: the game put this player at a front door; its own (rear)
+    -- door when that is free (its moves take it there on the host too)
+    local idx = local_seat.idx
+    local door = ""
+    if ch and local_seat.seat == "passenger" and idx and idx >= 3 and local_seat.geo then
+        local s2, sw, loc, free = SEATK.exit_side(v, ch, idx, local_seat.geo)
+        if loc and free == true then
+            pcall(function() ch:K2_SetActorLocationAndRotation(loc, ue.rotation(ch), false, {}, false) end)
+            side = s2
+            door = "; out of seat " .. idx .. " at " .. sw
+        else
+            door = "; out of seat " .. idx .. ", left at the game's door (" .. tostring(sw) .. ")"
+        end
+    end
     -- only the interact key calls ExitVehicle (BP_PlayerCharacter @108596,
     -- IA_Interact "Started": once per press); the age tells a quick second
     -- press from a stuck seat in the logs
     local age = os.clock() - (local_seat.seat_at or local_seat.since or os.clock())
-    to_host("VEXIT", v, side, string.format("%.1f", age), tostring(local_seat.seat))
+    to_host("VEXIT", v, side, string.format("%.1f", age), tostring(local_seat.seat), tostring(idx or ""))
     set_requires(v, true)
     forget_att(ch)
-    seat_log("this player", local_seat.vname, "out", string.format("exit here with the interact key after %.1f s; was %s, %s side",
-        age, tostring(local_seat.seat), side))
+    seat_log("this player", local_seat.vname, "out", string.format("exit here with the interact key after %.1f s; was %s, %s side%s",
+        age, tostring(local_seat.seat), side, door))
     local_seat = nil
 end
 
@@ -2187,6 +3211,9 @@ local function on_vcap()
     host_cap = true
 end
 
+-- VSEAT|kind|name[|idx|N|M|side|x|y|z|yaw|pose|exit|tell|sw] (sdc_vehseats;
+-- an older host sends kind and name only: seat 1 or 2; without "sw" it has
+-- no seat key).
 local function on_vseat(f)
     if not client_ready() then return end
     host_cap = true
@@ -2197,29 +3224,89 @@ local function on_vseat(f)
     end
     local v = vehicle_by(local_seat.vaddr, local_seat.vname)
     if kind == "none" then
-        if v then local_force_exit(v, f[2] ~= "" and f[2] or "?") else local_seat = nil end
+        if v then local_force_exit(v, f[2] ~= "" and f[2] or "?", tonumber(f[3])) else local_seat = nil end
         return
     end
-    local was = local_seat.seat
+    local p = M.vseats.parse_vseat(f)
+    local was, was_idx = local_seat.seat, local_seat.idx
     local_seat.seat = kind == "driver" and "driver" or "passenger"
+    local_seat.idx = (p and p.idx) or (local_seat.seat == "driver" and 1 or 2)
+    local_seat.geo = (local_seat.seat == "passenger" and p and p.geo) or nil
+    local_seat.sw = p ~= nil and p.sw == true
+    local same = was == local_seat.seat and was_idx == local_seat.idx
     if was ~= local_seat.seat then local_seat.seat_at = os.clock() end
     if v then
         set_requires(v, local_seat.seat ~= "driver")
         -- this machine's own entry put us at the wheel; sit where the host
-        -- seated us (the attachment the host replicates says the same)
+        -- seated us (the attachment the host replicates says the same; a
+        -- seat tuned live on the host comes again with its new numbers)
         local lp = ue.local_pawn()
         if lp and parent_vehicle(lp) == local_seat.vaddr and (local_seat.seat == "passenger" or was == "passenger") then
-            local loc, rot = seat_transform(v, local_seat.seat == "passenger")
-            if loc then pcall(function() lp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
+            SEATK.place_local(v, lp)
         end
     end
+    -- the game's notice; none for the same seat again ("Seat N of M" where
+    -- the car has more than 2, else as before; no name: nobody drives)
+    local name = f[2] or "?"
     if local_seat.seat == "passenger" then
-        log.say("veh_passenger", "info", 5, f[2] or "?")
+        if not same and (not p or p.tell) then
+            if p and name == "" then
+                log.say("veh_seat_free", "info", 5, p.n, p.m)
+            elseif p and p.m and p.m > 2 then
+                log.say("veh_seat", "info", 5, p.n, p.m, name)
+            else
+                log.say("veh_passenger", "info", 5, name)
+            end
+        end
     elseif was == "passenger" then
-        log.say("veh_driver_now", "info", 4)
+        -- (its seat key took it to the wheel: "Seat 1 of M" where the car
+        -- has more than 2, as every move)
+        if p and p.m and p.m > 2 then log.say("veh_seat_driver", "info", 5, p.m) else log.say("veh_driver_now", "info", 4) end
+    elseif p and p.tell and p.m and p.m > 2 and not same then
+        log.say("veh_seat_driver", "info", 5, p.m)
     end
-    seat_log("this player", local_seat.vname, local_seat.seat,
-        "the host's answer" .. ((f[2] and f[2] ~= "") and ("; " .. f[2] .. " drives") or "") .. "; was " .. tostring(was))
+    seat_log("this player", local_seat.vname, local_seat.seat .. (local_seat.seat == "passenger" and (" seat " .. local_seat.idx) or ""),
+        "the host's answer" .. ((f[2] and f[2] ~= "") and ("; " .. f[2] .. " drives") or "") .. "; was " .. tostring(was)
+        .. (p and string.format(" (seat %d of %s)", p.n, tostring(p.m)) or " (an older host: seats 1-2)"))
+end
+
+-- VSWR|kind[|M or name]: the host on this player's seat key (sdc_vehseats
+-- header): "wheel" = the driver left, the wheel is free (once); "full" = no
+-- free seat; "taken" = somebody took the free wheel just before (it stays);
+-- "no" = it could not move this player.
+function SEATK.on_vswr(f)
+    if not client_ready() then return end
+    local kind = f[1]
+    local pass = local_seat ~= nil and local_seat.seat == "passenger"
+    if kind == "wheel" then
+        if pass then SEATK.say_wheel_free() end
+    elseif kind == "taken" then
+        if pass then log.say("veh_wheel_taken", "info", 4, (f[2] and f[2] ~= "") and f[2] or "?") end
+    elseif kind == "full" then
+        log.say("veh_switch_none", "info", 4)
+    else
+        log.say("veh_switch_failed", "warn", 4)
+    end
+    log.info("vehicles: seat key: the host's answer '%s%s' (this player: %s)", tostring(kind), f[2] and ("|" .. tostring(f[2])) or "",
+        local_seat and (tostring(local_seat.seat) .. (local_seat.idx and (" seat " .. local_seat.idx) or "")) or "not seated")
+end
+
+-- This machine's player is a client and pressed its seat key (game thread,
+-- SEATK.on_key): a passenger asks the host (VSWITCH; the host moves it and
+-- answers VSEAT, or VSWR); with an older host (no "sw" in its VSEAT) the key
+-- does nothing there: a notice. Returns the log text.
+function SEATK.client_key()
+    if not client_ready() then return "not connected" end
+    local ls = local_seat
+    if not ls or ls.seat ~= "passenger" then return "not a passenger (" .. tostring(ls and ls.seat) .. ")" end
+    local v = vehicle_by(ls.vaddr, ls.vname)
+    if not v then return "its vehicle is gone" end
+    if not ls.sw then
+        log.say("veh_switch_old_host", "warn", 5)
+        return "the host has no seat key (an older version of the mod)"
+    end
+    to_host("VSWITCH", v)
+    return string.format("seat %s of %s: asked the host (VSWITCH)", tostring(ls.idx or 2), ls.vname)
 end
 
 local function apply_color(v, idx)
@@ -2241,11 +3328,9 @@ local function band(h)
     return 0
 end
 
--- VSTATE|x|y|z|class|colour|fuel|health|lights|engine|driver
-local function on_vstate(f)
-    if not client_ready() or not on("vehicle_state") then return end
-    local v = vehicle_at(tonumber(f[1]), tonumber(f[2]), tonumber(f[3]), f[4], MATCH_M)
-    if not v then return end
+-- One VSTATE record (x|y|z|class|colour|fuel|health|lights|engine|driver|
+-- driver id|passenger id) on this machine's copy v.
+function cpl.apply(v, f)
     local a = addr(v)
     local ap = applied[a]
     if not ap or ap.name ~= ue.short(v) then
@@ -2294,8 +3379,144 @@ local function on_vstate(f)
     ue.set_prop(v, "EngineOn?", engine)
     if (ue.prop(v, "LightsOn?") == true) ~= lights and t - (ap.lights_local or -100) > 2 then
         apply(function() v:TurnOnOffLights() end)
+        -- (the host's wreck with its lights on: the game's function does not switch them on at 0 here)
+        if lights and ue.prop(v, "LightsOn?") ~= true then
+            log.info("vehicles: state: %s: the host's lights are on: %s", ue.short(v), SEATK.lights_back(v))
+        end
     end
     M.stats.states_applied = M.stats.states_applied + 1
+end
+
+-- VSTATE|*|<record>|<record>|... (the host's vehicles near this player, one
+-- message a tick), or VSTATE|<record> (one vehicle, as before 0.7.3). A
+-- packed message is matched against one vehicle list (refreshed every 2 s);
+-- a record whose vehicle is not in it (just bought, or out of this machine's
+-- network range) rescans it at most every RESCAN_S.
+local function on_vstate(f)
+    if not client_ready() or not on("vehicle_state") then return end
+    if f[1] ~= "*" then
+        local v = vehicle_at(tonumber(f[1]), tonumber(f[2]), tonumber(f[3]), f[4], MATCH_M)
+        if v then cpl.apply(v, f) end
+        return
+    end
+    discover_slow()
+    local miss = nil
+    for i = 2, #f - 11, 12 do
+        local r = table.move(f, i, i + 11, 1, {})
+        local v = vehicle_at(tonumber(r[1]), tonumber(r[2]), tonumber(r[3]), r[4], MATCH_M, true)
+        if v then
+            cpl.apply(v, r)
+        else
+            miss = miss or {}
+            miss[#miss + 1] = r
+        end
+    end
+    local t = os.clock()
+    if not miss or t - cpl.rescan_at < cpl.RESCAN_S then return end
+    cpl.rescan_at = t
+    discover(true)
+    for _, r in ipairs(miss) do
+        local v = vehicle_at(tonumber(r[1]), tonumber(r[2]), tonumber(r[3]), r[4], MATCH_M, true)
+        if v then cpl.apply(v, r) end
+    end
+end
+
+-- A vehicle's VOCC list counts while it came with the latest VSTATE of that
+-- vehicle (the host sends it next to each VSTATE record of a car with a
+-- seat 3+ taken): an older one (a VSTATE came without it) is stale - field 12
+-- of VSTATE says who sits then.
+function cpl.occ_fresh(ap, t)
+    return ap.occ_x ~= nil and (ap.occ_at or -100) >= (ap.at or -100) - 0.25 and t - (ap.at or -100) < 3 * STATE_EVERY_S
+end
+
+-- VOCC|*|x|y|z|class|occ|...: the seats 2+ of the host's vehicles near this
+-- player that have someone in a seat 3+ (sdc_vehseats.parse_occ; a bad
+-- entry is skipped). client_place sits a seated player there when the
+-- engine's attachment did not arrive.
+function cpl.on_occ(f)
+    if not client_ready() or not on("vehicle_state") or f[1] ~= "*" then return end
+    discover_slow()
+    local t = os.clock()
+    for i = 2, #f - 4, 5 do
+        local x, y, z, cls = tonumber(f[i]), tonumber(f[i + 1]), tonumber(f[i + 2]), f[i + 3]
+        local v = vehicle_at(x, y, z, cls, MATCH_M, true) or vehicle_at(x, y, z, cls, MATCH_M)
+        if v then
+            local a = addr(v)
+            local ap = applied[a]
+            if not ap or ap.name ~= ue.short(v) then
+                ap = { name = ue.short(v) }
+                applied[a] = ap
+            end
+            ap.occ_x, ap.occ_at = M.vseats.parse_occ(f[i + 4]), t
+        end
+    end
+end
+
+-- The vehicles with a seat 3+ taken (seat_tick: SEATK.cam): on the host
+-- from its records, on a client from its own seat and the fresh VOCC lists
+-- (an older host sends none: two seats, nothing behind).
+function SEATK.rear_set()
+    local out = {}
+    if S and S.role == "host" then
+        for a, st in pairs(vs) do
+            if M.vseats.rear_taken(st) then out[a] = true end
+        end
+        return out
+    end
+    if local_seat and (local_seat.idx or 0) >= 3 then out[local_seat.vaddr] = true end
+    local t = os.clock()
+    for a, ap in pairs(applied) do
+        if cpl.occ_fresh(ap, t) and M.vseats.rear_listed(ap.occ_x) then out[a] = true end
+    end
+    return out
+end
+
+-- The characters whose seat has the floor pose (seat_tick): on the host
+-- from its records (each passenger's seat geometry), on a client from its
+-- own seat and VOCC. Empty almost always (floor seats are stage 2).
+function SEATK.floor_set(list)
+    local out = {}
+    if S and S.role == "host" then
+        for _, st in pairs(vs) do
+            for _, key in pairs(st.pax or {}) do
+                local seat = seats[key]
+                if seat and seat.geo and seat.geo.pose == "floor" then
+                    local pc = remote_pc_of(key)
+                    local ch = pc and ue.pawn_of(pc)
+                    local ca = ch and addr(ch)
+                    if ca then out[ca] = true end
+                end
+            end
+            if st.host_seat == "passenger" and st.host_geo and st.host_geo.pose == "floor" then
+                local ca = addr(ue.local_pawn())
+                if ca then out[ca] = true end
+            end
+        end
+        return out
+    end
+    if local_seat and local_seat.geo and local_seat.geo.pose == "floor" then
+        local ca = addr(ue.local_pawn())
+        if ca then out[ca] = true end
+    end
+    local t, ids = os.clock(), nil
+    for _, ap in pairs(applied) do
+        if cpl.occ_fresh(ap, t) then
+            for _, o in ipairs(ap.occ_x) do
+                if o.geo.pose == "floor" then
+                    if not ids then
+                        ids = {}
+                        for _, ch in ipairs(list) do
+                            local id = pawn_id(ch)
+                            if id then ids[tostring(id)] = ch end
+                        end
+                    end
+                    local ca = addr(ids[o.id])
+                    if ca then out[ca] = true end
+                end
+            end
+        end
+    end
+    return out
 end
 
 horn_client = function(f)
@@ -2318,6 +3539,9 @@ function fx.report(v, ap, why)
         log.info("vehicles: refuel: this player refuelled %s here: %.0f -> %.0f of %.0f (+%.0f; %s), %s",
             ue.short(v), ap.fuel, fuel, maxf or -1, add, why, ok and "sent to the host" or "NOT sent (no connection)")
         ap.fuel, ap.raised_at, sent = fuel, t, true
+        -- (this player's running refuel hold: its end asks nothing more)
+        local h = fx.holds[addr(v)]
+        if h and h.kind == "refuel" then h.sent = true end
     end
     local hp, maxh = health_of(v)
     if hp and ap.health and hp > ap.health + 0.5 then
@@ -2326,6 +3550,8 @@ function fx.report(v, ap, why)
         log.info("vehicles: repair: this player repaired %s here: %.0f -> %.0f of %.0f (+%.0f; %s), %s",
             ue.short(v), ap.health, hp, maxh or -1, add, why, ok and "sent to the host" or "NOT sent (no connection)")
         ap.health, ap.raised_at, sent = hp, t, true
+        local h = fx.holds[addr(v)]
+        if h and h.kind == "repair" then h.sent = true end
     end
     return sent
 end
@@ -2441,22 +3667,223 @@ local function on_vi_post(self_p, enter_p, vref_p)
     if not (ch and ue.valid(v)) then return end
     local va = addr(v)
     local pa = ue.try(function() return ch:GetAttachParentActor() end)
-    if ue.valid(pa) and addr(pa) == va then return end
+    if ue.valid(pa) and addr(pa) == va then
+        -- The get-in's delayed step reached the client it was for: that
+        -- client's player-0 window on this vehicle (scope_key, SCOPE_S) is
+        -- done - its last call of the get-in. Kept open, it took the host's
+        -- own player-0 calls on this car in the rest of that second (the
+        -- prompt when the host looks at it). (With the host in the car the
+        -- window closed at the get-in already: SEATK.early_step.)
+        local st = vs[va]
+        local mine = locally_controlled(ch)
+        if st and st.scope_key and not mine then
+            local pc = remote_pc_of(st.scope_key)
+            local sc = pc and ue.pawn_of(pc)
+            if sc and addr(sc) == addr(ch) and os.clock() < (st.scope_till or 0) then st.scope_till = os.clock() end
+        end
+        -- the step of a get-in that SEATK.early_step ran already, to the host in its seat
+        if st and mine and os.clock() < (st.step_till or 0) then SEATK.step_seen(ch, st, true) end
+        return
+    end
     local is_local = locally_controlled(ch)
     if is_local then apply(function() ch:ResetVehicleCameraArmLength() end) end
     char_out(ch)
     local cmc = ue.prop(ch, "CharacterMovement")
     if ue.valid(cmc) then pcall(function() cmc:SetMovementMode(MOVE_WALKING, 0) end) end
     forget_att(ch)
+    -- the host's own get-in step after SEATK.host_out (no free seat): expected
+    local rf = SEATK.refused
+    if is_local and rf and rf.va == va and os.clock() < rf.till then
+        SEATK.refused = nil
+        log.info("vehicles: seat: the get-in step of the host's refused entry into %s undone (no driving state, walking, camera back)",
+            ue.short(v))
+        return
+    end
+    -- the step of a get-in that SEATK.early_step ran already, to the host who got out in between
+    local sst = vs[va]
+    if is_local and sst and os.clock() < (sst.step_till or 0) then return SEATK.step_seen(ch, sst, false) end
     M.stats.stray_vi = M.stats.stray_vi + 1
     log.warn("vehicles: seat: the game's get-in step VehicleInteraction(true) for %s reached %s, who does not sit in it (attached to %s) -> undone: no driving state, walking again (else it stood beside the car without control until a second press)",
         ue.short(v), is_local and "the host" or char_label(ch), ue.valid(pa) and ue.short(pa) or "nothing")
 end
 
+-- Driver-only controls. In the game the one in a vehicle is its driver: the
+-- lights key (IA_Flashlight, VehicleDrivingComponent @1642..2229), the radial
+-- menu's light (BP_PlayerCharacter RadialMenuSelection @609..688), the horn
+-- (@8397..8816) and the flip key (@1166..1585) ask only InVehicle? and the
+-- driving component's Vehicle - and a passenger the mod seats has both, on
+-- its own machine. (Its throttle / brake / steering / handbrake reach
+-- nothing: its copy takes the replicated inputs, set_requires - the host
+-- passenger of a car nobody drives is held parked, SEATK.hold_frame; the
+-- radio window stays every seated player's, sdc_vehradio.) This machine's player
+-- is a passenger of v: a client by the host's answer (local_seat), the host
+-- by its seat record (sdc_vehseats host_idx) while attached there.
+function SEATK.pass_here(v)
+    if not (S and v) then return false end
+    local a = addr(v)
+    if S.role == "client" then
+        return local_seat ~= nil and local_seat.vaddr == a and local_seat.seat == "passenger"
+    end
+    local st = S.role == "host" and vs[a] or nil
+    return st ~= nil and M.vseats.host_idx(st) ~= nil and host_attached(a)
+end
+
+-- A passenger's own lights / horn on this machine (`undo`: the lights,
+-- switched back at once - the same frame, nothing shows or goes out, a
+-- wreck's too: SEATK.lights_back; the horn was muted while it played,
+-- SEATK.hush_snd / hush_ai, and is not passed on). The notice at most every
+-- 5 s. True: it was a passenger's.
+function SEATK.pass_block(v, undo)
+    if not SEATK.pass_here(v) then return false end
+    local how
+    if undo then
+        -- (the lights before this press: a Blueprint hook sees only the after;
+        -- asked only of a wreck - above 0 health the game's switch is its own undo)
+        local was_on = SEATK.flip_va == addr(v) and SEATK.lights_was == true
+        apply(function() v:TurnOnOffLights() end)
+        how = "switched back"
+        if was_on and ue.prop(v, "LightsOn?") ~= true and (health_of(v) or 1) <= 0 then how = SEATK.lights_back(v) end
+    else
+        local h = SEATK.hush_now or {}
+        SEATK.hush_now = nil
+        how = string.format("not passed on; muted here: sound %s, AI noise %s", h.snd and "yes" or "NO", h.ai and "yes" or "NO")
+    end
+    local t = os.clock()
+    if t - (SEATK.pass_note_at or -100) > 5 then
+        SEATK.pass_note_at = t
+        log.say("veh_driver_only", "info", 4)
+    end
+    log.info("vehicles: driver only: this player (a passenger) %s in %s: %s", undo and "switched the lights" or "honked",
+        ue.short(v), how)
+    return true
+end
+
+-- The game's TurnOnOffLights switches off always but on only while the
+-- vehicle's CurrentHealth > 0 (BP_VehicleMaster TurnOnOffLights @344..418),
+-- and a wreck keeps its lights (at 0 only the engine stops, @27198): a
+-- passenger's radial-menu light (no engine check, BP_PlayerCharacter
+-- RadialMenuSelection @609..688; the lights key needs the engine) switched
+-- a wreck's lights off for good, on the host's copy for everyone. Back on
+-- with the game's own function, the health above 0 for that one call and
+-- put back right after. Also for the host's lights in a VSTATE (cpl.apply).
+-- Returns the log text.
+function SEATK.lights_back(v)
+    local h, _, hc = health_of(v)
+    if not (h and hc) then return "NOT switched back (a wreck: no health to read)" end
+    ue.set_prop(hc, "CurrentHealth", 1)
+    apply(function() v:TurnOnOffLights() end)
+    ue.set_prop(hc, "CurrentHealth", h)
+    return string.format("switched back (a wreck, health %.0f: on again through the game's function, its health above 0 for that call)%s",
+        h, ue.prop(v, "LightsOn?") == true and "" or " - STILL OFF")
+end
+
+-- The lights of the vehicle this machine's player sits in as a passenger
+-- (flip_va), as last seen: flip_hold each tick, and every TurnOnOffLights
+-- this module runs on it (on_lights_post, applying) - so a passenger's press
+-- finds the state before it (SEATK.pass_block).
+function SEATK.lights_seen(p)
+    local v = hook_self(p)
+    if v and addr(v) == SEATK.flip_va then SEATK.lights_was = ue.prop(v, "LightsOn?") == true end
+end
+
+-- A passenger's horn makes no sound and calls no zombie (in single player
+-- only the driver has one). The game's Horn plays Cue_Horn
+-- (GameplayStatics.PlaySoundAtLocation, WorldContext = the vehicle, @90)
+-- and reports an AI noise (AISense_Hearing.ReportNoiseEvent, Instigator =
+-- the vehicle, MaxRange 8500 = 85 m, @191; the vehicle's driving noise has
+-- the driver as Instigator, 3500, @23260). The Blueprint hook (on_horn_post)
+-- runs after the function, so these two natives are caught before
+-- (sdc_ue.hook_native, pre) while this machine's player sits in that
+-- vehicle as a passenger (flip_va) and it is not the driver's horn this
+-- module plays (apply): VolumeMultiplier 0; Loudness 0 and MaxRange 1 cm
+-- (0 would mean "no limit"). On the host this is the noise the zombies hear.
+-- Subscribed the first time this machine's player sits as a passenger
+-- (flip_hold); with nobody seated so, both return at once.
+SEATK.HUSH = { snd = "/Script/Engine.GameplayStatics:PlaySoundAtLocation",
+               ai = "/Script/AIModule.AISense_Hearing:ReportNoiseEvent" }
+function SEATK.hush_hooks()
+    if SEATK.hush_on or not ue.hook_native then return end
+    SEATK.hush_on = true
+    for _, kind in ipairs({ "snd", "ai" }) do
+        local ok, err = ue.hook_native(SEATK.HUSH[kind], "vehicles.hush", SEATK["hush_" .. kind])
+        log.info("vehicles: driver only: %s hook (a passenger's horn muted) %s%s", SEATK.HUSH[kind]:match(":([%w_]+)$"),
+            ok and "ok" or "FAILED ", ok and "" or tostring(err))
+    end
+end
+
+function SEATK.hush_set(p, x, kind)
+    local ok = pcall(function() p:set(x) end)
+    local back = ok and get(p) or nil
+    if type(back) == "number" and math.abs(back - x) < 0.001 then
+        SEATK.hush_now = SEATK.hush_now or {}
+        SEATK.hush_now[kind] = true
+    else
+        log.err_throttled("veh.hush." .. kind, "vehicles: driver only: could not mute a passenger's horn (%s: set ok=%s, reads %s)",
+            kind, tostring(ok), tostring(back))
+    end
+end
+
+-- PlaySoundAtLocation(WorldContext, Sound, Location, Rotation, VolumeMultiplier, ...)
+function SEATK.hush_snd(_, wco_p, sound_p, _, _, vol_p)
+    local va = SEATK.flip_va
+    if va == nil or applying > 0 or addr(get(wco_p)) ~= va then return end
+    if not ue.short(get(sound_p)):find("Horn", 1, true) then return end
+    SEATK.hush_set(vol_p, 0, "snd")
+end
+
+-- ReportNoiseEvent(WorldContext, NoiseLocation, Loudness, Instigator, MaxRange, Tag)
+function SEATK.hush_ai(_, _, _, loud_p, inst_p, range_p)
+    local va = SEATK.flip_va
+    if va == nil or applying > 0 or addr(get(inst_p)) ~= va then return end
+    SEATK.hush_set(loud_p, 0, "ai")
+    SEATK.hush_set(range_p, 1, "ai")
+end
+
+-- The flip key of a passenger here: the vehicle's Flipped (the game's 1 s
+-- guard after a flip, @25339 / @2968; not saved, not replicated) is held on
+-- this machine's copy while this player sits in it as a passenger, so the
+-- game answers with its own "Cannot flip vehicle" (@25405 -> @24871) and
+-- moves nothing. Let go (false) when the seat ends or becomes the driver's,
+-- for a VFLIP of the driver (on_vflip), and on a reset (`free`).
+function SEATK.flip_hold(free)
+    local a = nil
+    if not free and S and enabled() then
+        if S.role == "client" then
+            if local_seat and local_seat.seat == "passenger" then a = local_seat.vaddr end
+        elseif S.role == "host" then
+            local hp = ue.local_pawn()
+            local pa = hp and parent_vehicle(hp)
+            local st = pa and vs[pa]
+            if st and M.vseats.host_idx(st) then a = pa end
+        end
+    end
+    local held = SEATK.flip_va
+    if held and held ~= a then
+        local v = cur.by[held]
+        if v and ue.valid(v) then ue.set_prop(v, "Flipped", false) end
+        SEATK.flip_va, SEATK.lights_was = nil, nil
+        log.info("vehicles: driver only: flip key of %s free again", v and ue.short(v) or "a vehicle")
+    end
+    local v = a and cur.by[a]
+    if v and ue.valid(v) then
+        if ue.prop(v, "Flipped") ~= true then ue.set_prop(v, "Flipped", true) end
+        if held ~= a then log.info("vehicles: driver only: this player sits in %s as a passenger: its flip key held", ue.short(v)) end
+        SEATK.flip_va = a
+        -- (also the passenger's lights as they are now, and its horn muted: SEATK.lights_seen / hush_hooks)
+        SEATK.lights_was = ue.prop(v, "LightsOn?") == true
+        SEATK.hush_hooks()
+    end
+end
+
 local function on_lights_post(self_p)
-    if applying > 0 or not enabled() then return end
+    if applying > 0 then
+        if SEATK.flip_va ~= nil then SEATK.lights_seen(self_p) end
+        return
+    end
+    if not enabled() then return end
     local v = hook_self(self_p)
     if not v then return end
+    if SEATK.pass_block(v, true) then return end
     if S and S.role == "client" then
         if host_cap and in_local_seat(v, DRIVING) then
             local a = addr(v)
@@ -2475,8 +3902,9 @@ local function on_horn_post(self_p)
     if applying > 0 or not enabled() then return end
     local v = hook_self(self_p)
     if not v then return end
+    if SEATK.pass_block(v, false) then return end
     if S and S.role == "client" then
-        if host_cap and in_local_seat(v) then to_host("VHORN", v) end
+        if host_cap and in_local_seat(v, DRIVING) then to_host("VHORN", v) end
     elseif host_live() then
         host_horn_broadcast(v, nil)
     end
@@ -2485,15 +3913,33 @@ end
 local function on_flip_post(self_p)
     if applying > 0 or not enabled() then return end
     local v = hook_self(self_p)
+    if v and SEATK.flip_va ~= nil and SEATK.flip_va == addr(v) then
+        log.info("vehicles: driver only: this player (a passenger) pressed the flip key in %s: the game's \"Cannot flip vehicle\" (flip_hold)",
+            ue.short(v))
+    end
     if v and S and S.role == "client" and host_cap and in_local_seat(v, DRIVING) then to_host("VFLIP", v) end
 end
 
+-- AddTowingComp / RemoveTowingComp (post), client: this player's own "Tow
+-- Vehicle" / "Detach Vehicle" (the game offers it only to a player on foot at
+-- the tow box, so no seat is asked for; the player stands at that vehicle).
+-- A detach runs both functions (AddTowingComp -> RemoveTowingComp): the same
+-- state of the same vehicle within half a second goes once.
 local function on_tow_post(self_p)
     if applying > 0 or not enabled() then return end
     local v = hook_self(self_p)
-    if v and S and S.role == "client" and host_cap and in_local_seat(v, DRIVING) then
-        to_host("VTOW", v, ue.prop(v, "TowingVehicle?") == true and "1" or "0")
-    end
+    if not (v and S and S.role == "client" and host_cap) then return end
+    local lp = ue.local_pawn()
+    local pl, vl = lp and ue.location(lp), ue.location(v)
+    if not (pl and vl) or d2(pl, vl) > NEAR_M * NEAR_M then return end
+    local want = ue.prop(v, "TowingVehicle?") == true and "1" or "0"
+    local a, t = addr(v), os.clock()
+    local last = fx.tow_sent
+    if last and last.a == a and last.want == want and t - last.t < 0.5 then return end
+    fx.tow_sent = { a = a, want = want, t = t }
+    local ok = to_host("VTOW", v, want)
+    log.info("vehicles: tow: this player %s %s here: %s", want == "1" and "hitched a vehicle to" or "detached the towed vehicle of",
+        ue.short(v), ok and "sent to the host" or "NOT sent (no connection)")
 end
 
 local function on_push_post(self_p)
@@ -2551,11 +3997,20 @@ function buy.on_spawn(_, wco_p, class_p)
     end
 end
 
-function buy.hook_spawn()
-    if buy.spawn_hooked or not ue.hook_native then return end
-    buy.spawn_hooked = true
+-- The shared engine hook; a failed registration is tried again on the next
+-- ticks, up to `max_tries` (install_hooks).
+function buy.hook_spawn(max_tries)
+    if buy.spawn_hooked or buy.spawn_tries >= max_tries then return end
+    buy.spawn_tries = buy.spawn_tries + 1
     local ok, err = ue.hook_native(buy.SPAWN_FN, "vehicles.buy", safe("buy-spawn", buy.on_spawn))
-    log.info("vehicles: trader spawn hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+    buy.spawn_hooked = ok == true
+    if ok then
+        log.info("vehicles: trader spawn hook ok%s", buy.spawn_tries > 1 and string.format(" (try %d)", buy.spawn_tries) or "")
+    elseif buy.spawn_tries == 1 then
+        log.warn("vehicles: trader spawn hook FAILED %s; tried again each tick (up to %d tries)", tostring(err), max_tries)
+    elseif buy.spawn_tries >= max_tries then
+        log.err("vehicles: trader spawn hook FAILED %d times (%s): a client's own trader car is not blocked", max_tries, tostring(err))
+    end
 end
 
 -- BP_VehicleTraderSpawner.SpawnVehicle(Class), post. Host: its own purchase
@@ -2684,24 +4139,49 @@ function fx.on_interact(self_p, actor_p, opt_p)
     if applying > 0 or not enabled() or not S or (S.role ~= "host" and S.role ~= "client") then return end
     local v = hook_self(self_p)
     if not v then return end
+    local a = addr(v)
+    -- (this car's hold only: the game's IsHeld and delay are per vehicle, a
+    -- hold on another car runs on)
+    local h = fx.holds[a]
     local kind = fx.kind_of(ue.try(function() return ue.str(opt_p:get().TagName) end))
-    if not kind then return end
+    -- (another option: only while this player's hold on this car waits)
+    if not kind and not h then return end
     local lp = ue.local_pawn()
     local who = get(actor_p)
     if not (lp and ue.valid(who)) or addr(who) ~= addr(lp) then return end
-    local a = addr(v)
+    if not kind then
+        local t = os.clock()
+        if h.dur and t >= h.t0 + h.dur then
+            -- the hold's time was up: its last step ran before this press
+            -- (getting in right after the bar filled), no tick saw it yet
+            fx.hold_end(t, a)
+        elseif ue.prop(v, "IsHeld") ~= true then
+            -- any other option on this car during the hold (the game's
+            -- @17947: IsHeld set -> only cleared, nothing else): the game's
+            -- last step will find the flag down and do nothing - so
+            -- fx.hold_end must not take the flag down for that step
+            fx.holds[a] = nil
+            log.info("vehicles: %s: this player's hold on %s here ended by another option (the game's press only cleared its flag; its last step does nothing)",
+                h.kind, h.vname)
+        end
+        return
+    end
     local cur, max
     if kind == "refuel" then cur, max = fuel_of(v) else cur, max = health_of(v) end
     local outcome
     if ue.prop(v, "IsHeld") ~= true then
         -- @17947: IsHeld was already set, so this press only cleared it
-        if fx.hold and fx.hold.va == a then
+        if h then
             outcome = "stopped its running hold (the game's second press)"
         else
             outcome = "the game's hold flag was set: this press only cleared it"
         end
-        fx.hold = nil
+        fx.holds[a] = nil
     else
+        -- an earlier hold on this car whose time is up and whose end no tick
+        -- has seen yet: its last step ran (the flag was down for this press)
+        -- - its ask first
+        if h and h.dur and os.clock() >= h.t0 + h.dur then fx.hold_end(os.clock(), a) end
         local full
         if kind == "refuel" then full = cur ~= nil and max ~= nil and cur >= max
         else full = cur ~= nil and max ~= nil and cur > max - 1 end
@@ -2714,8 +4194,18 @@ function fx.on_interact(self_p, actor_p, opt_p)
         else
             local dur = num(ue.prop(v, "Duration")) or 10
             local t = os.clock()
-            fx.hold = { va = a, vname = ue.short(v), kind = kind, t0 = t, till = t + dur + 1 }
-            outcome = string.format("hold started (%.0f s, %s found)", dur, fx.item_name(kind))
+            -- v0: the value at the press (fx.hold_end's line; `sent`: fx.report
+            -- sent an add the game made here during this hold)
+            fx.holds[a] = { va = a, vname = ue.short(v), kind = kind, t0 = t, till = t + dur + 1, dur = dur, v0 = cur, has = has }
+            -- (has nil: the item asset is not in memory here - not looked for)
+            outcome = string.format("hold started (%.0f s, %s %s)", dur, fx.item_name(kind),
+                has == true and "found here" or "not checked here")
+            -- (a hold on another car runs on beside it, the game's own on each)
+            local other = {}
+            for oa, oh in pairs(fx.holds) do
+                if oa ~= a and oh.dur and t < oh.t0 + oh.dur then other[#other + 1] = oh.kind .. " on " .. oh.vname end
+            end
+            if #other > 0 then outcome = outcome .. "; this player's hold still running beside it: " .. table.concat(other, ", ") end
         end
         if full or has == false then
             -- the game leaves IsHeld set (@18506, then returns): the next press
@@ -2742,17 +4232,17 @@ function fx.on_gascan(self_p)
     if S.role == "client" then
         local ap = applied[a]
         if not host_cap then
-            if fx.hold and fx.hold.va == a then fx.hold = nil end
+            fx.holds[a] = nil
             log.warn("vehicles: refuel: the game's UseGasCan ran on %s here (fuel %.0f of %.0f), but the host runs no vehicle sync: not sent",
                 ue.short(v), fuel or -1, maxf or -1)
         elseif ap and fx.report(v, ap, "the game's UseGasCan") then
-            if fx.hold and fx.hold.va == a then fx.hold = nil end
+            fx.holds[a] = nil
         else
             -- (its note normally asked already; one ask per hold either way)
             fx.ask(v, "refuel", "the game's UseGasCan added nothing here")
         end
     else
-        if fx.hold and fx.hold.va == a then fx.hold = nil end
+        fx.holds[a] = nil
         local st = vs[a]
         if st then st.dirty = true end
         fx.widgets(v)
@@ -2779,13 +4269,19 @@ function fx.box(kind, ended)
         local a = addr(v)
         local box = kind == "refuel" and "fuel" or "repair"
         if addr(who) == addr(lp) then
-            local h = fx.hold
+            local h = fx.holds[a]
             local note = ""
-            if ended and h and h.va == a then
-                fx.hold = nil
+            local t = os.clock()
+            if ended and h and S.role == "client" and h.dur and t >= h.t0 + h.dur and not h.out then
+                -- the hold's time is up: the game's last step has run (a client's
+                -- tick asks the host for it a moment later, fx.hold_end); a player
+                -- walking off as the bar fills keeps its refuel / repair
+                h.out = t
+                note = string.format("; its %s hold's time was up %.1f s before: the tick looks at its end", h.kind, t - h.t0 - h.dur)
+            elseif ended and h and not h.out then
+                fx.holds[a] = nil
                 note = string.format("; its %s hold stopped (the game: leaving a box)", h.kind)
             end
-            local t = os.clock()
             local k = tostring(a) .. box .. tostring(ended)
             if note ~= "" or t - (fx.box_log[k] or -100) > 10 then
                 fx.box_log[k] = t
@@ -2806,8 +4302,11 @@ function fx.box(kind, ended)
             end)
             back[#back + 1] = kind == "refuel" and "Refuel Vehicle" or "Repair Vehicle"
         end
-        local h = fx.hold
-        if h and h.va == a and os.clock() < h.till and ue.prop(v, "IsHeld") ~= true then
+        local h = fx.holds[a]
+        -- (only while the hold's time runs: after it the game's last step has
+        -- cleared the flag itself, and a flag set again would never come down)
+        if h and not h.out and os.clock() < (h.dur and h.t0 + h.dur or h.till)
+            and ue.prop(v, "IsHeld") ~= true then
             ue.set_prop(v, "IsHeld", true)
             fx.timer_ui(v, h.kind)
             back[#back + 1] = "its " .. h.kind .. " hold"
@@ -2864,7 +4363,7 @@ function fx.ask(v, kind, why)
     local t = os.clock()
     if t - (fx.asked[k] or -100) < fx.ask_gap_s then return false end
     fx.asked[k] = t
-    if fx.hold and fx.hold.va == a then fx.hold = nil end
+    fx.holds[a] = nil
     local note = kind == "refuel" and fx.NO_GAS or fx.NO_KIT
     local off = fx.unnote(note)
     if not off then ue.delay("veh-unnote", 100, function() fx.unnote(note) end) end
@@ -2895,10 +4394,89 @@ function fx.on_note(_, msg_p, _, _, _, _, wco_p)
     if not kind then return end
     local v = get(wco_p)
     local a = ue.valid(v) and addr(v)
-    if not a then return end
-    if not cur.by[a] then discover(true) end
-    if not cur.by[a] then return end
+    if a and not cur.by[a] then discover(true) end
+    -- (13.11: in the game this hook never saw these notes; this line says
+    -- whether it does now, and with which context)
+    log.info("vehicles: %s: the game's note '%s' seen here (context %s%s)", kind, text,
+        ue.valid(v) and ue.short(v) or "none", (a and cur.by[a]) and "" or ": no vehicle of this list")
+    if not (a and cur.by[a]) then return end
     fx.ask(v, kind, "its note '" .. text .. "'")
+end
+
+-- Client, every tick: the end of this player's hold. The game's last step
+-- (UseGasCan @1887 / the kit branch @1902, both clear IsHeld first) cannot
+-- take the item here; its note was to ask the host (fx.on_note), but in the
+-- game no such note ever reached that hook (13.11, 0.11.0: two repair holds
+-- ran out with nothing sent; the one refuel ask came from UseGasCan's own
+-- hook), and the kit branch has no function to hook. So: the hold's time is
+-- up, the game's flag is down, nothing was added here and this player is not
+-- outside the box (or it walked off after the hold's time, h.out) -> the
+-- same ask (fx.ask, one per hold). The flag still up `late_s` after `till`:
+-- the game never ran its delay (its own item check failed, or the hold was
+-- set again) - the flag goes, nothing asked. Host: the game's own step takes
+-- the item there; a hold record is only let go.
+-- Every car's hold on its own (fx.holds: the game's IsHeld and delay are per
+-- vehicle). `ran_va`: only that car's hold, whose last step is known to have
+-- run (a new press on that car before the tick saw the old hold's end: its
+-- flag was down).
+function fx.hold_end(t, ran_va)
+    if not S then return end
+    if ran_va then
+        local h = fx.holds[ran_va]
+        if h then fx.hold_end_of(h, t, true) end
+        return
+    end
+    local list = {}
+    for _, h in pairs(fx.holds) do list[#list + 1] = h end
+    if #list == 0 then return end
+    table.sort(list, function(x, y) return x.t0 < y.t0 end)
+    for _, h in ipairs(list) do
+        if fx.holds[h.va] == h then fx.hold_end_of(h, t, false) end
+    end
+end
+
+function fx.hold_end_of(h, t, ran)
+    if not ran and t < h.t0 + (h.dur or 10) + fx.end_s then return end
+    if S.role ~= "client" or not h.dur then
+        if ran or t >= h.till + fx.late_s then fx.holds[h.va] = nil end
+        return
+    end
+    local v = vehicle_by(h.va, h.vname)
+    if not v then
+        fx.holds[h.va] = nil
+        log.warn("vehicles: %s: the game's hold on %s here ended; the vehicle is gone here: nothing asked", h.kind, h.vname)
+        return
+    end
+    local what = h.kind == "refuel" and "fuel" or "health"
+    local now, max
+    if h.kind == "refuel" then now, max = fuel_of(v) else now, max = health_of(v) end
+    if not ran and ue.prop(v, "IsHeld") == true then
+        if t < h.till + fx.late_s then return end
+        fx.holds[h.va] = nil
+        ue.set_prop(v, "IsHeld", false)
+        log.warn("vehicles: %s: the game's hold on %s here still up %.1f s after its time (%s %.0f of %.0f, %s %s): its last step never ran; flag cleared, nothing asked",
+            h.kind, h.vname, t - h.t0 - h.dur, what, now or -1, max or -1, fx.item_name(h.kind),
+            h.has == true and "found here at the press" or "not checked here at the press")
+        return
+    end
+    fx.holds[h.va] = nil
+    if h.sent then
+        -- the game's own add here, already sent to the host (fx.report)
+        log.info("vehicles: %s: the game's hold on %s here ended with %s %.0f -> %.0f added here and sent: nothing asked",
+            h.kind, h.vname, what, h.v0 or -1, now or -1)
+        return
+    end
+    -- (a value raised only by the host - its own refuel / repair meanwhile,
+    -- or its answer to an earlier hold: this hold still asks; the host
+    -- answers "full" when nothing is left)
+    local lp = ue.local_pawn()
+    if not h.out and lp and fx.inside(v, lp, h.kind) == false then
+        log.info("vehicles: %s: the game's hold on %s here ended with this player outside the %s box: nothing asked",
+            h.kind, h.vname, what == "fuel" and "fuel" or "repair")
+        return
+    end
+    fx.ask(v, h.kind, string.format("seen in the tick: the game's hold ended %.1f s ago, its flag down, %s %.0f -> %.0f here%s",
+        t - h.t0 - h.dur, what, h.v0 or -1, now or -1, h.out and ", this player walked off after its time" or ""))
 end
 
 -- The game's success step of a refuel / repair on this copy (UseGasCan
@@ -2936,7 +4514,14 @@ function fx.on_boxr(f)
     if kind ~= "refuel" and kind ~= "repair" then return end
     local v = vehicle_at(tonumber(f[3]), tonumber(f[4]), tonumber(f[5]), f[6], MATCH_M)
     local value, max = tonumber(f[7]), tonumber(f[8])
-    if not (fx.hold and fx.hold.kind == kind) then fx.timer_off() end
+    -- (the HUD's one timer bar: kept while a hold of this player still runs,
+    -- on this car - pressed again - or on another)
+    local running = false
+    local t = os.clock()
+    for _, h in pairs(fx.holds) do
+        if t < h.t0 + (h.dur or 10) then running = true end
+    end
+    if not running then fx.timer_off() end
     local what = kind == "refuel" and "fuel" or "health"
     if res == "ok" then
         if v and value then fx.done_here(v, kind, value) end
@@ -2985,12 +4570,15 @@ end
 --     CheckDistanceFromActor timer, AddJigWidgetToContent): a window that
 --     closes within QUICK_CLOSE_S of opening in a seat gets a line naming
 --     what closed it (0.7.0 client as a passenger: open 0.44 s / 0.31 s at
---     16:33:10 / 16:37:00; as the driver 34 s / 10 s at 16:52).
---   * Tab itself (UE4SS key bind, seated only): a press after which the
---     IA_Inventory event never ran (the key did not reach the character)
---     gets a line; in the passenger seat, with Tab mapped to IA_Inventory,
---     no modifier, no window / menu / console / cursor up and nothing the
---     game would refuse, the window opens the game's way (ToggleInventory).
+--     16:33:10 / 16:37:00; as the driver 34 s / 10 s at 16:52). The three
+--     callers' hooks only name the cause in that line: registered with
+--     config debug only.
+--   * Tab itself (read on the game thread each frame while seated): a press
+--     after which the IA_Inventory event never ran (the key did not reach
+--     the character) gets a line; in the passenger seat, with Tab mapped to
+--     IA_Inventory, no modifier, no window / menu / console / cursor up and
+--     nothing the game would refuse, the window opens the game's way
+--     (ToggleInventory).
 local ik = {
     IA = CHAR_PATH .. ":InpActEvt_IA_Inventory_K2Node_EnhancedInputActionEvent_63",
     INTERACT = CHAR_PATH .. ":InpActEvt_IA_Interact_K2Node_EnhancedInputActionEvent_61",
@@ -3009,7 +4597,7 @@ local ik = {
     toggle_at = nil, opened_at = nil,
     close = nil,            -- a quick close waiting for its caller's post-hook
     tab = nil,              -- { at, yes }: Tab is mapped to IA_Inventory here
-    bound = false,
+    poll = false,           -- the frame's Tab read is on (ik.maybe_seated, set by the 0.5 s tick)
 }
 
 function ik.live()
@@ -3131,7 +4719,8 @@ function ik.report_close()
     local fn = c.key and log.info or log.warn
     fn("vehicles: inventory: the window of %s (%s seat of %s) closed %.2f s after it opened, by %s",
         c.who, tostring(c.seat), c.vname, c.open_for,
-        c.cause or "no caller seen (not the inventory or interact key, no distance check, no loot / trade window)")
+        c.cause or (ik.callers_on and "no caller seen (not the inventory or interact key, no distance check, no loot / trade window)"
+            or "a caller not watched (not the inventory key; the interact key / distance check / loot window hooks are on with config debug only)"))
 end
 
 -- Post-hooks of the game's functions that call ToggleInventory: the caller of
@@ -3312,7 +4901,8 @@ end
 -- thread runs native hooks that take no lock. Lua on both threads at once
 -- broke the shared Lua registry. That was the 0.7.1 host crashes (lua_rawgeti /
 -- luaH_getint while wrapping a hook param); they began with this Tab bind.
--- Gate from Lua state only (no engine call); a stale seat only costs one key
+-- Gate from Lua state only (no engine call), read by the 0.5 s tick into
+-- ik.poll (a seat taken shows within 0.5 s); a stale seat only costs one key
 -- read a frame: on_tab checks the real seat.
 function ik.maybe_seated()
     if not ik.live() then return false end
@@ -3325,39 +4915,208 @@ function ik.maybe_seated()
     return local_seat ~= nil
 end
 
+-- The 0.5 s tick: the frame's Tab read on or off.
+function ik.set_poll(on)
+    if ik.poll and not on then ik.tab_down = false end
+    ik.poll = on == true
+end
+
 function ik.poll_tab()
-    if not ik.maybe_seated() then
-        ik.tab_down = false
-        return
-    end
     local pc = ue.local_pc()
     if not pc then return end
     if not ik.TAB_KEY then ik.TAB_KEY = { KeyName = FName("Tab") } end
     local down = ue.try(function() return pc:IsInputKeyDown(ik.TAB_KEY) end) == true
     if down and not ik.tab_down then ik.on_tab() end
     ik.tab_down = down
+    -- the seat key and a parked car's hold (below)
+    SEATK.frame(pc)
 end
 
-function ik.bind_tab()
-    if ik.bound then return end
-    ik.bound = true
-    log.info("vehicles: inventory key watch on (Tab read on the game thread each frame while seated, no UE4SS key bind)")
+-- ---------------------------------------------------------------------------
+-- The seat key (config vehicle_seat_key): read on the game thread
+-- ---------------------------------------------------------------------------
+-- As Tab above: no UE4SS key bind (its thread), the key's down state read in
+-- main.lua's frame loop - only while this machine's player sits as a
+-- passenger (ik.seat_poll, set by the 0.5 s tick: one key read a frame), a
+-- press = its down edge. G by default: no action of the game's IMC_General
+-- (one context on foot and in a vehicle; F interact / exit, WASD, Space,
+-- Shift, Tab, H horn, K flip, R radio, L, J, M, Y, digits are the game's;
+-- Enter the chat, F7 / F8 the mod's). A press while something holds the
+-- input (the chat line, a game window, the co-op panel, the console, the
+-- mouse cursor) does nothing.
+SEATK.GAME_KEYS = " # A B Backslash C D Down E Eight Equals Escape F F5 Five Four H Hyphen J K L Left LeftAlt LeftControl"
+    .. " LeftMouseButton LeftShift M MiddleMouseButton N Nine O One Q R Right RightMouseButton S Semicolon Seven"
+    .. " Six SpaceBar T Tab Three Two Up V W X Y Z "
+
+-- The mod's own keys (their defaults as their modules read them): a seat
+-- key on one of them is off - one press would do both (the frame reads the
+-- seat key before the chat's, so with chat_key = G a passenger's G moved it
+-- and opened the chat). The setting it clashes with, or nil.
+SEATK.MOD_KEYS = { { "chat_key", "Enter" }, { "menu_key", "F7" }, { "players_hud_key", "F8" } }
+function SEATK.clash(name)
+    for _, k in ipairs(SEATK.MOD_KEYS) do
+        local other = (tostring(cfg.get(k[1]) or ""):gsub("%s+", ""))
+        if other == "" then other = k[2] end
+        if other:lower() == name:lower() then return k[1] end
+    end
+    return nil
 end
 
--- main.lua's frame loop (game thread)
+-- The seat key: its FKey and name, or nil (config empty / "None": no key;
+-- one of the mod's own keys: off, a warning in the log).
+function SEATK.key()
+    local name = (tostring(cfg.get("vehicle_seat_key") or ""):gsub("%s+", ""))
+    local clash = name ~= "" and SEATK.clash(name)
+    if clash and SEATK.clash_seen ~= name .. "|" .. clash then
+        SEATK.clash_seen = name .. "|" .. clash
+        log.warn("vehicles: seat key: vehicle_seat_key = %s is also %s (the mod's own key): the seat key is off - set another one (G, U, P, I...)",
+            name, clash)
+    end
+    if name == "" or name:lower() == "none" or clash then
+        SEATK.key_fk, SEATK.key_name = nil, nil
+        return nil, nil
+    end
+    if name ~= SEATK.key_name then
+        -- (a key already down is no press)
+        SEATK.key_name, SEATK.key_fk, SEATK.key_was = name, { KeyName = FName(name) }, true
+        log.info("vehicles: seat key: %s%s", name, SEATK.GAME_KEYS:find(" " .. name .. " ", 1, true)
+            and " - also a key of the game (IMC_General): its action runs too" or "")
+    end
+    return SEATK.key_fk, name
+end
+
+-- The 0.5 s tick: read the seat key each frame (this machine's player is a
+-- passenger) and hold a parked car (the host sits in it as a passenger and
+-- nobody drives: SEATK.hold_frame).
+function SEATK.poll_flags()
+    local pass, hold = false, nil
+    if ik.live() then
+        if S.role == "host" then
+            local hp = ue.local_pawn()
+            local ha = hp and parent_vehicle(hp)
+            local st = ha and vs[ha]
+            if st and st.host_seat == "passenger" then
+                pass = true
+                if not st.driver_key then hold = ha end
+            end
+        else
+            pass = local_seat ~= nil and local_seat.seat == "passenger"
+        end
+    end
+    local want = pass and SEATK.key() ~= nil
+    if want and not ik.seat_poll then SEATK.key_was = true end
+    ik.seat_poll = want
+    -- (a car somebody tows: not held, SEATK.tower_of)
+    local towed = hold
+    local tower = hold and SEATK.tower_of(hold)
+    if tower then
+        if SEATK.tow_seen ~= towed then
+            log.info("vehicles: seat: %s, where the host sits as a passenger, is towed by %s: not held parked while it is",
+                vs[towed] and vs[towed].name or "?", ue.short(tower))
+        end
+        hold = nil
+    end
+    SEATK.tow_seen = tower and towed or nil
+    SEATK.hold_va = hold
+end
+
+-- The frame (ik.poll_tab, game thread): the seat key's press, the hold.
+function SEATK.frame(pc)
+    if ik.seat_poll and SEATK.key_fk then
+        local down = ue.try(function() return pc:IsInputKeyDown(SEATK.key_fk) end) == true
+        local was = SEATK.key_was
+        SEATK.key_was = down
+        if down and not was then SEATK.on_key() end
+    end
+    if SEATK.hold_va then SEATK.hold_frame() end
+end
+
+-- A press of the seat key (game thread).
+function SEATK.on_key()
+    if not ik.live() then return end
+    local who = S.role == "host" and "the host" or "this player"
+    local chat = package.loaded["sdc_chat"]
+    local busy = type(chat) == "table" and type(chat.is_open) == "function" and chat.is_open() == true and "the chat line" or nil
+    local pc = ue.local_pc()
+    busy = busy or ik.screen_busy() or (pc and ue.prop(pc, "bShowMouseCursor") == true and "the mouse cursor (a window holds the input)")
+    if busy then
+        log.info("vehicles: seat key: %s pressed it while %s is open: nothing done", who, tostring(busy))
+        return
+    end
+    local res = S.role == "host" and SEATK.host_key() or SEATK.client_key()
+    log.info("vehicles: seat key: %s: %s", who, tostring(res))
+end
+
+-- The host sits as a passenger in a car nobody drives (SEATK.hold_va: set
+-- by SEATK.wheel_free and the tick): its own driving keys still reach its
+-- copy - its driving component points at the car, and no replicated inputs
+-- are used once the driver left (set_requires false: the handbrake must
+-- hold). Every frame: the handbrake on (the game's throttle step then gives
+-- 0 itself, VehicleDrivingComponent @53..302), throttle and brake (its
+-- reverse) 0. Off once somebody drives, the host moves to the wheel or
+-- gets out, and while another vehicle tows it (SEATK.tower_of).
+function SEATK.hold_frame()
+    local a = SEATK.hold_va
+    local st = vs[a]
+    local v = cur.by[a]
+    if not (st and st.host_seat == "passenger" and not st.driver_key and v and ue.valid(v)) then
+        SEATK.hold_va = nil
+        return
+    end
+    local m = mcomp(v)
+    if not m then return end
+    if ue.try(function() return m:GetHandbrakeInput() end) ~= true then pcall(function() m:SetHandbrakeInput(true) end) end
+    pcall(function() m:SetThrottleInput(0) end)
+    pcall(function() m:SetBrakeInput(0) end)
+end
+
+-- The car vehicle t tows (its address), or nil. The game's hitch
+-- (AddTowingComp, BP_VehicleMaster @197..538) sets t's TowingVehicle? and
+-- adds the PhysicsConstraintComp to the towed car (its owner), then, a tick
+-- later, releases that car's handbrake and gives it throttle 0.01
+-- (@1168 / @1252); the detach (@28529..28916) puts them back.
+function SEATK.towed_by(t)
+    if not (t and ue.valid(t)) or ue.prop(t, "TowingVehicle?") ~= true then return nil end
+    local pcc = ue.prop(t, "PhysicsConstraintComp")
+    local o = ue.valid(pcc) and ue.try(function() return pcc:GetOwner() end) or nil
+    return o and ue.valid(o) and addr(o) or nil
+end
+
+-- The vehicle towing car a, or nil (the 0.5 s tick, only for a car the host
+-- sits in as a passenger with nobody at the wheel: SEATK.poll_flags). Held
+-- parked there, the hitched car was dragged with its handbrake on.
+function SEATK.tower_of(a)
+    for _, t in ipairs(cur.list) do
+        if SEATK.towed_by(t) == a then return t end
+    end
+    return nil
+end
+
+
+-- main.lua's frame loop (game thread). Nobody of this machine seated (the
+-- 0.5 s tick's flag): back at once, no pcall, no engine call (0.7.3 [PERF]
+-- f:vehicles 0.6-1.7 ms/s with nobody in a vehicle).
 function M.frame_tick()
+    if not ik.poll then return end
     local ok, err = pcall(ik.poll_tab)
     if not ok then log.err_throttled("veh.tab", "vehicles: Tab poll: %s", tostring(err)) end
 end
 
+-- For main.lua's frame loop: frame_tick has work this frame (a plain field
+-- read; the caller may skip its timing wrapper when false).
+function M.frame_wanted() return ik.poll == true end
+
+-- debug = true: the hook only writes log lines (the box entry of this
+-- player, the cause of a quick inventory close): registered with config
+-- debug only (each Blueprint hook costs on every call of its function).
 local HOOKS = {
     { path = SEATK.helper .. ":TryInteract", cb = on_try_interact_post },
     { path = VEH_PATH .. ":OnExecuteInteract", cb = fx.on_interact },
     { path = VEH_PATH .. ":UseGasCan", cb = fx.on_gascan },
     { path = fx.GFL_NOTE, cb = fx.on_note },
-    { path = VEH_PATH .. ":OnBeginFuelInteract", cb = fx.box("refuel", false) },
+    { path = VEH_PATH .. ":OnBeginFuelInteract", cb = fx.box("refuel", false), debug = true },
     { path = VEH_PATH .. ":OnEndFuelInteract", cb = fx.box("refuel", true) },
-    { path = VEH_PATH .. ":OnBeginRepairInteract", cb = fx.box("repair", false) },
+    { path = VEH_PATH .. ":OnBeginRepairInteract", cb = fx.box("repair", false), debug = true },
     { path = VEH_PATH .. ":OnEndRepairInteract", cb = fx.box("repair", true) },
     { path = VEH_PATH .. ":Interact_GetInVehicle", cb = on_enter_post },
     { path = VEH_PATH .. ":ExitVehicle", cb = on_exit_post },
@@ -3371,21 +5130,40 @@ local HOOKS = {
     { path = TRADER_PATH .. ":SpawnVehicle", cb = on_buy_post },
     { path = ik.TOGGLE, cb = ik.on_toggle },
     { path = ik.IA, cb = ik.on_key },
-    { path = ik.INTERACT, cb = ik.caller("interact") },
-    { path = ik.DISTANCE, cb = ik.caller("distance") },
-    { path = ik.LOOT, cb = ik.caller("loot") },
+    { path = ik.INTERACT, cb = ik.caller("interact"), debug = true, caller = true },
+    { path = ik.DISTANCE, cb = ik.caller("distance"), debug = true, caller = true },
+    { path = ik.LOOT, cb = ik.caller("loot"), debug = true, caller = true },
 }
--- (a field, not a local: this chunk is at Lua's 200-locals limit)
-HOOKS.hooked = {}
+-- (fields, not locals: this chunk is at Lua's 200-locals limit)
+HOOKS.hooked = {}    -- [path] = true once registered
+HOOKS.tries = {}     -- [path] = registrations tried
+-- A registration can fail while the class loads (UFunction::Func 0x0); it is
+-- tried again each tick (0.5 s) up to MAX_TRIES. Up to 0.7.3 a failed one
+-- counted as hooked and was never tried again: logs had "hook SpawnVehicle
+-- (post) FAILED" and nothing later - a client paid for a car and got none.
+HOOKS.MAX_TRIES = 120
 
 local function install_hooks()
-    buy.hook_spawn()
+    buy.hook_spawn(HOOKS.MAX_TRIES)
     for _, h in ipairs(HOOKS) do
-        if not HOOKS.hooked[h.path] and ue.find_object(h.path) then
+        local n = HOOKS.tries[h.path] or 0
+        if not HOOKS.hooked[h.path] and n < HOOKS.MAX_TRIES and (log.debug_enabled or not h.debug)
+            and ue.find_object(h.path) then
             local name = h.path:match(":([%w_]+)$")
             local ok, err = pcall(RegisterHook, h.path, safe(name, h.cb))
-            HOOKS.hooked[h.path] = true
-            log.info("vehicles: hook %s (post) %s%s", name, ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+            n = n + 1
+            HOOKS.tries[h.path] = n
+            if ok then
+                HOOKS.hooked[h.path] = true
+                if h.caller then ik.callers_on = true end
+                log.info("vehicles: hook %s (post) ok%s%s", name, h.debug and " (debug)" or "",
+                    n > 1 and string.format(" (try %d)", n) or "")
+            elseif n == 1 then
+                log.warn("vehicles: hook %s (post) FAILED %s; tried again each tick (up to %d tries)", name, tostring(err),
+                    HOOKS.MAX_TRIES)
+            elseif n >= HOOKS.MAX_TRIES then
+                log.err("vehicles: hook %s (post) FAILED %d times, given up: %s", name, n, tostring(err))
+            end
         end
     end
 end
@@ -3406,16 +5184,101 @@ local function occupancy(list)
     return occ
 end
 
--- VSTATE sends that are not a change (the 10 s refresh, a vehicle's first
--- state) are spread over the 0.5 s ticks: all vehicles at once held the host
--- for 10-20 ms every 10 s (130 ms on the first pass after a join). A change
--- (colour, fuel, health, lights, engine, driver) still goes out at once.
-local REFRESH_PER_TICK, FIRST_PER_TICK = 3, 8
-local refresh_left, first_left = 0, 0
-local IDLE_PER_TICK = 4
-local idle_turn = 0
+-- VSTATE, per client: only the vehicles within RANGE of its character, all
+-- of them in one message a tick (VSTATE|*|<N fields>|<N fields>|..., up to
+-- PER_MSG records). Up to 0.7.3 every vehicle went to every client in a
+-- message of its own; one the client did not have (out of its network range)
+-- made it rescan its vehicle list each time (1.6/s).
+-- Sends that are not a change (the 10 s refresh, a vehicle's first state)
+-- are spread over the 0.5 s ticks: all vehicles at once held the host for
+-- 10-20 ms every 10 s (130 ms on the first pass after a join). A change
+-- (colour, fuel, health, lights, engine, driver) still goes out at once to
+-- the clients in range. st.got[client] = the state that client has: one
+-- that comes into range gets the latest at the vehicle's next read (active:
+-- every tick; idle: its turn, ~every 3 s).
+local vsync = {
+    REFRESH = 3, FIRST = 8, IDLE = 4,   -- per tick: refreshes, first states, idle vehicles read
+    refresh_left = 0, first_left = 0, idle_turn = 0,
+    RANGE = 20000,                      -- cm (~200 m)
+    N = 12,                             -- fields per record
+    PER_MSG = 16,                       -- records per message
+    rcpt = {},                          -- this tick's clients: { pc, k, loc (nil: unknown -> every vehicle) }
+    out = {},                           -- [client key] = { pc =, fields... } this tick
+    rkey = "",                          -- the clients of the last tick (st.got is cleared when they change)
+    -- VOCC (sdc_vehseats): a vehicle's seats 2+ while a seat 3+ is taken,
+    -- next to each of its VSTATE records (and once empty after, per client:
+    -- st.occ_got[client] = the list that client has)
+    NO = 5,                             -- fields per VOCC record (x, y, z, class, list)
+    occ_out = {},                       -- [client key] = { pc =, fields... } this tick
+}
 
--- PlayerIds of the driver and the passenger ("" = free) for VSTATE.
+-- Start of a host tick: the clients and where their characters are.
+function vsync.begin()
+    local list, keys = {}, {}
+    for _, pc in ipairs(S.remote_pcs or {}) do
+        local k = addr(pc)
+        if k then
+            local p = ue.pawn_of(pc)
+            list[#list + 1] = { pc = pc, k = k, loc = p and ue.location(p) or nil }
+            keys[#keys + 1] = tostring(k)
+        end
+    end
+    vsync.rcpt, vsync.out, vsync.occ_out = list, {}, {}
+    local rk = table.concat(keys, ",")
+    if rk ~= vsync.rkey then
+        vsync.rkey = rk
+        for _, st in pairs(vs) do st.got, st.occ_got = nil, nil end
+    end
+    vsync.refresh_left, vsync.first_left = vsync.REFRESH, vsync.FIRST
+end
+
+-- End of a host tick: each client's records, packed.
+function vsync.flush()
+    local per = vsync.N * vsync.PER_MSG
+    for _, o in pairs(vsync.out) do
+        local n = #o
+        for i = 1, n, per do
+            net.send_to(o.pc, "VSTATE", "*", table.unpack(o, i, math.min(n, i + per - 1)))
+        end
+    end
+    -- after the VSTATE records (the client takes a VOCC list as fresh only
+    -- when it follows that vehicle's latest VSTATE)
+    per = vsync.NO * vsync.PER_MSG
+    for _, o in pairs(vsync.occ_out) do
+        local n = #o
+        for i = 1, n, per do
+            net.send_to(o.pc, "VOCC", "*", table.unpack(o, i, math.min(n, i + per - 1)))
+        end
+    end
+    vsync.out, vsync.occ_out = {}, {}
+end
+
+-- VOCC's list for a vehicle: its seats 2+ ("idx:id:side:x:y:z:yaw:pose;..."),
+-- only while somebody sits in a seat 3+ ("" otherwise: VSTATE's field 12
+-- says it all, as before). Each seat's own geometry (a copy taken when the
+-- player sat down: a row changed or removed later does not break it).
+function SEATK.occ_text(a, st)
+    local occ = M.vseats.occupants(st)
+    if #occ == 0 or occ[#occ].idx < 3 then return "" end
+    local parts = {}
+    for _, o in ipairs(occ) do
+        local id, geo
+        if o.who == "host" then
+            id = host_seated(a) and pawn_id(ue.local_pawn()) or nil
+            geo = st.host_geo or M.vseats.geo(st.cls, o.idx)
+        else
+            local pc = remote_pc_of(o.who)
+            id = pawn_id(pc and ue.pawn_of(pc))
+            local seat = seats[o.who]
+            geo = (seat and seat.geo) or M.vseats.geo(st.cls, o.idx)
+        end
+        if id and geo then parts[#parts + 1] = M.vseats.occ_entry(o.idx, id, geo) end
+    end
+    return table.concat(parts, ";")
+end
+
+-- PlayerIds of the driver and the passenger in seat 2 ("" = free) for
+-- VSTATE (seats 3+: VOCC).
 local function seat_ids(a, st)
     local did, pid = "", ""
     local hp = ue.local_pawn()
@@ -3426,10 +5289,11 @@ local function seat_ids(a, st)
     elseif host_here and st.host_seat ~= "passenger" then
         did = tostring(pawn_id(hp) or "")
     end
-    if st.pass_key then
-        local pc = remote_pc_of(st.pass_key)
+    local p2 = st.pax and st.pax[2]
+    if p2 then
+        local pc = remote_pc_of(p2)
         pid = tostring(pawn_id(pc and ue.pawn_of(pc)) or "")
-    elseif host_here and st.host_seat == "passenger" then
+    elseif host_here and M.vseats.host_idx(st) == 2 then
         pid = tostring(pawn_id(hp) or "")
     end
     return did, pid
@@ -3443,25 +5307,57 @@ local function broadcast_state(v, a, st, t)
     local eng = ue.prop(v, "EngineOn?") ~= false
     local drv = has_driver(a, st)
     local did, pid = seat_ids(a, st)
+    local occ = SEATK.occ_text(a, st)
     local pct = (fuel and maxf and maxf > 0) and math.floor(fuel / maxf * 100) or -1
-    local sig = string.format("%d|%d|%d|%s|%s|%s|%s|%s", color, pct, math.floor(hp or -1), tostring(lights), tostring(eng),
-        tostring(drv), did, pid)
-    if not st.dirty then   -- (a change the hooks reported goes now)
+    local sig = string.format("%d|%d|%d|%s|%s|%s|%s|%s|%s", color, pct, math.floor(hp or -1), tostring(lights), tostring(eng),
+        tostring(drv), did, pid, occ)
+    local due = st.dirty == true   -- (a change the hooks reported goes now)
+    if not due then
         if st.sig == nil then
-            if first_left <= 0 then return end
-            first_left = first_left - 1
-        elseif sig == st.sig then
-            if t - (st.sent_at or -100) < STATE_EVERY_S or refresh_left <= 0 then return end
-            refresh_left = refresh_left - 1
+            if vsync.first_left > 0 then
+                vsync.first_left = vsync.first_left - 1
+                due = true
+            end
+        elseif sig ~= st.sig then
+            due = true
+        elseif t - (st.sent_at or -100) >= STATE_EVERY_S and vsync.refresh_left > 0 then
+            vsync.refresh_left = vsync.refresh_left - 1
+            due = true
         end
     end
     local l = ue.location(v)
     if not l then return end
-    st.sig, st.sent_at, st.dirty = sig, t, false
-    net.broadcast(S.remote_pcs, "VSTATE", f0(l.X), f0(l.Y), f0(l.Z), st.cls or ue.class_name(v), tostring(color),
-        string.format("%.1f", fuel or 0), string.format("%.1f", hp or 0), lights and "1" or "0", eng and "1" or "0", drv and "1" or "0",
-        did, pid)
-    M.stats.states_sent = M.stats.states_sent + 1
+    if due then st.sig, st.sent_at, st.dirty = sig, t, false end
+    if st.sig == nil then return end   -- (its first state waits for the budget)
+    st.got = st.got or {}
+    st.occ_got = st.occ_got or {}
+    local rec = nil
+    for _, r in ipairs(vsync.rcpt) do
+        if (due or st.got[r.k] ~= st.sig) and (not r.loc or d2(r.loc, l) <= vsync.RANGE * vsync.RANGE) then
+            rec = rec or { f0(l.X), f0(l.Y), f0(l.Z), st.cls or ue.class_name(v), tostring(color),
+                string.format("%.1f", fuel or 0), string.format("%.1f", hp or 0), lights and "1" or "0", eng and "1" or "0",
+                drv and "1" or "0", did, pid }
+            st.got[r.k] = st.sig
+            local o = vsync.out[r.k]
+            if not o then
+                o = { pc = r.pc }
+                vsync.out[r.k] = o
+            end
+            table.move(rec, 1, vsync.N, #o + 1, o)
+            M.stats.states_sent = M.stats.states_sent + 1
+            -- the seats 3+ with it; an emptied list once to whoever had one
+            -- (also a client that was out of range when the seats emptied)
+            if occ ~= "" or (st.occ_got[r.k] or "") ~= "" then
+                local oo = vsync.occ_out[r.k]
+                if not oo then
+                    oo = { pc = r.pc }
+                    vsync.occ_out[r.k] = oo
+                end
+                table.move({ rec[1], rec[2], rec[3], rec[4], occ }, 1, vsync.NO, #oo + 1, oo)
+                st.occ_got[r.k] = occ
+            end
+        end
+    end
 end
 
 local function host_tick()
@@ -3496,6 +5392,9 @@ local function host_tick()
             host_unseat(key, "vehicle gone", { tell = true, reason = "vehicle gone" })
         elseif not ch or ue.prop(ch, "PlayerDead?") == true then
             host_unseat(key, "no living character")
+        elseif SEATK.out_cold(ch) then
+            -- down (sdc_down): it gets out itself on VSEAT none
+            host_unseat(key, "downed", { tell = true, reason = "downed" })
         elseif parent_vehicle(ch) ~= seat.vaddr and t - (seat.at or t) > 2 then
             host_unseat(key, "not attached any more", { tell = true, reason = "detached" })
         else
@@ -3522,20 +5421,20 @@ local function host_tick()
     local occ = occupancy(list)
     -- everyone attached to a vehicle: unwelded, sit pose, trace, pose tick
     seat_tick(list)
-    refresh_left, first_left = REFRESH_PER_TICK, FIRST_PER_TICK
+    vsync.begin()
     -- an idle vehicle (nobody in or at it, nothing reported) has its state
-    -- read in turns, IDLE_PER_TICK a tick (~every 3 s with 25 vehicles); the
+    -- read in turns, vsync.IDLE a tick (~every 3 s with 25 vehicles); the
     -- others every tick. Reading all of them every 0.5 s was most of the
     -- vehicles task.
-    local idle_left = IDLE_PER_TICK
+    local idle_left = vsync.IDLE
     local n = #cur.list
-    idle_turn = (n > 0) and (idle_turn % n) or 0
+    vsync.idle_turn = (n > 0) and (vsync.idle_turn % n) or 0
     for i, v in ipairs(cur.list) do
         if ue.valid(v) then
             local a = addr(v)
             local st = state_for(a, v)
             if st.host_seat and not host_attached(a) and t > (st.host_till or 0) then
-                st.host_seat, st.dirty = nil, true
+                SEATK.host_gone(v, st)
             end
             if occ[a] then set_collision(v, true) end
             if st.driver_key then
@@ -3547,9 +5446,9 @@ local function host_tick()
                 host_services(v)
             end
             if on("vehicle_state") then
-                local active = st.dirty or st.sig == nil or st.driver_key or st.pass_key or st.host_seat or occ[a]
-                -- idle: its turn (a window of IDLE_PER_TICK positions that moves on every tick)
-                local turn = ((i - 1 - idle_turn) % math.max(1, n)) < IDLE_PER_TICK
+                local active = st.dirty or st.sig == nil or st.driver_key or M.vseats.any(st) or st.host_seat or occ[a]
+                -- idle: its turn (a window of vsync.IDLE positions that moves on every tick)
+                local turn = ((i - 1 - vsync.idle_turn) % math.max(1, n)) < vsync.IDLE
                 if active or (turn and idle_left > 0) then
                     if not active then idle_left = idle_left - 1 end
                     broadcast_state(v, a, st, t)
@@ -3557,10 +5456,11 @@ local function host_tick()
             end
         end
     end
-    idle_turn = idle_turn + IDLE_PER_TICK
+    vsync.flush()
+    vsync.idle_turn = vsync.idle_turn + vsync.IDLE
     -- forget vehicles that are gone
     for a, st in pairs(vs) do
-        if not cur.by[a] and not st.driver_key and not st.pass_key then vs[a] = nil end
+        if not cur.by[a] and not st.driver_key and not M.vseats.any(st) then vs[a] = nil end
     end
     recount_watch()
 end
@@ -3589,12 +5489,16 @@ local function client_ghosts(occ, t)
             end
         end
     end
+    -- (a destroyed ghost stays valid, and in the list, until the garbage
+    -- collector: cpl.gone keeps it from being destroyed and counted again;
+    -- runtime names are not reused)
     for _, v in ipairs(cur.list) do
-        if ue.valid(v) and ue.role(v) == ue.ROLE_AUTHORITY then
+        local name = ue.valid(v) and ue.short(v)
+        if name and not cpl.gone[name] and ue.role(v) == ue.ROLE_AUTHORITY then
             local a = addr(v)
-            local name = ue.short(v)
             if not occ[a] and ue.is_runtime_spawned(v) then
                 if pcall(function() v:K2_DestroyActor() end) then
+                    cpl.gone[name] = t
                     M.stats.ghosts = M.stats.ghosts + 1
                     log.info("vehicles: removed local ghost vehicle %s (spawned on this client only)", name)
                 end
@@ -3604,12 +5508,17 @@ local function client_ghosts(occ, t)
             end
         end
     end
+    for name, at in pairs(cpl.gone) do
+        if t - at > 300 then cpl.gone[name] = nil end
+    end
 end
 
--- Client: the host says who sits where (VSTATE fields 11 / 12, PlayerIds).
--- A seat the engine did not attach here within SEATK.place_after (an old weld on
--- the host, relevancy) is attached here at the same seat; one the host says
--- is free is let go again. The engine's attachment wins when it comes.
+-- Client: the host says who sits where (VSTATE fields 11 / 12, PlayerIds;
+-- the seats 2+ of a car with a seat 3+ taken: VOCC, with each seat's
+-- numbers). A seat the engine did not attach here within SEATK.place_after
+-- (an old weld on the host, relevancy) is attached here at the same seat;
+-- one the host says is free is let go again. The engine's attachment wins
+-- when it comes.
 
 local function client_place(list, t)
     local placed, missing = cpl.placed, cpl.missing
@@ -3625,10 +5534,16 @@ local function client_place(list, t)
         local a = ue.valid(v) and addr(v)
         local ap = a and applied[a]
         if ap and ap.occ_d ~= nil and t - (ap.at or -100) < 3 * STATE_EVERY_S then
-            for _, sd in ipairs({ { "driver", ap.occ_d }, { "passenger", ap.occ_p } }) do
+            local list2 = { { "driver", ap.occ_d } }
+            if cpl.occ_fresh(ap, t) and #ap.occ_x > 0 then
+                for _, o in ipairs(ap.occ_x) do list2[#list2 + 1] = { "passenger", o.id, o.geo, o.idx } end
+            else
+                list2[2] = { "passenger", ap.occ_p }
+            end
+            for _, sd in ipairs(list2) do
                 local ch = sd[2] and sd[2] ~= "" and by_id[sd[2]]
                 local ca = ch and addr(ch)
-                if ca then want[ca] = { ch = ch, v = v, va = a, seat = sd[1] } end
+                if ca then want[ca] = { ch = ch, v = v, va = a, seat = sd[1], geo = sd[3], idx = sd[4] } end
             end
         end
     end
@@ -3639,12 +5554,14 @@ local function client_place(list, t)
             missing[ca] = missing[ca] or t
             local p = placed[ca]
             if t - missing[ca] >= SEATK.place_after and (not p or t - p.at >= SEATK.place_every) then
-                local loc, rot = seat_transform(w.v, w.seat == "passenger")
+                local loc, rot = nil, nil
+                if w.geo then loc, rot = M.vseats.xf_geo(w.v, w.geo) end
+                if not loc then loc, rot = seat_transform(w.v, w.seat == "passenger") end
                 pcall(function() w.ch:K2_AttachToActor(w.v, FName("None"), KEEP_WORLD, KEEP_WORLD, KEEP_WORLD, false) end)
                 if loc then pcall(function() w.ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end) end
                 placed[ca] = { va = w.va, vname = ue.short(w.v), name = ue.short(w.ch), at = t }
-                log.info("vehicles: pose: %s placed in the %s seat of %s here (the host says so; no attachment arrived for %.1f s)",
-                    char_label(w.ch), w.seat, ue.short(w.v), t - missing[ca])
+                log.info("vehicles: pose: %s placed in the %s seat%s of %s here (the host says so; no attachment arrived for %.1f s)",
+                    char_label(w.ch), w.seat, w.idx and (" " .. w.idx) or "", ue.short(w.v), t - missing[ca])
             end
         end
     end
@@ -3674,6 +5591,17 @@ local function client_tick()
     local list = chars()
     local occ = occupancy(list)
     local lp = ue.local_pawn()
+    -- once per world, 12 s after this player's character exists: the sit
+    -- montage (sit_montage takes it only from memory on a client, so a
+    -- client that never sat in a car would show teammates seated without
+    -- the pose). One small asset, off the message path.
+    if lp and not sit.tried then
+        sit.pawn_at = sit.pawn_at or t
+        if t - sit.pawn_at >= 12 then
+            sit.tried = true
+            ue.load_asset(SIT_MONTAGE, "vehicles preload")
+        end
+    end
     local la = lp and parent_vehicle(lp)
     if local_seat then
         if la ~= local_seat.vaddr and t - local_seat.since > 2 then
@@ -3732,6 +5660,9 @@ local function client_tick()
             end
         end
     end
+    -- the end of this player's refuel / repair hold (after fx.report: an add
+    -- the game made here is sent as such)
+    fx.hold_end(t)
     if on("vehicle_state") then
         client_place(list, t)
         seat_tick(list)
@@ -3747,18 +5678,29 @@ end
 local last_role = nil
 
 function M.reset(why)
+    pcall(SEATK.flip_hold, true)   -- (before the vehicle list goes)
+    sit.obj, sit.tried, sit.pawn_at = nil, false, nil
+    sit.floor, sit.floor_tried = nil, false
     vs, seats, watch_n, outer_cache = {}, {}, 0, {}
     cur = { list = {}, by = {}, at = -100 }
     local_seat, host_cap = nil, false
     applied, obs, att, seated = {}, {}, {}, {}
-    cpl.placed, cpl.missing = {}, {}
+    cpl.placed, cpl.missing, cpl.gone, cpl.rescan_at = {}, {}, {}, -100
     spawners_done, ghost_logged = {}, {}
     last_spawner_scan, last_cap = -100, -100
     sit.obj = nil
     buy.seen, buy.blocked = {}, nil
-    fx.hold, fx.stuck_since, fx.asked = nil, nil, {}
+    fx.holds, fx.stuck_since, fx.asked, fx.box_log, fx.tow_sent = {}, nil, {}, {}, nil
+    SEATK.refused = nil
+    hud.logged, hud.until_at = {}, -100
+    vsync.out, vsync.rkey, vsync.idle_turn, vsync.occ_out = {}, "", 0, {}
+    for k in pairs(logged) do logged[k] = nil end
     ik.key_at, ik.toggle_at, ik.opened_at, ik.close, ik.tab = nil, nil, nil, nil, nil
+    ik.set_poll(false)
+    ik.seat_poll, SEATK.hold_va, SEATK.key_was, SEATK.tow_seen = false, nil, true, nil
     M.radio.reset(why)
+    -- (the seat table's live edits stay: they are not per world)
+    M.vseats.reset(why)
     log.info("vehicles: reset (%s)", tostring(why))
 end
 
@@ -3769,15 +5711,22 @@ local function tick()
         if last_role ~= nil then M.reset("role " .. tostring(last_role) .. " -> " .. tostring(role)) end
         last_role = role
     end
-    if not enabled() then return end
-    if role ~= "host" and role ~= "client" then return end
+    SEATK.flip_hold()   -- (also off / single player: let go)
+    if not enabled() or (role ~= "host" and role ~= "client") then
+        ik.set_poll(false)
+        ik.seat_poll, SEATK.hold_va = false, nil
+        return
+    end
     install_hooks()
     hud.tick()
     if role == "host" then
         host_tick()
+        fx.hold_end(os.clock())   -- (here: only lets an old hold record go)
     else
         client_tick()
     end
+    SEATK.poll_flags()
+    ik.set_poll(ik.maybe_seated())
     M.radio.tick(role)
 end
 
@@ -3801,7 +5750,11 @@ function M.register_handlers()
     net.on("VBUYR", on_vbuyr)
     net.on("VCAP", on_vcap)
     net.on("VSEAT", on_vseat)
+    -- the seat key: a client's press (host), the host's answer (client)
+    net.on("VSWITCH", function(f, pc) SEATK.on_vswitch(f, pc) end)
+    net.on("VSWR", function(f) SEATK.on_vswr(f) end)
     net.on("VSTATE", on_vstate)
+    net.on("VOCC", cpl.on_occ)
     net.on("VRADIO", function(f, pc) if enabled() then M.radio.on_msg(f, pc) end end)
     net.on("VRADIOQ", function(f, pc) if enabled() then M.radio.on_query(f, pc) end end)
 end
@@ -3840,22 +5793,41 @@ function M.install(state)
     if session and session.world_reset_hooks then
         session.world_reset_hooks.vehicles = function(why) M.reset("world:" .. tostring(why)) end
     end
-    log.info("vehicles: installed (vehicle_sync=%s passengers=%s state=%s ghosts=%s radio=%s)", tostring(enabled()),
-        tostring(on("vehicle_passengers")), tostring(on("vehicle_state")), tostring(on("vehicle_ghosts")),
-        tostring(on("vehicle_radio")))
-    ik.bind_tab()
+    log.info("vehicles: installed (vehicle_sync=%s passengers=%s seats=%s untuned seats=%s state=%s ghosts=%s radio=%s)",
+        tostring(enabled()), tostring(on("vehicle_passengers")), tostring(M.vseats.on()), tostring(M.vseats.untuned()),
+        tostring(on("vehicle_state")), tostring(on("vehicle_ghosts")), tostring(on("vehicle_radio")))
+end
+
+-- main.lua: the console commands (sdcoop_seat, sdc_vehseats).
+function M.register_commands(add)
+    M.vseats.register_commands(add)
+end
+
+-- Host: the seat ("driver" | "passenger") the host gave remote player `key`
+-- (session key), or nil (sdc_players: no pull of a seated player).
+function M.seat_of(key)
+    local seat = key and seats[key]
+    return seat and seat.seat or nil
+end
+
+-- Host: the seat number (1 = driver, 2.. passengers) of remote player `key`, or nil.
+function M.seat_idx(key)
+    local seat = key and seats[key]
+    if not seat then return nil end
+    return seat.idx or (seat.seat == "driver" and 1 or 2)
 end
 
 function M.status_line()
     local nseats = 0
     for _ in pairs(seats) do nseats = nseats + 1 end
     local s = M.stats
-    return string.format("vehicles: %s known=%d seats=%d watched=%d local=%s host_cap=%s | enters=%d passengers=%d exits=%d promoted=%d rejected=%d relays=%d | state sent=%d applied=%d | ghosts=%d spawners=%d buys=%d | stray get-in steps undone=%d stray exits=%d | inventory key in a seat=%d fixed=%d lost=%d | %s",
+    return string.format("vehicles: %s known=%d seats=%d watched=%d local=%s host_cap=%s | enters=%d passengers=%d exits=%d to the wheel=%d seat moves=%d rejected=%d relays=%d | state sent=%d applied=%d | ghosts=%d spawners=%d buys=%d | stray get-in steps undone=%d stray exits=%d | inventory key in a seat=%d fixed=%d lost=%d | %s",
         tostring(S and S.role), #cur.list, nseats, watch_n,
-        local_seat and (local_seat.vname .. ":" .. local_seat.seat) or "-", tostring(host_cap),
-        s.enters, s.passengers, s.exits, s.promoted, s.rejected, s.relays, s.states_sent, s.states_applied,
+        local_seat and (local_seat.vname .. ":" .. local_seat.seat .. (local_seat.idx and (":" .. local_seat.idx) or "")) or "-",
+        tostring(host_cap),
+        s.enters, s.passengers, s.exits, s.promoted, s.switches, s.rejected, s.relays, s.states_sent, s.states_applied,
         s.ghosts, s.spawners, s.buys, s.stray_vi, s.stray_exits, s.inv_keys, s.inv_fixed, s.inv_lost,
-        M.radio.status())
+        M.radio.status() .. " | " .. M.vseats.status())
 end
 
 -- Test access (mock harness).
@@ -3866,6 +5838,125 @@ M._t = {
     local_seat = function() return local_seat end,
     applying = function() return applying end,
     ik = ik,
+    att = function() return att end,
+    cpl = cpl,
+    vseats = M.vseats,
+    seatk = SEATK,
+    vsync = vsync,
+    applied = function() return applied end,
+    seated = function() return seated end,
+    fx = fx,
 }
+
+-- ---------------------------------------------------------------------------
+-- sdcoop_seat (sdc_vehseats.command): the vehicle-side pieces. Host or
+-- single player. Who sits in a seat is told by the live attachment (and,
+-- for a client, the host's record): in single player no records are kept.
+-- ---------------------------------------------------------------------------
+
+-- The vehicle the host sits in, else the nearest within 8 m: v, its
+-- address, its class, its record (host only; nil in single player).
+function SEATK.cmd_vehicle()
+    discover(true)
+    local hp = ue.local_pawn()
+    if not hp then return nil end
+    local a = parent_vehicle(hp)
+    local v = a and cur.by[a]
+    if not v then
+        local l = ue.location(hp)
+        v = l and vehicle_at(l.X, l.Y, l.Z, nil, 800)
+        a = v and addr(v)
+    end
+    if not (v and a) then return nil end
+    local st = (S and S.role == "host") and state_for(a, v) or nil
+    return v, a, ue.class_name(v), st
+end
+
+-- Who sits in seat idx (geometry geo): its label and id (a client key or
+-- "host"), or nil.
+function SEATK.cmd_who(v, a, st, idx, geo)
+    if st and S and S.role == "host" then
+        for key, seat in pairs(seats) do
+            if seat.vaddr == a and (seat.idx or (seat.seat == "driver" and 1 or 2)) == idx then
+                local pc = remote_pc_of(key)
+                local ch = pc and ue.pawn_of(pc)
+                if ch and parent_vehicle(ch) == a then return name_of(key), key end
+            end
+        end
+    end
+    local hp = ue.local_pawn()
+    if hp and geo and parent_vehicle(hp) == a then
+        local loc = idx == 1 and seat_transform(v, false) or M.vseats.xf_geo(v, geo)
+        local hl = ue.location(hp)
+        if loc and hl and d2(loc, hl) <= M.vseats.NEAR * M.vseats.NEAR then return "host", "host" end
+    end
+    return nil, nil
+end
+
+-- The one in seat idx (wid) to the seat's new geometry at once: the host
+-- moved here (its record's geometry too), a client moved here and told its
+-- seat again (VSEAT with the new numbers, no notice; it moves itself); the
+-- others see it through the attachment, VOCC follows (st.dirty).
+function SEATK.cmd_place(v, a, st, idx, geo, wid)
+    if not (wid and geo) then return "nobody to move" end
+    local loc, rot = M.vseats.xf_geo(v, geo)
+    if not loc then return "no world position for seat " .. idx end
+    if wid == "host" then
+        local hp = ue.local_pawn()
+        if not (hp and parent_vehicle(hp) == a) then return "the host does not sit in it" end
+        unweld(hp, v)
+        pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+        if st and st.host_seat == "passenger" and M.vseats.host_idx(st) == idx then
+            st.host_geo = geo
+            st.dirty = true
+        end
+        return "the host moved there"
+    end
+    local seat = seats[wid]
+    local pc = remote_pc_of(wid)
+    local ch = pc and ue.pawn_of(pc)
+    if not (st and seat and ch and parent_vehicle(ch) == a) then return "that player does not sit in it" end
+    seat.geo = geo
+    pcall(function() ch:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+    SEATK.tell_pass(pc, st, wid, idx, geo, false)
+    st.dirty = true
+    return name_of(wid) .. " moved there (its seat sent again)"
+end
+
+-- The host to seat idx to look at it, alone in the vehicle: a real seat
+-- change on the host (records, VOCC); in single player only the move.
+function SEATK.cmd_try(v, a, st, idx, geo)
+    local hp = ue.local_pawn()
+    if not (hp and parent_vehicle(hp) == a) then return false, "sit in this vehicle first" end
+    if st then
+        for key, seat in pairs(seats) do
+            if seat.vaddr == a then return false, "only alone in the vehicle (" .. name_of(key) .. " sits in it)" end
+        end
+    end
+    local loc, rot
+    if idx == 1 then loc, rot = seat_transform(v, false) else loc, rot = M.vseats.xf_geo(v, geo) end
+    if not loc then return false, "no world position for seat " .. idx end
+    unweld(hp, v)
+    pcall(function() hp:K2_SetActorLocationAndRotation(loc, rot, false, {}, true) end)
+    if st then
+        if idx == 1 then
+            st.host_seat, st.host_idx, st.host_geo = "driver", nil, nil
+        else
+            st.host_seat, st.host_idx, st.host_geo = "passenger", idx, geo
+        end
+        st.dirty = true
+    end
+    return true, "the host sits in seat " .. idx .. " now" .. (st and "" or " (single player: moved only)")
+end
+
+-- The seat module's view of this one (xf: seat_transform; the command).
+M.vseats.attach({
+    seat_transform = seat_transform,
+    role = function() return S and S.role end,
+    cmd_vehicle = SEATK.cmd_vehicle,
+    who_at = SEATK.cmd_who,
+    place = SEATK.cmd_place,
+    try = SEATK.cmd_try,
+})
 
 return M

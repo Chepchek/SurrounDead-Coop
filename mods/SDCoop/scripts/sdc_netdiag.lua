@@ -6,25 +6,16 @@
 -- OnlineSubsystemUtils.IpNetDriver as fallback), whether those classes exist,
 -- every NetDriver object, and the world's own driver / net mode.
 --
--- Fallback (config listen_ip_fallback): when listening through Steam failed,
--- the GameNetDriver definition is switched to IpNetDriver in memory (the
--- engine reads UEngine.NetDriverDefinitions each time it creates a driver)
--- and the world is opened again: a plain UDP listen server on port 7777, the
--- same as an exe started outside Steam. Friends then join by IP.
+-- switch_to_ip: the GameNetDriver definition is switched to IpNetDriver in
+-- memory (the engine reads UEngine.NetDriverDefinitions each time it creates
+-- a driver): a plain UDP listen server on port 7777, the same as an exe
+-- started outside Steam. sdc_steamlink does it at start, sdc_session before
+-- every listen and IP join; the Steam link helper and IP joins both use it.
 
 local log = require("sdc_log")
 local ue  = require("sdc_ue")
 
 local M = { ip_fallback = false }
-
-local function s(v)
-    if v == nil then return "nil" end
-    local t = type(v)
-    if t == "string" or t == "number" or t == "boolean" then return tostring(v) end
-    local ok, r = pcall(function() return v:ToString() end)
-    if ok and r then return tostring(r) end
-    return ue.str(v)
-end
 
 local function engine()
     return ue.find_first("GameEngine")
@@ -47,8 +38,8 @@ function M.report(why)
     log.info("netdiag [%s]: role=%s steam id=%s", tostring(why), ue.net_role(),
         tostring(package.loaded["sdc_steam"] and package.loaded["sdc_steam"].id or "?"))
     local any = each_definition(function(i, d)
-        log.info("netdiag: definition %d: %s -> %s (fallback %s)", i, s(d.DefName), s(d.DriverClassName),
-            s(d.DriverClassNameFallback))
+        log.info("netdiag: definition %d: %s -> %s (fallback %s)", i, ue.str(d.DefName), ue.str(d.DriverClassName),
+            ue.str(d.DriverClassNameFallback))
     end)
     if not any then log.info("netdiag: net driver definitions not readable") end
     for _, path in ipairs({ "/Script/SteamSockets.SteamSocketsNetDriver", "/Script/SteamSockets.SteamSocketsNetConnection",
@@ -59,7 +50,7 @@ function M.report(why)
     for _, d in ipairs(ue.find_all("NetDriver")) do
         if ue.valid(d) and not ue.short(d):find("^Default__") then
             n = n + 1
-            log.info("netdiag: driver %s class=%s name=%s", ue.short(d), ue.class_name(d), s(ue.prop(d, "NetDriverName")))
+            log.info("netdiag: driver %s class=%s name=%s", ue.short(d), ue.class_name(d), ue.str(ue.prop(d, "NetDriverName")))
         end
     end
     log.info("netdiag: %d net driver object(s)", n)
@@ -73,13 +64,13 @@ end
 function M.switch_to_ip()
     local changed = false
     each_definition(function(_, d)
-        if s(d.DefName) == "GameNetDriver" then
+        if ue.str(d.DefName) == "GameNetDriver" then
             local ok = pcall(function()
                 d.DriverClassName = FName("OnlineSubsystemUtils.IpNetDriver")
                 d.DriverClassNameFallback = FName("OnlineSubsystemUtils.IpNetDriver")
             end)
-            changed = ok and s(d.DriverClassName):find("IpNetDriver", 1, true) ~= nil
-            log.info("netdiag: GameNetDriver definition -> %s (ok=%s)", s(d.DriverClassName), tostring(ok))
+            changed = ok and ue.str(d.DriverClassName):find("IpNetDriver", 1, true) ~= nil
+            log.info("netdiag: GameNetDriver definition -> %s (ok=%s)", ue.str(d.DriverClassName), tostring(ok))
         end
     end)
     M.ip_fallback = changed

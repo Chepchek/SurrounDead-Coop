@@ -112,6 +112,7 @@ local HUMAN = "/Game/SmartAI/Blueprints/AI/AICharacters/BP_MasterAICharacter.BP_
 local BANDIT = "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C"
 local DMG = "/Game/Blueprints/Components/DamageComponent.DamageComponent_C"
 local OBJREF = "/Script/Engine.PlayerController:ClientRepObjRef"
+local BOSS_HIT = "BndEvt__DamageTester_DamageComponent_K2Node_ComponentBoundEvent_0_StandardDamage__DelegateSignature"
 
 local function new_world(is_server)
     W = { objects = {}, paths = {}, hooks = {}, out = {}, loads = 0, lazy = {} }
@@ -271,12 +272,11 @@ check(#msgs("NPCFIRE") == 2, "host: StopBurning of a fire never sent (Death's ca
 fire(HUMAN .. ":Event_BloodSplatter", param(bandit))
 fire(HUMAN .. ":Event_BloodSplatter", param(bandit))
 check(#msgs("NPCBLOOD") == 1, "host: NPCBLOOD for a hit bandit, rate-limited")
-fire(DMG .. ":Event_BloodSplatterFX", param(boss._p.DamageComponent))
-check(#msgs("NPCBLOOD") == 2 and msgs("NPCBLOOD")[2].obj == boss, "host: NPCBLOOD for a hit boss")
-local zdc = new({ "DamageComponent_C" }, "ZDC")
-zdc._p._owner = new({ "BP_Zombie_Roamer_C", "BP_MasterZombie_C" }, "BP_Zombie_Roamer_C_1", { _loc = { X = 100100, Y = 0, Z = 0 } })
-fire(DMG .. ":Event_BloodSplatterFX", param(zdc))
-check(#msgs("NPCBLOOD") == 2, "host: no NPCBLOOD for zombies (sdc_ai's)")
+-- the boss's own StandardDamage bound event (0.7.3; before: DamageComponent.Event_BloodSplatterFX,
+-- which runs on every hit of every zombie too)
+fire(BOSS .. ":" .. BOSS_HIT, param(boss), param(25.0), param(rpawn))
+check(#msgs("NPCBLOOD") == 2 and msgs("NPCBLOOD")[2].obj == boss, "host: NPCBLOOD for a hit boss (its own hit event)")
+check(W.hooks[DMG .. ":Event_BloodSplatterFX"] == nil, "host: DamageComponent.Event_BloodSplatterFX (every zombie hit) not hooked")
 
 -- the human pass: tick + NPCSET
 check(bandit._p.Mesh._p.VisibilityBasedAnimTickOption == 0, "host: bandit 10 m from the client ticks unseen")

@@ -99,14 +99,6 @@ local corpse_done = {}         -- client: [copy full name] = { t, n } (corpse st
 local told = {}                -- host: [animal full name] = { seen = clock, sent = { [pc full name] = true } }
 local pass = { last = -1000, broken = false }
 
-local function vec(v)
-    local x = ue.try(function() return v.X end)
-    local y = ue.try(function() return v.Y end)
-    local z = ue.try(function() return v.Z end)
-    if type(x) == "number" and type(y) == "number" and type(z) == "number" then return { X = x, Y = y, Z = z } end
-    return nil
-end
-
 -- ---------------------------------------------------------------------------
 -- Host
 -- ---------------------------------------------------------------------------
@@ -127,7 +119,7 @@ local function fix_root(z, quiet)
         return "kept"
     end
     local mesh = ue.prop(z, "Mesh")
-    local ml = ue.valid(mesh) and vec(ue.try(function() return mesh:K2_GetComponentLocation() end)) or nil
+    local ml = ue.valid(mesh) and ue.vec(ue.try(function() return mesh:K2_GetComponentLocation() end)) or nil
     local cls = ue.find_object(SCENE_COMPONENT)
     if not ml or not cls then
         M.stats.root_failed = M.stats.root_failed + 1
@@ -135,7 +127,7 @@ local function fix_root(z, quiet)
     end
     -- the capsule's centre: the mesh sits BaseTranslationOffset below it
     -- (normally 0,0,-90; read as the character stored it at spawn)
-    local off = vec(ue.prop(z, "BaseTranslationOffset")) or { X = 0, Y = 0, Z = -90 }
+    local off = ue.vec(ue.prop(z, "BaseTranslationOffset")) or { X = 0, Y = 0, Z = -90 }
     local tf = {
         Rotation = { X = 0, Y = 0, Z = 0, W = 1 },
         Translation = { X = ml.X - off.X, Y = ml.Y - off.Y, Z = ml.Z - off.Z },
@@ -220,26 +212,19 @@ end
 local function animal_pass(now)
     if pass.broken or #core.host.viewers == 0 or now - pass.last < PASS_S then return end
     pass.last = now
-    local cls = ue.find_object(core.ANIMAL_CLASS)
-    local gps = ue.gameplay_statics()
-    local wc = ue.local_pc()
-    if not cls or not gps or not wc then return end
     -- the engine's actor iterator: live actors of this world only
-    local out = {}
-    local ok, err = pcall(function() gps:GetAllActorsOfClass(wc, cls, out) end)
-    if not ok then
+    local out, err = ue.actors_of(core.ANIMAL_CLASS)
+    if out == false then
         pass.broken = true
         log.warn("ai: corpses: GetAllActorsOfClass failed (%s); animal corpses only at death", tostring(err))
         return
     end
+    if not out then return end
     local n = #out
     for _ = 1, math.min(n, PASS_MAX) do
-        -- out-array elements come as params (read with :get()); a cursor, so
-        -- more than PASS_MAX animals are all visited over a few passes
+        -- a cursor, so more than PASS_MAX animals are all visited over a few passes
         pass.cursor = (pass.cursor or 0) % n + 1
-        local e = out[pass.cursor]
-        local okg, o = pcall(function() return e:get() end)
-        if not okg then o = e end
+        local o = ue.elem(out[pass.cursor])
         if ue.valid(o) and ue.role(o) == ue.ROLE_AUTHORITY and ue.prop(o, "IsDead?") == true then
             -- died while this feature was off: root it now
             if fix_root(o, true) ~= "failed" then
@@ -303,7 +288,8 @@ local function on_rep_dead(c)
     if simulating(ue.prop(z, "Mesh")) == true then return end
     if make_corpse(z) then
         M.stats.ragdolls = M.stats.ragdolls + 1
-        if core.first("corpses.ragdoll", 3) then log.info("ai: corpses: %s died here: ragdoll, lootable", ue.short(z)) end
+        local say = core.line("corpses.ragdoll", 3)
+        if say then say("ai: corpses: %s died here: ragdoll, lootable", ue.short(z)) end
     end
 end
 
@@ -316,28 +302,17 @@ local function on_begin_play(c)
     if simulating(ue.prop(z, "Mesh")) == true then return end
     if make_corpse(z) then
         M.stats.came_dead = M.stats.came_dead + 1
-        if core.first("corpses.came_dead", 5) then
-            log.info("ai: corpses: %s came into view dead: corpse here (ragdoll, lootable)", ue.short(z))
-        end
+        local say = core.line("corpses.came_dead", 5)
+        if say then say("ai: corpses: %s came into view dead: corpse here (ragdoll, lootable)", ue.short(z)) end
     end
 end
 
--- live copies of a class on this client
+-- live copies of a class on this client ({} when the class is not loaded;
+-- false, error when the call failed)
 local function copies_of(class_path)
-    local cls = ue.find_object(class_path)
-    local gps = ue.gameplay_statics()
-    local wc = ue.local_pc()
-    if not cls or not gps or not wc then return {} end
-    local out = {}
-    local ok, err = pcall(function() gps:GetAllActorsOfClass(wc, cls, out) end)
-    if not ok then return false, err end
-    return out
-end
-
-local function elem(e)
-    local ok, o = pcall(function() return e:get() end)
-    if ok then return o end
-    return e
+    local out, err = ue.actors_of(class_path)
+    if out == nil then return {} end
+    return out, err
 end
 
 -- Client, every 2 s: a dead zombie copy that stands (joined / came into view
@@ -357,7 +332,7 @@ local function client_corpse_pass(now)
     local n = #out
     for _ = 1, math.min(n, CPASS_MAX) do
         cpass.cursor = cpass.cursor % n + 1
-        local z = elem(out[cpass.cursor])
+        local z = ue.elem(out[cpass.cursor])
         if ue.valid(z) and ue.role(z) ~= ue.ROLE_AUTHORITY and ue.prop(z, "IsDead?") == true then
             local sim = simulating(ue.prop(z, "Mesh"))
             local key = ue.name(z)
@@ -391,7 +366,7 @@ local function client_corpse_pass(now)
     local bosses = copies_of(core.BOSS_CLASS)
     if bosses == false then return end
     for i = 1, #bosses do
-        local b = elem(bosses[i])
+        local b = ue.elem(bosses[i])
         if ue.valid(b) and ue.role(b) ~= ue.ROLE_AUTHORITY and ue.prop(b, "IsDead?") == true
             and ue.prop(b, "Dead") ~= true and ue.set_prop(b, "Dead", true) then
             M.stats.boss_lootable = M.stats.boss_lootable + 1
@@ -406,7 +381,8 @@ local function on_boss_rep_dead(c)
     if not ue.valid(b) or ue.role(b) == ue.ROLE_AUTHORITY or ue.prop(b, "IsDead?") ~= true then return end
     if ue.set_prop(b, "Dead", true) then
         M.stats.boss_lootable = M.stats.boss_lootable + 1
-        if core.first("corpses.boss", 2) then log.info("ai: corpses: boss %s died here: lootable", ue.short(b)) end
+        local say = core.line("corpses.boss", 2)
+        if say then say("ai: corpses: boss %s died here: lootable", ue.short(b)) end
     end
 end
 
@@ -439,9 +415,8 @@ local function animal_died(o)
     ue.set_prop(o, "Health", 0)
     if ok then
         M.stats.animal_ragdolls = M.stats.animal_ragdolls + 1
-        if core.first("corpses.animal_client", 3) then
-            log.info("ai: corpses: animal %s died on the host: ragdoll, harvestable", ue.short(o))
-        end
+        local say = core.line("corpses.animal_client", 3)
+        if say then say("ai: corpses: animal %s died on the host: ragdoll, harvestable", ue.short(o)) end
     else
         M.stats.ragdoll_failed = M.stats.ragdoll_failed + 1
     end

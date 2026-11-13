@@ -122,25 +122,6 @@ local M = {
 local S   -- sdc_session.state
 
 -- ---------------------------------------------------------------------------
--- Settings (defaults apply until the keys are added to sdc_config's SCHEMA)
--- ---------------------------------------------------------------------------
-
-local DEFAULTS = {
-    player_names = true,
-    player_names_range = 40,
-    player_names_near = 4,
-    gps_markers = true,
-    gps_compass = true,
-    map_markers_shared = true,
-}
-
-local function opt(key)
-    local v = cfg.get(key)
-    if v == nil then return DEFAULTS[key] end
-    return v
-end
-
--- ---------------------------------------------------------------------------
 -- Game assets
 -- ---------------------------------------------------------------------------
 
@@ -209,12 +190,14 @@ local markers = {}       -- [player id] = { w = W_StandardMarker_C, map = map wi
 local map_key = nil      -- full name of the map widget `markers` belong to
 local tags = {}          -- [character full name] = { p = character, shown, name, until_t, fail_until }
 local last_role = nil
+local alone, alone_mk_at = false, -1000   -- host: nobody connected (M.tick)
 local struct_ok = nil    -- S_MarkerData member names verified
 local los_broken = false
 -- client: own GPS / compass slot as the host has it (PEQUIP)
 local own_equip = { got = false, gps = "", compass = "", logged = nil }
 local warned = {}
 
+-- [remote player key] tables; hud_warned = the character last warned about
 local function new_host_state()
     return { client_gps = {}, synced = {}, sig = {}, equip_sent = {}, equip_at = {}, hud_warned = {}, cvars = {},
              last_resync = -1000 }
@@ -308,7 +291,7 @@ end
 -- stale local copy is not a simulated proxy and is hidden.
 local function refresh_others()
     local out = {}
-    for _, p in ipairs(ue.find_all(PAWN_CLASS)) do
+    for _, p in ipairs(ue.player_chars() or {}) do
         if ue.valid(p) and not is_local(p) and ue.prop(p, "bHidden") ~= true then
             local replicated = S.role == "host" or ue.role(p) == ue.ROLE_SIMULATED
             if replicated and ue.prop(p, "PlayerDead?") ~= true then
@@ -367,13 +350,24 @@ end
 -- Every 5 s: any other game HUD (BP_Ingame_C) on this screen, e.g. one left
 -- from an earlier character, must not show a compass either. A narrow
 -- Blueprint class (one or two instances), each re-validated before use.
+-- The HUDs on screen: sdc_players.screen_huds (FindAllOf alone does not see
+-- UMG widgets in this UE4SS build); FindAllOf without sdc_players.
+local function screen_huds()
+    local pl = package.loaded["sdc_players"]
+    if type(pl) == "table" and type(pl.screen_huds) == "function" then
+        local ok, list = pcall(pl.screen_huds)
+        if ok and type(list) == "table" then return list end
+    end
+    return ue.find_all("BP_Ingame_C")
+end
+
 local hud_sweep_at = -1000
 local function sweep_other_huds(own_hud, now)
     if now - hud_sweep_at < 5 then return end
     if not ue.valid(own_hud) then return end   -- only stray HUDs next to a known own one
     hud_sweep_at = now
     local own_key = ue.name(own_hud)
-    for _, h in ipairs(ue.find_all("BP_Ingame_C")) do
+    for _, h in ipairs(screen_huds()) do
         if ue.valid(h) and ue.name(h) ~= own_key then
             local okv, inv = pcall(function() return h:IsInViewport() end)
             local c = ue.prop(h, "Compass")
@@ -434,62 +428,179 @@ local function client_equip_tick(now)
 end
 
 -- ---------------------------------------------------------------------------
--- Difficulty CVars the map / GPS rules depend on: the host's value applies
+-- Difficulty CVars a player's own machine uses: the host's values apply
 -- ---------------------------------------------------------------------------
--- BP_PlayerCharacter @150872-150995 opens the big map when IsGPSEquipped? OR
--- NOT Difficulty.MapVisibility. The Difficulty.* CVars are AutoSettings
--- settings of each machine (SD_GameInstance registers them, default false =
--- map without a GPS), so a client used its own value instead of the host's
--- world setting. The client takes the host's value through the game's CVar
--- helper (AutoSettings ConsoleUtils, as sdc_sync does for Game.SlowTime) and
--- gets its own value back when it leaves.
-local SYNCED_CVARS = { "Difficulty.MapVisibility" }
+-- The Difficulty.* CVars are AutoSettings settings of each machine
+-- (SD_GameInstance registers them). Most of the game's difficulty logic runs
+-- on the host (spawns, AI health / damage, every character's hunger, thirst,
+-- stamina, infection and radiation: Send*ToClient), but some of it runs on
+-- the player's own machine and used the client's own value (0.7.3 wave):
+--   MapVisibility       BP_PlayerCharacter @150872-150995: the big map
+--                       without a GPS (IsGPSEquipped? OR NOT MapVisibility)
+--   XPMultiplier        LevellingComponent (a CVar change callback ->
+--                       Difficulty_MultiplierValue): the client's own AddXP
+--                       (sdc_ai_kills' AIKILL: the kill XP of a client)
+--   SearchTime          BP_LootContainer @3646: the searching player's bar
+--   DisableBackpackInBackpack  JSIContainer.DifficultyCheckBackpack?: the
+--                       inventory screen of the player
+--   TraderCurrencyAmount W_TraderUI: selling to traders, the trader screen
+--   FirearmMalfunction, HeadshotMode, WeaponDurability(+Multiplier),
+--   MuzzleAttachmentDurability(+Multiplier): BP_FirearmPickup.FireBullet runs
+--                       on the shooter's machine (sdc_wear)
+--   MultiHit, MeleeDmgDegradation: BP_MeleePickup on the swinging machine
+-- The client takes the host's values through the game's CVar helper
+-- (AutoSettings ConsoleUtils, as sdc_sync does for Game.SlowTime) and gets
+-- its own back when it leaves; they are kept on disk meanwhile
+-- (client_cvars_own.txt next to config.ini), so a game closed or crashed
+-- while connected gets them back at its next start. Host setting
+-- host_difficulty_sync off: MapVisibility only (as up to 0.7.2); turned off
+-- while connected, the clients get their own values of the rest back at once.
+-- PCVAR|<name>|<value>|<name>|<value>...: MapVisibility first (an older
+-- client reads the first pair only); bool "0" / "1", float "%.6g"; each
+-- PCVAR is the whole set (a CVar missing from it is not the host's any more).
+local SYNCED_CVARS = {
+    { "Difficulty.MapVisibility", "bool" },
+    { "Difficulty.XPMultiplier", "float" },
+    { "Difficulty.SearchTime", "float" },
+    { "Difficulty.DisableBackpackInBackpack", "bool" },
+    { "Difficulty.TraderCurrencyAmount", "bool" },
+    { "Difficulty.FirearmMalfunction", "bool" },
+    { "Difficulty.HeadshotMode", "bool" },
+    { "Difficulty.WeaponDurability", "bool" },
+    { "Difficulty.WeaponDurabilityMultiplier", "float" },
+    { "Difficulty.MuzzleAttachmentDurability", "bool" },
+    { "Difficulty.MuzzleAttachmentDurabilityMultiplier", "float" },
+    { "Difficulty.MultiHit", "bool" },
+    { "Difficulty.MeleeDmgDegradation", "bool" },
+}
+local CVAR_KIND = {}
+for _, c in ipairs(SYNCED_CVARS) do CVAR_KIND[c[1]] = c[2] end
 local CONSOLE_UTILS = "/Script/AutoSettings.Default__ConsoleUtils"
 local cvars = { want = {}, saved = {} }   -- client: host's values, own values before the session
+local cvars_boot_done = false             -- own values left on disk by an unclean end: checked once
 
-local function get_bool_cvar(name)
+local function cvar_text(kind, v)
+    if kind == "float" then return string.format("%.6g", v) end
+    return v and "1" or "0"
+end
+
+local function cvar_parse(kind, s)
+    if kind == "float" then return tonumber(s) end
+    if s == "1" then return true end
+    if s == "0" then return false end
+    return nil
+end
+
+local function cvar_same(kind, a, b)
+    if kind == "float" then return type(a) == "number" and type(b) == "number" and math.abs(a - b) < 1e-4 end
+    return a == b
+end
+
+local function get_cvar(name, kind)
+    kind = kind or CVAR_KIND[name] or "bool"
+    local want_type = kind == "float" and "number" or "boolean"
     local cu = ue.find_object(CONSOLE_UTILS)
     if cu then
-        local ok, v = pcall(function() return cu:GetBoolCVar(FName(name)) end)
-        if ok and type(v) == "boolean" then return v end
+        local fn = kind == "float" and "GetFloatCVar" or "GetBoolCVar"
+        local ok, v = pcall(function() return cu[fn](cu, FName(name)) end)
+        if ok and type(v) == want_type then return v end
     end
     local ksl = ue.ksl()
     if ksl then
-        local ok, v = pcall(function() return ksl:GetConsoleVariableBoolValue(name) end)
-        if ok and type(v) == "boolean" then return v end
+        local fn = kind == "float" and "GetConsoleVariableFloatValue" or "GetConsoleVariableBoolValue"
+        local ok, v = pcall(function() return ksl[fn](ksl, name) end)
+        if ok and type(v) == want_type then return v end
     end
     return nil
 end
 
-local function set_bool_cvar(name, on)
+local function set_cvar(name, v, kind)
+    kind = kind or CVAR_KIND[name] or "bool"
     local cu = ue.find_object(CONSOLE_UTILS)
-    if cu and pcall(function() cu:SetBoolCVar(FName(name), on) end) and get_bool_cvar(name) == on then
+    local fn = kind == "float" and "SetFloatCVar" or "SetBoolCVar"
+    if cu and pcall(function() cu[fn](cu, FName(name), v) end) and cvar_same(kind, get_cvar(name, kind), v) then
         return true, "ConsoleUtils"
     end
-    ue.exec(name .. " " .. (on and "1" or "0"))
-    return get_bool_cvar(name) == on, "console"
+    ue.exec(name .. " " .. cvar_text(kind, v))
+    return cvar_same(kind, get_cvar(name, kind), v), "console"
+end
+
+-- <mod folder>\client_cvars_own.txt: "name=value" lines of the own values
+-- replaced right now (nil path: no config file known, e.g. in tests).
+local function own_cvars_file()
+    local p = cfg.path
+    local d = type(p) == "string" and p:match("^(.*)[/\\][^/\\]*$") or nil
+    return d and (d .. "/client_cvars_own.txt") or nil
+end
+
+local function write_own_cvars()
+    local path = own_cvars_file()
+    if not path then return end
+    local lines = {}
+    for name, v in pairs(cvars.saved) do lines[#lines + 1] = name .. "=" .. cvar_text(CVAR_KIND[name] or "bool", v) end
+    table.sort(lines)
+    local f = io.open(path, "w")
+    if not f then return end
+    f:write(table.concat(lines, "\n"))
+    f:close()
+end
+
+-- Once, outside a session: own values a game closed or crashed while
+-- connected left on disk come back. Returns how many.
+local function restore_left_over_cvars()
+    local path = own_cvars_file()
+    local f = path and io.open(path, "r")
+    if not f then return 0 end
+    local s = f:read("a") or ""
+    f:close()
+    local n = 0
+    for name, text in s:gmatch("([%w_%.]+)=([^\r\n]+)") do
+        local kind = CVAR_KIND[name]
+        local v = nil   -- (not "kind and parse() or nil": false is a value)
+        if kind then v = cvar_parse(kind, text) end
+        if v ~= nil then
+            local ok, how = set_cvar(name, v, kind)
+            n = n + 1
+            log.info("playermarks: %s back to own value %s (the last session did not end cleanly; %s, ok=%s)", name,
+                text, how, tostring(ok))
+        end
+    end
+    if s ~= "" then
+        local w = io.open(path, "w")
+        if w then w:close() end
+    end
+    return n
 end
 
 local function client_cvar_tick()
+    local saved_new = false
     for name, want in pairs(cvars.want) do
-        local cur = get_bool_cvar(name)
+        local kind = CVAR_KIND[name] or "bool"
+        local cur = get_cvar(name, kind)
         if cur == nil then
             warn_once("pm.cvar." .. name, "playermarks: %s unreadable on this machine", name)
-        elseif cur ~= want then
-            if cvars.saved[name] == nil then cvars.saved[name] = cur end
-            local ok, how = set_bool_cvar(name, want)
+        elseif not cvar_same(kind, cur, want) then
+            if cvars.saved[name] == nil then
+                cvars.saved[name] = cur
+                saved_new = true
+            end
+            local ok, how = set_cvar(name, want, kind)
             log.info("playermarks: %s %s -> %s from the host (%s, ok=%s; own value %s comes back on leaving)",
-                name, cur and "1" or "0", want and "1" or "0", how, tostring(ok), cvars.saved[name] and "1" or "0")
+                name, cvar_text(kind, cur), cvar_text(kind, want), how, tostring(ok), cvar_text(kind, cvars.saved[name]))
         end
     end
+    if saved_new then write_own_cvars() end
 end
 
 local function restore_cvars(why)
     for name, orig in pairs(cvars.saved) do
-        local ok, how = set_bool_cvar(name, orig)
-        log.info("playermarks: %s back to own value %s (%s; %s, ok=%s)", name, orig and "1" or "0", why, how, tostring(ok))
+        local kind = CVAR_KIND[name] or "bool"
+        local ok, how = set_cvar(name, orig, kind)
+        log.info("playermarks: %s back to own value %s (%s; %s, ok=%s)", name, cvar_text(kind, orig), why, how, tostring(ok))
     end
+    local had = next(cvars.saved) ~= nil
     cvars = { want = {}, saved = {} }
+    if had then write_own_cvars() end
 end
 
 -- ---------------------------------------------------------------------------
@@ -546,8 +657,9 @@ local function host_tick(now)
                     -- the game's equip code runs ShowCompassWidget on this
                     -- character here; it must have no HUD on the host
                     local hud = ue.prop(p, "InGameUI")
-                    if ue.valid(hud) and not host.hud_warned[ue.name(p)] then
-                        host.hud_warned[ue.name(p)] = true
+                    local pname = ue.name(p)
+                    if ue.valid(hud) and host.hud_warned[key] ~= pname then
+                        host.hud_warned[key] = pname
                         local okv, inv = pcall(function() return hud:IsInViewport() end)
                         log.warn("playermarks: remote character %s has a HUD on the host (in viewport=%s)",
                             ue.short(p), tostring(okv and inv))
@@ -579,19 +691,32 @@ local function host_tick(now)
     end
     info = want
 
-    -- the host's difficulty CVars the map rules depend on (PCVAR)
-    local cv = {}
-    for _, name in ipairs(SYNCED_CVARS) do
-        local v = get_bool_cvar(name)
-        if v ~= nil then
-            cv[name] = v
-            if host.cvars[name] ~= v then
-                log.info("playermarks: host %s = %s", name, v and "1" or "0")
-                for _, pc in ipairs(pcs) do net.send_to(pc, "PCVAR", name, v and "1" or "0") end
+    -- the host's difficulty CVars a player's own machine uses (PCVAR, one
+    -- message with every pair; read every 2 s)
+    if now - (host.cvar_at or -1000) >= 2 then
+        host.cvar_at = now
+        local cv, pairs_ = {}, {}
+        local all = cfg.get("host_difficulty_sync") ~= false
+        for i, c in ipairs(SYNCED_CVARS) do
+            if i == 1 or all then
+                local v = get_cvar(c[1], c[2])
+                if v ~= nil then
+                    cv[c[1]] = v
+                    pairs_[#pairs_ + 1] = c[1]
+                    pairs_[#pairs_ + 1] = cvar_text(c[2], v)
+                end
+            end
+        end
+        local sig = table.concat(pairs_, "|")
+        host.cvars = cv
+        if sig ~= host.cvar_sig then
+            host.cvar_sig, host.cvar_pairs = sig, pairs_
+            if #pairs_ > 0 then
+                log.info("playermarks: host difficulty for the clients: %s", sig)
+                for _, pc in ipairs(pcs) do net.send_to(pc, "PCVAR", table.unpack(pairs_)) end
             end
         end
     end
-    host.cvars = cv
 
     -- the whole table to a client that just said HI, and to everybody every 10 s
     local resync = now - host.last_resync >= INFO_RESYNC_S
@@ -600,13 +725,13 @@ local function host_tick(now)
         if r.hello and ue.valid(r.pc) and (resync or not host.synced[key]) then
             host.synced[key] = true
             for id, i in pairs(info) do send_info(r.pc, id, i) end
-            for name, v in pairs(host.cvars) do net.send_to(r.pc, "PCVAR", name, v and "1" or "0") end
+            if host.cvar_pairs and #host.cvar_pairs > 0 then net.send_to(r.pc, "PCVAR", table.unpack(host.cvar_pairs)) end
         end
     end
     for key in pairs(host.synced) do
         if not (S.remote or {})[key] then
             host.synced[key], host.client_gps[key], host.sig[key] = nil, nil, nil
-            host.equip_sent[key], host.equip_at[key] = nil, nil
+            host.equip_sent[key], host.equip_at[key], host.hud_warned[key] = nil, nil, nil
         end
     end
 
@@ -687,7 +812,7 @@ end
 
 -- w = { pawn = character or nil, pos = relayed position or nil }
 local function ensure_proxy(id, w)
-    local compass = opt("gps_compass") == true
+    local compass = cfg.get("gps_compass") == true
     local rec = proxies[id]
     if rec and not proxy_ok(rec.a) then
         proxies[id], rec = nil, nil       -- gone with its world / destroyed elsewhere: not touched
@@ -826,8 +951,8 @@ end
 -- actor is then needed as its target even with the compass off).
 local function view_tick()
     local me = local_id()
-    local compass_on = opt("gps_compass") == true
-    local map_on = opt("gps_markers") == true
+    local compass_on = cfg.get("gps_compass") == true
+    local map_on = cfg.get("gps_markers") == true
     local wanted = {}
     for id, i in pairs(info) do
         local on_map = map_on and i.gps
@@ -1033,14 +1158,15 @@ local function hide_tag(st)
 end
 
 local function names_fast(now)
-    local enabled = opt("player_names") == true
+    if next(others) == nil and next(tags) == nil then return end
+    local enabled = cfg.get("player_names") == true
     local pc = ue.local_pc()
     local cl, fwd = nil, nil
     if enabled and pc then cl, fwd = camera_view(pc) end
     local me = ue.local_pawn()
     local ml = is_character(me) and ue.location(me) or nil
-    local range = (tonumber(opt("player_names_range")) or DEFAULTS.player_names_range) * 100
-    local near = (tonumber(opt("player_names_near")) or DEFAULTS.player_names_near) * 100
+    local range = (tonumber(cfg.get("player_names_range")) or 0) * 100
+    local near = (tonumber(cfg.get("player_names_near")) or 0) * 100
     local seen = {}
     for id, p in pairs(others) do
         if alive_character(p) then
@@ -1584,7 +1710,7 @@ function MK.host_send(now, shared)
 end
 
 function MK.after_change(now)
-    local shared = opt("map_markers_shared") ~= false
+    local shared = cfg.get("map_markers_shared") ~= false
     MK.host_view(now, MK.scan(), shared)
     MK.host_send(now, shared)
 end
@@ -1592,7 +1718,7 @@ end
 function MK.host_tick(now)
     local found = MK.host_scan(now)
     local names = MK.host_names()
-    local shared = opt("map_markers_shared") ~= false
+    local shared = cfg.get("map_markers_shared") ~= false
     if shared ~= MK.last_shared then
         if MK.last_shared ~= nil then log.info("playermarks: map_markers_shared %s", shared and "on" or "off") end
         MK.last_shared, MK.dirty = shared, true
@@ -1671,7 +1797,7 @@ function MK.on_svr_spawn(ctx_p, hit_p, ok_p)
     if not rec then return end
     if placing then placing.rec = rec; return end   -- MK.on_req goes on
     MK.stats.placed, MK.stats.via_rpc = MK.stats.placed + 1, MK.stats.via_rpc + 1
-    local shared = opt("map_markers_shared") ~= false
+    local shared = cfg.get("map_markers_shared") ~= false
     log.info("playermarks: %s (id %s) placed map marker #%d at %s (the game's Svr_SpawnPlayerMarker)%s",
         owner == "" and "the host" or "a client", tostring(id), rec.key, MK.fmt(hit),
         owner == "" and "" or (shared and "; on the host's map in that player's colour" or "; kept off the host's map"))
@@ -1746,7 +1872,7 @@ function MK.on_req(f, pc)
         return
     end
     MK.stats.placed, MK.stats.via_req = MK.stats.placed + 1, MK.stats.via_req + 1
-    local shared = opt("map_markers_shared") ~= false
+    local shared = cfg.get("map_markers_shared") ~= false
     log.info("playermarks: a client (id %s) placed map marker #%d at %s (the mod's MKREQ: the game's RPC did not come first; Svr_SpawnPlayerMarker run on the host)%s",
         tostring(id), rec.key, MK.fmt(loc), shared and "; on the host's map in that player's colour" or "; kept off the host's map")
     MK.after_change(now)
@@ -1757,7 +1883,7 @@ end
 function MK.on_del(f, pc)
     local now = os.clock()
     local id = pc_id(pc)
-    local shared = opt("map_markers_shared") ~= false
+    local shared = cfg.get("map_markers_shared") ~= false
     local found = MK.scan()
     local n = 0
     for k in tostring(f[1] or ""):gmatch("%d+") do
@@ -1837,7 +1963,7 @@ function MK.client_apply(now)
         MK.need_apply = true
         return
     end
-    local hide = opt("map_markers_shared") == false
+    local hide = cfg.get("map_markers_shared") == false
     MK.hide_others = hide
     local function shown(e) return not hide or (e.id ~= nil and e.id == myid) end
     local found = MK.scan()
@@ -1929,7 +2055,7 @@ function MK.client_tick(now)
         MK.stats.remade = MK.stats.remade + remade
         log.info("playermarks: %d own copy(ies) of map markers were removed by the game here (not by the player): made again", remade)
     end
-    local hide = opt("map_markers_shared") == false
+    local hide = cfg.get("map_markers_shared") == false
     if MK.hide_others ~= nil and hide ~= MK.hide_others then MK.need_apply = true end
     if MK.need_apply then
         MK.client_apply(now)
@@ -2102,7 +2228,7 @@ end
 -- No session, sharing off: markers clients placed in this world (saved
 -- owner in the title) stay off this player's map in single player too.
 function MK.solo_tick(now)
-    if opt("map_markers_shared") ~= false or now - MK.solo_at < MK.SOLO_S then return end
+    if cfg.get("map_markers_shared") ~= false or now - MK.solo_at < MK.SOLO_S then return end
     MK.solo_at = now
     local titled = {}
     for ad, a in pairs(MK.scan()) do
@@ -2134,7 +2260,7 @@ function MK.report(out)
     for _ in pairs(MK.locals) do nl = nl + 1 end
     local s = MK.stats
     out(string.format("  map markers: shared=%s | host records=%d (%d of other players) | own copies=%d | hooks create=%s svr=%s dbl=%s",
-        tostring(opt("map_markers_shared")), nr, theirs, nl, tostring(MK.hooks.create == true), tostring(MK.hooks.svr == true),
+        tostring(cfg.get("map_markers_shared")), nr, theirs, nl, tostring(MK.hooks.create == true), tostring(MK.hooks.svr == true),
         tostring(MK.hooks.dbl == true)))
     out(string.format("  map markers: placed=%d (rpc=%d mkreq=%d) req_dup=%d dups=%d removed=%d lists=%d | client: requests=%d spawned=%d removed=%d remade=%d | widgets off=%d rereg=%d",
         s.placed, s.via_rpc, s.via_req, s.req_dup, s.dups, s.removed, s.lists, s.requests, s.spawned, s.client_removed,
@@ -2176,9 +2302,16 @@ function M.tick()
             MK.reset()
         end
         last_role = role
+        alone = false
         info, relay, host = {}, {}, new_host_state()
         my.sent, my.sent_at = nil, -1000
         own_equip = { got = false, gps = "", compass = "" }
+    end
+    -- own difficulty values a game closed / crashed while connected left on disk
+    if not cvars_boot_done and (role == "standalone" or role == "host") then
+        cvars_boot_done = true
+        local okb, errb = pcall(restore_left_over_cvars)
+        if not okb then log.err("playermarks: own CVars left on disk: %s", tostring(errb)) end
     end
     if role ~= "host" and role ~= "client" then
         local oks, errs = pcall(MK.solo_tick, os.clock())
@@ -2188,6 +2321,24 @@ function M.tick()
     -- (no main-menu check: ue.in_main_menu() is also true while the local
     -- player is dead, and the host must keep relaying then)
     local now = os.clock()
+    if role == "host" and next(S.remote or {}) == nil then
+        -- nobody connected (every world is a host): no names, GPS, CVars or
+        -- positions to share; the map marker pass as often as without a session
+        if not alone then
+            alone = true
+            local ok, err = pcall(cleanup, "nobody connected")
+            if not ok then log.err("playermarks: cleanup failed: %s", tostring(err)) end
+            info, relay, host = {}, {}, new_host_state()
+            log.debug("playermarks: host with nobody connected: names / GPS / positions paused")
+        end
+        if now - alone_mk_at >= MK.SOLO_S or now < alone_mk_at then
+            alone_mk_at = now
+            local okm, errm = pcall(MK.tick, role, now)
+            if not okm then log.err_throttled("pm.mk", "playermarks: map markers: %s", tostring(errm)) end
+        end
+        return
+    end
+    alone = false
     refresh_others()
     if role == "client" then
         local ok, err = pcall(client_equip_tick, now)
@@ -2214,6 +2365,7 @@ end
 -- Level change (sdc_session.world_reset_hooks): everything cached belongs to
 -- the old world and is dropped without touching it.
 function M.forget_world(why)
+    alone = false
     proxies, markers, tags, others, map_key = {}, {}, {}, {}, nil
     relay = {}
     if S and S.role == "client" then info = {} end
@@ -2246,16 +2398,45 @@ function M.register_handlers()
         if not (id and x and y and z) then return end
         relay[math.floor(id)] = { X = x, Y = y, Z = z, t = os.clock() }
     end)
-    -- host -> clients: PCVAR|<name>|<0|1>   (only the CVars in SYNCED_CVARS)
+    -- host -> clients: PCVAR|<name>|<value>|<name>|<value>...   (only the CVars in SYNCED_CVARS)
+    -- Every PCVAR carries everything the host shares now: a CVar it no
+    -- longer sends (host_difficulty_sync turned off while connected) is the
+    -- player's own again at once (an older host only ever sends MapVisibility).
     net.on("PCVAR", function(f)
-        local name = f[1] or ""
-        for _, n in ipairs(SYNCED_CVARS) do
-            if n == name then
-                local v = f[2] == "1"
-                if cvars.want[name] ~= v then log.info("playermarks: host says %s = %s", name, v and "1" or "0") end
+        if not S or S.role ~= "client" then return end
+        local seen = {}
+        for i = 1, #f - 1, 2 do
+            local name = f[i]
+            local kind = CVAR_KIND[name or ""]
+            local v = nil   -- (false is a value)
+            if kind then v = cvar_parse(kind, f[i + 1]) end
+            if v ~= nil then
+                if cvars.want[name] == nil or not cvar_same(kind, cvars.want[name], v) then
+                    log.info("playermarks: host says %s = %s", name, cvar_text(kind, v))
+                end
                 cvars.want[name] = v
+                seen[name] = true
             end
         end
+        if next(seen) == nil then return end   -- nothing usable in it: nothing dropped either
+        local back = false
+        for name in pairs(cvars.want) do
+            if not seen[name] then
+                cvars.want[name] = nil
+                local orig = cvars.saved[name]
+                if orig ~= nil then
+                    local kind = CVAR_KIND[name] or "bool"
+                    local ok, how = set_cvar(name, orig, kind)
+                    cvars.saved[name] = nil
+                    back = true
+                    log.info("playermarks: %s back to own value %s (the host no longer shares it; %s, ok=%s)", name,
+                        cvar_text(kind, orig), how, tostring(ok))
+                else
+                    log.info("playermarks: the host no longer shares %s", name)
+                end
+            end
+        end
+        if back then write_own_cvars() end
     end)
     -- host -> client: PEQUIP|<GPS item path>|<compass item path>   (own slots; "" = empty)
     net.on("PEQUIP", function(f)
@@ -2280,6 +2461,7 @@ function M.register_handlers()
 end
 
 M.MK = MK   -- tests / console
+M.color_of = color_of   -- a player's marker colour by PlayerId (sdc_chat: the nick in the chat feed)
 
 function M.init(state)
     S = state
@@ -2289,15 +2471,18 @@ end
 -- Console report (sdcoop_marks).
 function M.report(out)
     out(string.format("playermarks: role=%s my id=%s own GPS=%s | names=%s gps markers=%s compass=%s",
-        tostring(S and S.role), tostring(local_id()), tostring(my.gps), tostring(opt("player_names")),
-        tostring(opt("gps_markers")), tostring(opt("gps_compass"))))
+        tostring(S and S.role), tostring(local_id()), tostring(my.gps), tostring(cfg.get("player_names")),
+        tostring(cfg.get("gps_markers")), tostring(cfg.get("gps_compass"))))
     if S and S.role == "client" then
         out(string.format("  own slots from host: got=%s GPS='%s' compass='%s'", tostring(own_equip.got),
             own_equip.gps, own_equip.compass))
-        for _, name in ipairs(SYNCED_CVARS) do
+        for _, c in ipairs(SYNCED_CVARS) do
+            local name = c[1]
             out(string.format("  %s: host %s, here %s, own value before %s", name, tostring(cvars.want[name]),
-                tostring(get_bool_cvar(name)), tostring(cvars.saved[name])))
+                tostring(get_cvar(name, c[2])), tostring(cvars.saved[name])))
         end
+    elseif S and S.role == "host" then
+        out("  difficulty sent to the clients: " .. tostring(host.cvar_sig or "-"))
     end
     for id, i in pairs(info) do
         local r = relay[id]

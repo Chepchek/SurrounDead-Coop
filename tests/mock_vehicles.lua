@@ -140,7 +140,15 @@ log.toast_sink = function(text) toasts[#toasts + 1] = text end
 local ctx = require("sdc_ctx")
 local net = require("sdc_net")
 local sent = {}
-net.send_to = function(pc, kind, ...) sent[#sent + 1] = { to = pc, kind = kind, args = { ... } }; return true end
+net.send_to = function(pc, kind, ...)
+    local args = { ... }
+    -- (0.7.3: VSTATE|*|<12 fields>|<12 fields>|...: one entry per vehicle record, as the single form was)
+    if kind == "VSTATE" and args[1] == "*" then
+        for i = 2, #args, 12 do sent[#sent + 1] = { to = pc, kind = kind, args = table.move(args, i, i + 11, 1, {}) } end
+        return true
+    end
+    sent[#sent + 1] = { to = pc, kind = kind, args = args }; return true
+end
 net.send_to_host = function(kind, ...) sent[#sent + 1] = { to = "host", kind = kind, args = { ... } }; return true end
 net.broadcast = function(pcs, kind, ...) for _, pc in ipairs(pcs) do net.send_to(pc, kind, ...) end end
 local function last_sent(kind, to)
@@ -164,6 +172,10 @@ ctx.scope_resolver = function(wco) if wco == gi then return respawn_said end ret
 local V = require("sdc_vehicles")
 local S = { role = "host", remote = {}, remote_pcs = {}, client = nil }
 V.install(S)
+-- (the driver's exit moves nobody: a passenger takes the wheel with its seat
+-- key - the host's press runs SEATK.on_key, a client's is the VSWITCH it
+-- sends; the key itself: mock_vehicles_seats W / K)
+local function host_key() V._t.seatk.on_key() end
 
 -- ------------------------------------------------------------ world
 local host_vp = {}      -- widgets in the host viewport
@@ -504,8 +516,8 @@ T = T + 1
 V.tick()
 check(last_sent("VSTATE", cl2_pc) == nil, "no resend without a change")
 
--- ------------------------------------------------------------ 5. driver exits, host promoted
-print("5. the client driver leaves")
+-- ------------------------------------------------------------ 5. driver exits, the host passenger takes the wheel with its key
+print("5. the client driver leaves: the host stays in its seat; its seat key: the wheel")
 deliver("VEXIT", with(vstr(truck), "d"), cl_pc)
 check(cl_ch._parent == nil and truck._exited_by == cl_ch, "Event_ExitVehicle ran for the client (detached)")
 check(host_ch._parent == truck, "the host passenger stays attached")
@@ -513,7 +525,9 @@ check(truck._owner == nil, "owner cleared")
 check(truck._p.VehicleMovementComponent._p.bRequiresControllerForInputs == false, "host copy back to its own inputs")
 check(cl_ch._p.CharacterMovement._p.bServerAcceptClientAuthoritativePosition == true, "client position authority restored")
 check(cl_ch._p["InVehicle?"] == false, "host copy of the client: out of the vehicle")
-check(math.abs(host_ch._p.__loc.Y - (-40)) < 1, "host moved to the driver seat")
+check(math.abs(host_ch._p.__loc.Y - 40) < 1 and truck._p.VehicleMovementComponent._p.hb == true, "the host stays in the passenger seat; the car parked (handbrake on)")
+host_key()
+check(math.abs(host_ch._p.__loc.Y - (-40)) < 1, "the host's seat key: moved to the driver seat")
 check(truck._p.VehicleMovementComponent._p.hb == false, "handbrake off for the host as the new driver")
 check(truck._p.EngineSound._p.active == true, "engine sound running again for the host")
 check(truck._resp[2] == 0, "mesh still ignores pawns (occupied)")
@@ -534,13 +548,16 @@ check(truck._p["LightsOn?"] == true, "a passenger does not switch the lights")
 T = T + 3
 V.tick()
 
-print("6b. the host leaves; the passenger takes the wheel")
+print("6b. the host leaves; the passenger stays; its seat key: the wheel")
 truck:ExitVehicle()
 check(host_ch._parent == nil, "host out")
+check(cl2_ch._parent == truck and truck._entered_by ~= cl2_ch and truck._owner == nil, "6b: the passenger stays in its seat (no get-in for it)")
+deliver("VSWITCH", vstr(truck), cl2_pc)
 check(cl2_ch._parent == truck and truck._entered_by == cl2_ch, "passenger re-entered as the driver through the game's entry")
-check(truck._owner == cl2_pc, "owner = the promoted client")
+check(truck._owner == cl2_pc, "owner = the client at the wheel")
 s = last_sent("VSEAT", cl2_pc)
-check(s and s.args[1] == "driver", "VSEAT driver to the promoted client")
+check(s and s.args[1] == "driver", "VSEAT driver to the client at the wheel")
+check(cl2_ch._welded == false, "6b: the passenger at the wheel unwelded again after the game's get-in welded it (its seat replicates)")
 T = T + 0.1
 run_delayed()
 
@@ -592,13 +609,16 @@ do
         "8b: host's driving state repaired (exit key and driving work again)")
     check(truck4._p["InRepairingArea?"] == false, "8b: the stale area flag cleared")
 
-    print("8c. the host gets out: the client passenger takes the wheel")
+    print("8c. the host gets out: the client passenger stays; its seat key: the wheel")
     truck4:ExitVehicle()
     check(host_ch._parent == nil, "8c: the host got out")
+    check(cl_ch._parent == truck4 and truck4._owner == nil and math.abs(cl_ch._p.__loc.Y - 40) < 1, "8c: the client stays in the passenger seat")
+    deliver("VSWITCH", vstr(truck4), cl_pc)
     check(cl_ch._parent == truck4 and truck4._owner == cl_pc, "8c: the client is the driver now (owner)")
     check(truck4._p.VehicleMovementComponent._p.bRequiresControllerForInputs == true, "8c: host copy takes the client's inputs")
     s4 = last_sent("VSEAT", cl_pc)
     check(s4 and s4.args[1] == "driver", "8c: VSEAT driver")
+    check(cl_ch._welded == false, "8c: the passenger at the wheel unwelded again after the game's get-in")
     T = T + 0.1
     run_delayed()
 
@@ -642,13 +662,13 @@ do
     print("8f. the old state (client made driver of the host's car) is put right")
     local st4 = V._t.vs()[truck4._addr]
     local key1 = cl_pc:GetFullName()
-    st4.pass_key, st4.driver_key = nil, key1
+    st4.pax[2], st4.driver_key = nil, key1
     V._t.seats()[key1].seat = "driver"
     truck4._owner = cl_pc
     truck4._p.VehicleMovementComponent._p.bRequiresControllerForInputs = true
     T = T + 2
     V.tick()
-    check(st4.driver_key == nil and st4.pass_key == key1, "8f: the client moved to the passenger seat")
+    check(st4.driver_key == nil and st4.pax[2] == key1, "8f: the client moved to the passenger seat")
     check(truck4._owner == nil and truck4._p.VehicleMovementComponent._p.bRequiresControllerForInputs == false,
         "8f: owner / inputs back to the host")
     s4 = last_sent("VSEAT", cl_pc)
@@ -703,7 +723,8 @@ do
     print("9d. the host gets out: its sit pose ends on every machine")
     truck5:ExitVehicle()
     check((host_ch._stop_everywhere or 0) >= 1, "9d: the game's replicated StopMontage for the host")
-    check(cl_ch._parent == truck5 and truck5._owner == cl_pc, "9d: the passenger takes the wheel")
+    deliver("VSWITCH", vstr(truck5), cl_pc)
+    check(cl_ch._parent == truck5 and truck5._owner == cl_pc, "9d: the passenger takes the wheel with its seat key")
     T = T + 0.1
     run_delayed()
     sent = {}
@@ -1082,6 +1103,382 @@ do
     check(R.count_vehicles() == n1 + 1 and last_sent("VBUY") == nil, "11e: the host's car, no message")
 end
 
+-- ------------------------------------------------------------ 12. two seats, three players (0.7.3)
+-- The game has one seat (the driver's); the mod adds one passenger seat. A
+-- third player gets no seat - the host neither: up to 0.7.3 the host's
+-- get-in into a car a client drove with another client beside it put the
+-- host into that client's passenger seat (two characters in one seat).
+print("12. two seats, three players")
+do
+    local Q = { CHAR_HOOK = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:VehicleInteraction", vi = {} }
+    -- the game's VehicleInteraction ends with the mod's post hook (the
+    -- harness above calls the body only)
+    for _, c in ipairs({ host_ch, cl_ch, cl2_ch }) do
+        local body = c._m.VehicleInteraction
+        Q.vi[c] = body
+        c._m.VehicleInteraction = function(s, enter, vref)
+            s._vi_calls = s._vi_calls or {}
+            s._vi_calls[#s._vi_calls + 1] = enter
+            body(s, enter, vref)
+            local h = hooks[Q.CHAR_HOOK]
+            if h and h.pre then h.pre(param(s), param(enter), param(vref)) end
+        end
+    end
+    Q.cam = host_ch._m.ResetVehicleCameraArmLength
+    host_ch._m.ResetVehicleCameraArmLength = function(s) s._cams = (s._cams or 0) + 1 end
+    -- Event_ExitVehicle places player 0 at the door socket (@24714)
+    function Q.vehicle(name, loc)
+        local v = new_vehicle(name, loc)
+        local body = v._m.Event_ExitVehicle
+        v._m.Event_ExitVehicle = function(self)
+            body(self)
+            local sock = self._p.Mesh:GetSocketLocation(FName(self._p.GetOutPasseenger and "PassengerSide" or "DriverSide"))
+            self._exited_by:K2_SetActorLocationAndRotation(sock, {})
+            self._p.GetOutPasseenger = false
+        end
+        -- the get-in lets the handbrake go for its driver (@7820)
+        local get_in = v._m.Interact_GetInVehicle
+        v._m.Interact_GetInVehicle = function(self)
+            self._p.VehicleMovementComponent:SetHandbrakeInput(false)
+            get_in(self)
+        end
+        -- UAudioComponent: a FadeOut keeps the component active (IsActive)
+        -- until the sound has faded, GetPlayState() = FadingOut (4) meanwhile;
+        -- Activate(true) restarts it
+        local snd = v._p.EngineSound
+        snd._m.FadeOut = function(s) if s._p.active then s._p.fading = true end end
+        snd._m.Activate = function(s) s._p.active = true; s._p.fading = false; s._p.starts = (s._p.starts or 0) + 1 end
+        snd._m.GetPlayState = function(s) if not s._p.active then return 1 elseif s._p.fading then return 4 end return 0 end
+        return v
+    end
+    function Q.sound_on(v)
+        local s = v._p.EngineSound._p
+        return s.active == true and s.fading ~= true
+    end
+    -- KismetSystemLibrary.CapsuleTraceSingle at a door socket (the game's
+    -- CheckCanExitCar*Side): blocked by a "wall" within the capsule there
+    Q.walls, Q.traces = {}, {}
+    ksl._m.CapsuleTraceSingle = function(_, wc, s, e, r, hh, chan, cx, ignore)
+        Q.traces[#Q.traces + 1] = { wc = wc, at = s, r = r, half = hh, ignore = ignore }
+        for _, w in ipairs(Q.walls) do
+            if math.abs(w.X - s.X) <= r and math.abs(w.Y - s.Y) <= r then return true end
+        end
+        return false
+    end
+    -- the game's death in a vehicle on this machine (@13645..13863): its
+    -- VehicleDrivingComponent.Death stops the car (@9291..9811), the body stays
+    -- attached; AfterDeath's UnPossess (@1387) leaves the controller without it
+    function Q.die_in(ch, v, pc)
+        ch._p["PlayerDead?"] = true
+        v._p.EngineSound:FadeOut(2.5, 0, 0)
+        for _, fn in ipairs({ "CheckWater", "VehicleSound", "Event_Noise" }) do timers[tkey(v, fn)] = nil end
+        v._p.VehicleMovementComponent:SetHandbrakeInput(true)
+        v._p.FuelComponent:StopSpendFuel()
+        ch._p.VehicleDrivingComponent._p.Vehicle = nil
+        pc._p.Pawn = nil
+    end
+    function Q.free_all(at)
+        for i, c in ipairs({ host_ch, cl_ch, cl2_ch }) do
+            c._parent = nil; c._montage = nil; c._p["InVehicle?"] = false; c._p.VehicleDrivingComponent._p.Vehicle = nil
+            c._p.CharacterMovement._p.MovementMode = 1
+            c._p.__loc = { X = at.X - 60 + 40 * i, Y = (i % 2 == 0) and 160 or -160, Z = 100 }
+        end
+    end
+    -- the host's interact key on the car (TryInteract sets the target first)
+    function Q.host_press(v)
+        host_ch._p.BP_JigHelperComp._p.InteractExecutedActor = v
+        v:Interact_GetInVehicle()
+        host_ch._p.BP_JigHelperComp._p.InteractExecutedActor = nil
+    end
+    function Q.at_seat(ch, v, passenger)
+        local l, vl = ch._p.__loc, v._p.__loc
+        return ch._parent == v and math.abs(l.Y - (vl.Y + (passenger and 40 or -40))) < 1
+    end
+    function Q.toast(pat)
+        for i = Q.t0 + 1, #toasts do if toasts[i]:find(pat, 1, true) then return true end end
+        return false
+    end
+    function Q.timer(o, fn) return timers[tkey(o, fn)] == true end
+
+    local tk = Q.vehicle("Vehicle_Sheriff_C_2147471200", { X = 20000, Y = 0, Z = 80 })
+    local st = nil
+    Q.free_all({ X = 20000 })
+    T = T + 5
+    V.tick()
+
+    print("12a. a client drives, another sits next to it, the host presses get-in: no seat")
+    deliver("VENTER", vstr(tk), cl_pc)
+    T = T + 0.1
+    run_delayed()
+    deliver("VENTER", vstr(tk), cl2_pc)
+    T = T + 2
+    V.tick()
+    st = V._t.vs()[tk._addr]
+    check(st.driver_key == r1.key and st.pax[2] == r2.key and Q.at_seat(cl_ch, tk, false) and Q.at_seat(cl2_ch, tk, true),
+        "12a: Friend drives, Friend2 sits as the passenger")
+    local mc = tk._p.VehicleMovementComponent
+    local hb0, vp0 = mc._p.hb, #host_vp
+    check(hb0 == false and Q.sound_on(tk), "12a: the driver's get-in let the handbrake go and runs the engine sound (as the game, @7820 / @8941)")
+    Q.t0 = #toasts
+    local rej0, stray0, cams0, stops0 = V.stats.rejected, V.stats.stray_vi, host_ch._cams or 0, host_ch._stop_everywhere or 0
+    local starts0 = tk._p.EngineSound._p.starts or 0
+    host_ch._vi_calls = {}
+    sent = {}
+    Q.traces = {}
+    Q.host_press(tk)
+    check(#host_ch._vi_calls == 1 and host_ch._vi_calls[1] == false,
+        "12a: the character's own exit path ran on the host (VehicleInteraction(false), as after the game's exit)")
+    check(tk._entered_by == host_ch, "12a: the game's get-in ran for the host")
+    check(tk._exited_by == host_ch and host_ch._parent == nil, "12a: the game's exit took the HOST out (not the driver)")
+    check(math.abs(host_ch._p.__loc.Y - (-200)) < 1, "12a: the host stands at the door, not in a seat")
+    check(#Q.traces >= 1 and Q.traces[1].wc == tk and math.abs(Q.traces[1].at.Y - (-200)) < 1 and Q.traces[1].r == 30
+        and Q.traces[1].half == 50 and Q.traces[1].ignore[1] == host_ch,
+        "12a: the door was checked as the game's exit does (capsule 30/50 at the driver door, the host ignored)")
+    check(tk._p.GetOutPasseenger == false, "12a: the car's exit-side flag is back to the driver side")
+    check(not Q.at_seat(host_ch, tk, true) and Q.at_seat(cl2_ch, tk, true), "12a: the passenger seat is still Friend2's alone")
+    check(host_ch._montage == nil and (host_ch._stop_everywhere or 0) == stops0 + 1, "12a: the host's sit pose ended here and on the clients")
+    check(host_ch._p.CharacterMovement._p.MovementMode == 1, "12a: the host walks (movement on)")
+    check(host_ch._p["InVehicle?"] == false and host_ch._p.VehicleDrivingComponent._p.Vehicle == nil, "12a: no driving state on the host")
+    check((host_ch._cams or 0) > cams0, "12a: the host's camera back from the car")
+    check(#host_vp == vp0 and tk._p.VehicleUI == nil, "12a: the vehicle panel the get-in made is gone from the host's screen")
+    check(Q.toast("В машине нет свободного места."), "12a: the host told (the game's notice): no free seat")
+    check(V.stats.rejected == rej0 + 1, "12a: counted as a refusal")
+    check(last_sent("VSEAT") == nil, "12a: the clients' seats unchanged (no seat message)")
+    check(st.driver_key == r1.key and st.pax[2] == r2.key and st.host_seat == nil, "12a: seat records: Friend driver, Friend2 passenger, host none")
+    check(Q.at_seat(cl_ch, tk, false) and cl_ch._p["InVehicle?"] == true and cl_ch._p.VehicleDrivingComponent._p.Vehicle == tk,
+        "12a: the driver still sits at the wheel with the game's driving state")
+    check(tk._owner == cl_pc and mc._p.bRequiresControllerForInputs == true, "12a: owner / replicated inputs of the driver unchanged")
+    check(mc._p.hb == false, "12a: the driver's handbrake stays off (the car counts as occupied: no handbrake on)")
+    check(Q.timer(tk, "VehicleSound") and Q.timer(tk, "CheckWater") and Q.timer(tk, "Event_Noise")
+        and Q.timer(tk._p.FuelComponent, "FuelSpend"), "12a: the driver's timers and fuel keep running")
+    check(Q.sound_on(tk) and (tk._p.EngineSound._p.starts or 0) > starts0,
+        "12a: the driver's engine sound did not fade out with the game's exit (started again at once)")
+    check(tk._resp[2] == 0 and tk._resp[4] == 0, "12a: the car still ignores its seated players (collision)")
+    T = T + 0.1
+    run_delayed()
+    check(tk._vi_by == host_ch, "12a: the get-in's delayed step reached the host")
+    check(host_ch._p["InVehicle?"] == false and host_ch._p.VehicleDrivingComponent._p.Vehicle == nil
+        and host_ch._p.CharacterMovement._p.MovementMode == 1 and host_ch._weapons_hidden == false,
+        "12a: and was undone at once: no driving state, walking, weapons back")
+    check(V.stats.stray_vi == stray0, "12a: an expected step, not counted as a stray one")
+    T = T + 2
+    V.tick()
+    check(player0(tk) == cl_ch, "12a: the car's player 0 is its driver again")
+    st.dirty = true
+    sent = {}
+    V.tick()
+    local vsa = last_sent("VSTATE", cl_pc)
+    check(vsa and vsa.args[11] == tostring(cl_ch._pid) and vsa.args[12] == tostring(cl2_ch._pid),
+        "12a: VSTATE: Friend drives, Friend2 is the passenger")
+    -- the car stands with its driver door at a wall: out at the passenger door
+    Q.walls = { { X = 20000, Y = -200 } }
+    Q.host_press(tk)
+    check(math.abs(host_ch._p.__loc.Y - 200) < 1 and tk._p.GetOutPasseenger == false,
+        "12a: driver door at a wall: the host steps out at the passenger door (flag reset after)")
+    T = T + 0.1
+    run_delayed()
+    check(host_ch._parent == nil and V.stats.rejected == rej0 + 2 and Q.at_seat(cl2_ch, tk, true), "12a: a second press: refused again")
+    -- both doors blocked: the driver door (the game would keep the player seated)
+    Q.walls = { { X = 20000, Y = -200 }, { X = 20000, Y = 200 } }
+    Q.host_press(tk)
+    check(host_ch._parent == nil and math.abs(host_ch._p.__loc.Y - (-200)) < 1, "12a: both doors blocked: out at the driver door all the same")
+    Q.walls = {}
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+
+    print("12b. the passenger leaves: the host gets that seat; then a client asks: full")
+    deliver("VEXIT", with(vstr(tk), "p", "5.0", "passenger"), cl2_pc)
+    check(cl2_ch._parent == nil and st.pax[2] == nil, "12b: Friend2 out, its seat free")
+    Q.host_press(tk)
+    T = T + 0.1
+    run_delayed()
+    check(Q.at_seat(host_ch, tk, true) and st.host_seat == "passenger", "12b: the host sits in the free passenger seat")
+    check(host_ch._p.VehicleDrivingComponent._p.Vehicle == tk, "12b: with the game's driving state (its exit key works)")
+    T = T + 2
+    V.tick()
+    sent = {}
+    deliver("VENTER", vstr(tk), cl2_pc)
+    local s12 = last_sent("VSEAT", cl2_pc)
+    check(s12 and s12.args[1] == "none" and s12.args[2] == "full", "12b: Friend2 refused: full")
+    check(cl2_ch._parent == nil and Q.at_seat(host_ch, tk, true) and Q.at_seat(cl_ch, tk, false), "12b: nobody moved")
+
+    print("12c. the driver leaves: the host takes the wheel with its key; a client sits beside it; a third: full")
+    deliver("VEXIT", with(vstr(tk), "d", "9.0", "driver"), cl_pc)
+    check(cl_ch._parent == nil and Q.at_seat(host_ch, tk, true) and st.host_seat == "passenger", "12c: the driver out: the host stays in its seat")
+    host_key()
+    check(Q.at_seat(host_ch, tk, false) and st.host_seat == "driver", "12c: the host's seat key: the wheel")
+    T = T + 2
+    V.tick()
+    deliver("VENTER", vstr(tk), cl2_pc)
+    s12 = last_sent("VSEAT", cl2_pc)
+    check(s12 and s12.args[1] == "passenger" and Q.at_seat(cl2_ch, tk, true), "12c: Friend2 sits as the passenger")
+    T = T + 0.1
+    run_delayed()
+    sent = {}
+    deliver("VENTER", vstr(tk), cl_pc)
+    s12 = last_sent("VSEAT", cl_pc)
+    check(s12 and s12.args[1] == "none" and s12.args[2] == "full", "12c: Friend refused: full")
+    check(cl_ch._parent == nil and Q.at_seat(host_ch, tk, false) and Q.at_seat(cl2_ch, tk, true) and tk._owner == nil,
+        "12c: the host keeps the wheel, Friend2 the passenger seat")
+
+    print("12d. seats freed: the passenger dies, the next one disconnects")
+    cl2_ch._p["PlayerDead?"] = true
+    T = T + 1
+    V.tick()
+    check(st.pax[2] == nil and cl2_ch._parent == nil, "12d: the dead passenger's seat is free")
+    cl2_ch._p["PlayerDead?"] = false
+    deliver("VENTER", vstr(tk), cl_pc)
+    s12 = last_sent("VSEAT", cl_pc)
+    check(s12 and s12.args[1] == "passenger" and Q.at_seat(cl_ch, tk, true), "12d: Friend takes the freed seat")
+    T = T + 1
+    V.tick()
+    cl_pc._p.NetConnection = nil      -- Friend disconnects (the engine destroys its character)
+    cl_ch._parent = nil
+    T = T + 1
+    V.tick()
+    check(st.pax[2] == nil and V.seat_of(r1.key) == nil, "12d: the disconnected passenger's seat is free")
+    cl_pc._p.NetConnection = conn
+    cl2_ch._p.__loc = { X = 20050, Y = 160, Z = 100 }
+    sent = {}
+    deliver("VENTER", vstr(tk), cl2_pc)
+    s12 = last_sent("VSEAT", cl2_pc)
+    check(s12 and s12.args[1] == "passenger" and Q.at_seat(cl2_ch, tk, true), "12d: Friend2 takes it")
+    deliver("VEXIT", with(vstr(tk), "p"), cl2_pc)
+    tk:ExitVehicle()
+    T = T + 2
+    V.tick()
+    check(host_ch._parent == nil and next(V._t.seats()) == nil, "12d: everyone out")
+
+    print("12e. the driver disconnects; another client gets in before the tick noticed")
+    local tk2 = Q.vehicle("Vehicle_Van_C_2147471300", { X = 24000, Y = 0, Z = 80 })
+    Q.free_all({ X = 24000 })
+    T = T + 2
+    V.tick()
+    deliver("VENTER", vstr(tk2), cl_pc)
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+    Q.host_press(tk2)
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+    local st2 = V._t.vs()[tk2._addr]
+    check(Q.at_seat(cl_ch, tk2, false) and Q.at_seat(host_ch, tk2, true), "12e: Friend drives, the host rides along")
+    cl_pc._p.NetConnection = nil      -- Friend's connection is gone; the tick has not run yet
+    cl_ch._parent = nil
+    sent = {}
+    deliver("VENTER", vstr(tk2), cl2_pc)
+    s12 = last_sent("VSEAT", cl2_pc)
+    check(s12 and s12.args[1] == "driver" and Q.at_seat(cl2_ch, tk2, false), "12e: Friend2 takes the free wheel")
+    T = T + 0.1
+    run_delayed()
+    T = T + 0.5
+    V.tick()
+    check(V.seat_of(r1.key) == nil, "12e: the tick ended the gone driver's seat")
+    check(st2.driver_key == r2.key and tk2._owner == cl2_pc and tk2._p.VehicleMovementComponent._p.bRequiresControllerForInputs == true,
+        "12e: the new driver keeps the car (owner, replicated inputs)")
+    check(Q.at_seat(host_ch, tk2, true) and st2.host_seat == "passenger" and Q.at_seat(cl2_ch, tk2, false),
+        "12e: the host stays in the passenger seat (not moved onto the new driver)")
+    check(Q.sound_on(tk2) and Q.timer(tk2, "CheckWater"), "12e: the new driver's engine keeps running")
+    cl_pc._p.NetConnection = conn
+    T = T + 1
+    V.tick()
+    -- the host gets out while Friend2 drives on: the game's exit faded the
+    -- car's engine sound out (Event_ExitVehicle @23409)
+    local starts_e = tk2._p.EngineSound._p.starts or 0
+    tk2:ExitVehicle()
+    check(host_ch._parent == nil and st2.host_seat == nil and Q.at_seat(cl2_ch, tk2, false) and st2.driver_key == r2.key,
+        "12e: the host got out as the passenger, Friend2 still drives")
+    check(Q.sound_on(tk2) and (tk2._p.EngineSound._p.starts or 0) > starts_e and Q.timer(tk2, "VehicleSound"),
+        "12e: the driver's engine sound did not fade out with the host's exit (started again at once)")
+    deliver("VEXIT", with(vstr(tk2), "d"), cl2_pc)
+    T = T + 2
+    V.tick()
+    check(host_ch._parent == nil and cl2_ch._parent == nil and next(V._t.seats()) == nil, "12e: everyone out")
+
+    print("12f. the host dies at the wheel, a client beside it: the client stays; its seat key: the wheel")
+    local tk3 = Q.vehicle("Vehicle_Pickup_C_2147471400", { X = 28000, Y = 0, Z = 80 })
+    Q.free_all({ X = 28000 })
+    T = T + 2
+    V.tick()
+    Q.host_press(tk3)
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+    local st3 = V._t.vs()[tk3._addr]
+    deliver("VENTER", vstr(tk3), cl2_pc)
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+    check(Q.at_seat(host_ch, tk3, false) and st3.host_seat == "driver" and Q.at_seat(cl2_ch, tk3, true) and st3.pax[2] == r2.key,
+        "12f: the host drives, Friend2 sits beside it")
+    Q.die_in(host_ch, tk3, host_pc)
+    sent = {}
+    T = T + 1
+    V.tick()
+    check(st3.host_seat == nil, "12f: the dead host holds no seat")
+    check(st3.driver_key == nil and Q.at_seat(cl2_ch, tk3, true) and last_sent("VSEAT", cl2_pc) == nil, "12f: Friend2 stays in its seat")
+    deliver("VSWITCH", vstr(tk3), cl2_pc)
+    s12 = last_sent("VSEAT", cl2_pc)
+    check(st3.driver_key == r2.key and st3.pax[2] == nil and s12 and s12.args[1] == "driver" and Q.at_seat(cl2_ch, tk3, false)
+        and tk3._entered_by == cl2_ch, "12f: Friend2's key: the wheel through the game's get-in")
+    check(tk3._owner == cl2_pc and tk3._p.VehicleMovementComponent._p.bRequiresControllerForInputs == true,
+        "12f: the car is Friend2's now (owner, replicated inputs)")
+    T = T + 0.1
+    run_delayed()
+    check(cl2_ch._p.VehicleDrivingComponent._p.Vehicle == tk3 and Q.sound_on(tk3) and tk3._p.VehicleMovementComponent._p.hb == false,
+        "12f: Friend2 has the game's driving state, engine sound on, handbrake off")
+    T = T + 1
+    V.tick()
+    check(st3.driver_key == r2.key and st3.host_seat == nil and Q.at_seat(cl2_ch, tk3, false), "12f: and it stays so on the next tick")
+    -- the host respawns (the game destroys the body, a new character; here the same one)
+    host_pc._p.Pawn = host_ch
+    host_ch._p["PlayerDead?"] = false
+    host_ch._parent = nil
+    host_ch._p.__loc = { X = 28000, Y = -300, Z = 100 }
+
+    print("12g. the host dies as the passenger of a client: the client drives on")
+    T = T + 2
+    V.tick()
+    Q.host_press(tk3)
+    T = T + 0.1
+    run_delayed()
+    T = T + 2
+    V.tick()
+    check(Q.at_seat(host_ch, tk3, true) and st3.host_seat == "passenger" and st3.driver_key == r2.key, "12g: Friend2 drives, the host rides along")
+    Q.die_in(host_ch, tk3, host_pc)
+    sent = {}
+    T = T + 1
+    V.tick()
+    check(st3.host_seat == nil and st3.driver_key == r2.key and Q.at_seat(cl2_ch, tk3, false) and last_sent("VSEAT", cl2_pc) == nil,
+        "12g: the dead host holds no seat; Friend2 keeps the wheel (no seat change)")
+    check(Q.sound_on(tk3) and Q.timer(tk3, "VehicleSound") and Q.timer(tk3, "CheckWater") and Q.timer(tk3._p.FuelComponent, "FuelSpend"),
+        "12g: the driver's engine sound and timers are back at once after the death stopped them")
+    host_pc._p.Pawn = host_ch
+    host_ch._p["PlayerDead?"] = false
+    host_ch._parent = nil
+    deliver("VEXIT", with(vstr(tk3), "d"), cl2_pc)
+    T = T + 2
+    V.tick()
+    check(host_ch._parent == nil and cl2_ch._parent == nil and next(V._t.seats()) == nil and st3.host_seat == nil, "12g: everyone out")
+
+    -- back to the harness as it was
+    for c, body in pairs(Q.vi) do c._m.VehicleInteraction = body end
+    host_ch._m.ResetVehicleCameraArmLength = Q.cam
+    ksl._m.CapsuleTraceSingle = nil
+    for i = #toasts, Q.t0 + 1, -1 do toasts[i] = nil end
+    tk._valid, tk2._valid, tk3._valid = false, false, false
+    Q.free_all({ X = 20000 })
+    T = T + 2
+    V.tick()
+end
+
 -- ------------------------------------------------------------ 7. client side
 print("7. client")
 V.reset("test")
@@ -1171,14 +1568,39 @@ check(vx ~= nil, "VEXIT sent")
 check(truck2._p.VehicleMovementComponent._p.bRequiresControllerForInputs == true, "observer again after the exit")
 
 print("7e. rejected")
+-- the car stands with its driver door at a wall (the game's door check, a
+-- capsule at the socket: CheckCanExitCarDriverSide); Event_ExitVehicle
+-- places player 0 at the door its GetOutPasseenger flag names
+local e7 = { flags = {}, ign = nil, exit_body = truck2._m.Event_ExitVehicle }
+ksl._m.CapsuleTraceSingle = function(_, wc, s, e, r, hh, chan, cx, ignore)
+    e7.ign = ignore
+    return wc == truck2 and math.abs(s.Y - (-200)) <= r
+end
+truck2._m.Event_ExitVehicle = function(self)
+    e7.flags[#e7.flags + 1] = self._p.GetOutPasseenger == true
+    e7.exit_body(self)
+end
 me._parent = truck2
 truck2:Interact_GetInVehicle()
+local stops7e = me._stop_everywhere or 0
 deliver("VSEAT", { "none", "full" }, cl_pc)
 check(me._parent == nil, "forced out by the host's answer")
 check(me._p.CharacterMovement._p.MovementMode == 1, "walking again")
+check((me._stop_everywhere or 0) == stops7e + 1 and me._montage == nil,
+    "7e: the sit pose our get-in started on every machine is stopped there too (the game's replicated stop)")
+check(e7.flags[1] == true and truck2._p.GetOutPasseenger == false and e7.ign and e7.ign[1] == me,
+    "7e: driver door at a wall: out at the passenger door (the game's own door check, this player ignored; flag reset after)")
 local found = false
 for _, t in ipairs(toasts) do if t:find("места", 1, true) then found = true end end
 check(found, "Russian toast shown")
+-- the driver door free: out there, as before
+ksl._m.CapsuleTraceSingle = function() return false end
+me._parent = truck2
+truck2:Interact_GetInVehicle()
+deliver("VSEAT", { "none", "full" }, cl_pc)
+check(me._parent == nil and e7.flags[2] == false, "7e: driver door free: out at the driver door")
+ksl._m.CapsuleTraceSingle = nil
+truck2._m.Event_ExitVehicle = e7.exit_body
 
 print("7f. seated as a passenger: moved to the passenger seat here; a stuck seat is repaired")
 me._parent = nil

@@ -434,26 +434,6 @@ P(CL.p)["HoldingFirearm?"] = false
 local want = pawnstate.expected_bs(CL.p)
 check(want == 0, "holstered: expected pose 0")
 
-out("== cached function handles failing")
-P(CL.helper).ActiveWeapon = { TagName = "Jig.PlayerSlot.PrimaryWeapon" }
-P(CL.p)["HoldingFirearm?"] = true
--- the first lookup (the handle) gives something that throws, plain calls work
-local real_gst = rawget(RC, "_m").GetSocketTransform
-local served = 0
-rawget(RC, "_m").GetSocketTransform = nil
-rawset(RC, "_p", setmetatable(rawget(RC, "_p"), { __index = function(_, k)
-    if k ~= "GetSocketTransform" then return nil end
-    served = served + 1
-    if served == 1 then return function() error("stale handle") end end
-    return real_gst
-end }))
-rawset(CL.mesh, "_hand", xf(quat(0, 0, 1, 0.9), 21, -2, 133))
-pawnstate.reset()
-frames(30)
-check(lh_is(CL.p, SOCK, rawget(CL.mesh, "_hand")), "plain call used, IK right")
--- cached handles are off since the 0.7.1 crashes: plain calls from the start, nothing to fall back from
-check(count_lines("cached GetSocketTransform handles failed") == 0, "no cached handles (plain calls only)")
-
 check(#touched_dead == 0, "no destroyed object touched in the whole run")
 real_print(string.format("pawnstate perf: %d passed, %d failed", passed, fails))
 real_print(fails == 0 and string.format("%d checks, ALL OK", passed) or string.format("%d checks, %d FAILED", passed + fails, fails))

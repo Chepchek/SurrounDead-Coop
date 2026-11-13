@@ -428,9 +428,7 @@ check(text_of(cp4.Marker.MarkerTooltip.POIBossAmount) == "1/1" and logged("Hidde
 m0 = mark()
 on("host"); host_handlers.POICL({ "BP_POIManager_C_44" }, rpc_h)   -- the client is at Gas Station
 check(hp4["UniqueContainerLooted?"] == false and logged("is not near it here", m0) ~= nil, "host: a search from far away is refused")
-local back = take("POIST")
-check(#back == 1 and back[1].to == rpc_h and back[1].msg == "SDC1|POIST|j|BP_POIManager_C_44,1,0", "host: its state goes back to that client")
-deliver(back)
+check(#take("POIST") == 0, "host: nothing goes back (a client's values only ever go up; its own search stays)")
 m0 = mark()
 on("host"); host_handlers.POICL({ "BP_POIManager_C_33" }, rpc_h)
 check(logged("no such major place", m0) ~= nil and hp4["UniqueContainerLooted?"] == false, "host: not a major place: not counted")

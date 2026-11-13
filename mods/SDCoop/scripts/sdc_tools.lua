@@ -188,14 +188,6 @@ function M.host_player(pc, pass)
     end
 end
 
--- Host tick (1 s), all remote players at once (sdc_items calls host_begin and
--- host_player itself, with the players spread over the second).
-function M.host_tick(remote_pcs)
-    if cfg.get("client_tools") == false then return end
-    M.host_begin()
-    for _, pc in ipairs(remote_pcs or {}) do M.host_player(pc, nil) end
-end
-
 -- net MYNVG|<0|1>, client -> host: the client's goggles on / off.
 local function on_nvg_msg(f, pc)
     if S.role ~= "host" then return end
@@ -218,15 +210,6 @@ local function own_pawn()
     local p = ue.local_pawn()
     if is_player_character(p) and is_locally_controlled(p) then return p end
     return nil
-end
-
-local function load_obj(path)
-    local o = ue.find_object(path)
-    if not o then
-        ue.load_asset(path, "tools")
-        o = ue.find_object(path)
-    end
-    return o
 end
 
 -- net PTOOLS|<binoculars item path, "" = empty>|<NVG battery charge, -1 = none>
@@ -278,8 +261,9 @@ function M.client_tick()
     if cfg.get("client_tools") == false or not own.got then return end
     local me = own_pawn()
     if not me then return end
-    -- the binoculars slot as the host has it
-    local want = own.bino ~= "" and load_obj(own.bino) or nil
+    -- the binoculars slot as the host has it (the item's asset only from
+    -- memory: no synchronous load on a client tick; logged once when missing)
+    local want = own.bino ~= "" and ue.loaded_asset(own.bino, "tools") or nil
     if own.bino ~= "" and not want then
         log.err_throttled("tools.asset", "tools: item %s not found on this machine", own.bino)
     end

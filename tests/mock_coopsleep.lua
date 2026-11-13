@@ -169,7 +169,12 @@ local hud = new_obj("HUD_Game_C", "HUD", {}, {})
 hud._m.ShowSleepWidget = function(self, show) if show then self._p.SleepUI = new_sleep_ui() end end
 
 local med = new_obj("MedicalComponent_C", "Med", { Health = 100, MaxHealth = 100 }, {})
-local host_pawn = new_obj("BP_PlayerCharacter_C", "Host", { MedicalComponent = med, ["PlayerDead?"] = false }, {})
+-- the HUD's health bar (BP_Ingame.HealthBar): CurrentPercent = what the host
+-- sent / 100; TargetPercent is never touched by PB_SetPercent (stays 1.0)
+local hpbar = new_obj("ProgressBarLinear_C", "HealthBar", { CurrentPercent = 1.0, TargetPercent = 1.0 }, {})
+local ingame = new_obj("BP_Ingame_C", "BP_Ingame_C_0", { HealthBar = hpbar }, {})
+local host_pawn = new_obj("BP_PlayerCharacter_C", "Host", { MedicalComponent = med, InGameUI = ingame,
+    ["PlayerDead?"] = false }, {})
 local host_pc = new_obj("BP_PlayerController_C", "HostPC", { Pawn = host_pawn, DaysSurvived = 7,
     Player = new_obj("LocalPlayer", "LP", {}, {}) }, {})
 host_pc._m.IsLocalController = function() return true end
@@ -177,7 +182,9 @@ host_pc._m.GetHUD = function() return hud end
 host_pawn._p.Controller = host_pc
 registry["PlayerController"] = { host_pc }
 local conn = new_obj("IpConnection", "Conn", {}, {})
-local rpawn = new_obj("BP_PlayerCharacter_C", "Friend", { ["PlayerDead?"] = false }, {})
+-- the client's character on the host: its health is the game's own here
+local rmed = new_obj("MedicalComponent_C", "FriendMed", { Health = 100, MaxHealth = 100 }, {})
+local rpawn = new_obj("BP_PlayerCharacter_C", "Friend", { MedicalComponent = rmed, ["PlayerDead?"] = false }, {})
 local rpc = new_obj("BP_PlayerController_C", "RemotePC", { NetConnection = conn, Pawn = rpawn }, {})
 local rkey = rpc:GetFullName()
 S.remote[rkey] = { key = rkey, pc = rpc, index = 1, name = "Friend", hello = true, pawn = rpawn }
@@ -369,7 +376,86 @@ loops.respawn()
 check(not w7._p.__inview, "hurt: the sleep window closed")
 st = sent_kind("BED", "sleepst")
 check(st and args_of(st) == "sleepst|wait|0|2|Host|out", "hurt: got up (" .. args_of(st) .. ")")
+check(toasted("Вы теряете здоровье — вы проснулись."), "host hurt: 'you are losing health: you wake up' on screen")
+check(logged("hurt: health 100 %-> 80%)") ~= nil, "host hurt: logged with the game's own health")
 med._p.Health = 100
+
+-- ------------------------------------------------------------ J2. a sleeping client hurt (the host's view)
+print("J2. the host sees a sleeping client hurt")
+reset_round(2100)
+T = T + 30
+handlers.SLEEP({ "2" }, rpc)
+check(respawn.status_line():find("asleep=1", 1, true) ~= nil, "client asleep")
+loops.respawn()
+rmed._p.Health = 98     -- a small change (not a hit): still asleep
+loops.respawn()
+check(respawn.status_line():find("asleep=1", 1, true) ~= nil, "a fall of 2: still asleep")
+rmed._p.Health = 99     -- regeneration
+loops.respawn()
+check(respawn.status_line():find("asleep=1", 1, true) ~= nil, "health going up: still asleep")
+rmed._p.Health = 70     -- a zombie's hit on the host's copy of the client's character
+sent = {}
+lines = {}
+loops.respawn()
+check(respawn.status_line():find("asleep=0", 1, true) ~= nil, "hurt client no longer counts as asleep")
+local beds = {}
+for _, sm in ipairs(sent) do if sm.kind == "BED" then beds[#beds + 1] = sm end end
+local hm = beds[1]
+check(hm and hm.to == rpc and args_of(hm) == "sleepst|hurt|0|2|Friend|out",
+    "the hurt client is told first: hurt (" .. args_of(hm) .. ")")
+-- the mods up to 0.10.0 have no "hurt" (they ignore it): "off" closes their window
+local om = beds[2]
+check(om and om.to == rpc and args_of(om) == "sleepst|off|0|0|Friend|hurt",
+    "then 'off' (event hurt) to the same client, for older mods (" .. args_of(om) .. ")")
+local wm3 = beds[3]
+check(wm3 and args_of(wm3) == "sleepst|wait|0|2|Friend|out", "then the count: wait 0/2 (" .. args_of(wm3) .. ")")
+check(#beds == 3, "nothing else to the clients (" .. #beds .. " BED messages)")
+check(logged("Friend was hurt while asleep %(health 99 %-> 70 on the host%)") ~= nil, "host log: who was hurt, health")
+-- the client's own SLEEP x afterwards (it saw the hit on its HUD too): nothing more
+sent = {}
+handlers.SLEEP({ "x" }, rpc)
+check(#sent == 0, "the client's own 'got up' after that: no second status")
+-- the client's character away (no health readable): it stays asleep, no false wake
+handlers.SLEEP({ "2" }, rpc)
+rpc._p.Pawn = nil
+loops.respawn()
+check(respawn.status_line():find("asleep=1", 1, true) ~= nil, "no character on the host: still counted asleep")
+rpc._p.Pawn = rpawn
+rmed._p.Health = 100
+handlers.SLEEP({ "x" }, rpc)
+check(respawn.status_line():find("asleep=0", 1, true) ~= nil, "client got up")
+-- a hit right after the press, before the host's next tick: the health at the press counts
+handlers.SLEEP({ "2" }, rpc)
+rmed._p.Health = 60
+loops.respawn()
+check(respawn.status_line():find("asleep=0", 1, true) ~= nil, "a hit in the first second after Sleep: the client gets up")
+rmed._p.Health = 100
+
+-- ------------------------------------------------------------ J3. a sleeping client dies (the host's view)
+-- a death is not "hurt": the client gets its death screen, not the "hurt" words
+print("J3. a sleeping client dies")
+local function client_dies(health, dead_flag, what)
+    handlers.SLEEP({ "x" }, rpc)
+    rmed._p.Health, rpawn._p["PlayerDead?"] = 100, false
+    handlers.SLEEP({ "2" }, rpc)
+    loops.respawn()
+    check(respawn.status_line():find("asleep=1", 1, true) ~= nil, what .. ": client asleep")
+    rmed._p.Health, rpawn._p["PlayerDead?"] = health, dead_flag
+    sent, lines = {}, {}
+    loops.respawn()
+    check(respawn.status_line():find("asleep=0", 1, true) ~= nil, what .. ": no longer counts as asleep")
+    local hurt_sent = false
+    for _, sm in ipairs(sent) do if sm.kind == "BED" and (sm.args[2] == "hurt" or sm.args[2] == "off") then hurt_sent = true end end
+    check(not hurt_sent, what .. ": no 'hurt' / 'off' to the dead client")
+    local cm = sent_kind("BED", "sleepst")
+    check(cm and args_of(cm) == "sleepst|wait|0|2|Friend|out", what .. ": the count wait 0/2 (" .. args_of(cm) .. ")")
+    check(logged("Friend died while asleep") ~= nil and logged("was hurt while asleep") == nil,
+        what .. ": host log says died, not hurt")
+end
+client_dies(0, false, "health 0 before the dead flag")
+client_dies(50, true, "the dead flag (health 50)")
+rmed._p.Health, rpawn._p["PlayerDead?"] = 100, false
+handlers.SLEEP({ "x" }, rpc)
 
 -- ------------------------------------------------------------ K. the client's side
 print("K. client side")
@@ -414,6 +500,123 @@ press_sleep()
 T = T + 7
 loops.respawn()
 check(logged("no answer from the host") ~= nil, "client: an older host's silence ends the waiting")
+
+-- ------------------------------------------------------------ K2. the client hurt in bed (its HUD)
+-- A client's own MedicalComponent does not replicate (13.11: 100/100 on every
+-- client line); the host's value reaches it only through its HUD's bar.
+print("K2. client hurt in bed: its HUD's health")
+local function client_in_bed(tod)
+    reset_round(tod)
+    T = T + 30
+    local w = press_sleep()
+    handlers.BED({ "sleepst", "wait", "1", "2", "Friend", "in" })
+    T = T + 2.5
+    w:Exit()
+    run_delayed()
+    local w2 = hud._p.SleepUI
+    check(w2 ~= w and w2._p.__inview, "client: waiting in bed")
+    loops.respawn()
+    return w2
+end
+local kw = client_in_bed(2300)
+-- its own (not replicated) MedicalComponent copy changes: not its health
+med._p.Health = 40
+sent = {}
+loops.respawn()
+check(kw._p.__inview and sent_kind("SLEEP") == nil, "client: its own MedicalComponent copy is not read")
+med._p.Health = 100
+loops.respawn()
+hpbar._p.CurrentPercent = 0.98     -- a small change: still in bed
+loops.respawn()
+check(kw._p.__inview, "client: a fall of 2 on the HUD: still in bed")
+hpbar._p.CurrentPercent = 0.6      -- the host's Client_UpdateHealthUI(60) after a hit
+toasts, sent, lines = {}, {}, {}
+loops.respawn()
+check(not kw._p.__inview, "client hurt: the sleep window closed")
+m = sent_kind("SLEEP")
+check(m and m.to == "host" and m.args[1] == "x", "client hurt: SLEEP x sent to the host")
+check(toasted("Вы теряете здоровье — вы проснулись."), "client hurt: 'you are losing health: you wake up' on screen")
+check(logged("hurt: health 98 %-> 60 %(HUD%)") ~= nil, "client hurt: logged with the HUD's health")
+check(respawn.status_line():find("waiting_here=false", 1, true) ~= nil, "client: no longer waiting")
+T = T + 5
+loops.respawn()
+run_delayed()
+check(hud._p.SleepUI == kw, "client: no waiting window again after the hit")
+hpbar._p.CurrentPercent = 1.0
+-- TargetPercent is not the health (always 1.0): a HUD without CurrentPercent
+-- gives no health, and nothing wakes the client by mistake
+local kw2 = client_in_bed(2310)
+hpbar._p.CurrentPercent = nil
+hpbar._p.TargetPercent = 0.2
+loops.respawn()
+check(kw2._p.__inview, "client: no readable HUD health: still in bed")
+hpbar._p.CurrentPercent, hpbar._p.TargetPercent = 1.0, 1.0
+sent = {}
+kw2:Exit()   -- Esc
+check(sent_kind("SLEEP") and sent_kind("SLEEP").args[1] == "x", "client: got up with Esc")
+-- the host's Client_UpdateHealthUI(0) before PlayerDead? (an unreliable RPC
+-- can come first): the client gets up, without the words on its death screen
+local kw4 = client_in_bed(2315)
+hpbar._p.CurrentPercent = 0
+toasts, sent, lines = {}, {}, {}
+loops.respawn()
+check(not kw4._p.__inview, "client: HUD health 0: the sleep window closed")
+check(sent_kind("SLEEP") and sent_kind("SLEEP").args[1] == "x", "client: HUD health 0: SLEEP x to the host")
+check(#toasts == 0, "client: HUD health 0 (a death): no 'losing health' words")
+check(logged("died: health 100 %-> 0 %(HUD%)") ~= nil, "client: HUD health 0 logged as a death")
+hpbar._p.CurrentPercent = 1.0
+
+-- ------------------------------------------------------------ K3. the host says the client was hurt
+print("K3. the host's 'hurt'")
+local kw3 = client_in_bed(2320)
+toasts, sent, lines = {}, {}, {}
+handlers.BED({ "sleepst", "hurt", "0", "2", "Friend", "out" })
+check(not kw3._p.__inview, "client: the host's 'hurt' closes the sleep window")
+check(toasted("Вы теряете здоровье — вы проснулись."), "client: 'you are losing health: you wake up' on screen")
+check(respawn.status_line():find("waiting_here=false", 1, true) ~= nil, "client: no longer waiting")
+-- what follows it from the host: "off" (event hurt) for older mods, then the count
+handlers.BED({ "sleepst", "off", "0", "0", "Friend", "hurt" })
+handlers.BED({ "sleepst", "wait", "0", "2", "Friend", "out" })
+check(#toasts == 1, "client: 'hurt', 'off', the count: the words once (" .. #toasts .. ")")
+check(logged("coop_sleep_all off") == nil, "client: the 'off' after 'hurt' is not taken for the host's rule")
+check(sent_kind("SLEEP") == nil, "client: no SLEEP x after the host's 'hurt' (the host already knows)")
+T = T + 5
+loops.respawn()
+run_delayed()
+check(hud._p.SleepUI == kw3, "client: no waiting window again after the host's 'hurt'")
+-- the same messages as an older mod (up to 0.10.0) takes them: it has no
+-- "hurt" state and ignores it; the "off" after it closes its window
+local kw5 = client_in_bed(2330)
+toasts, sent, lines = {}, {}, {}
+handlers.BED({ "sleepst", "off", "0", "0", "Friend", "hurt" })
+handlers.BED({ "sleepst", "wait", "0", "2", "Friend", "out" })
+check(not kw5._p.__inview, "older mod's view (no 'hurt'): the 'off' closes the sleep window")
+check(respawn.status_line():find("waiting_here=false", 1, true) ~= nil, "older mod's view: no longer waiting in bed")
+check(logged("no longer waiting in bed: hurt") ~= nil, "the 'off' after a hurt is logged as the hurt")
+T = T + 5
+loops.respawn()
+run_delayed()
+check(hud._p.SleepUI == kw5, "older mod's view: no waiting window again")
+-- the host's 'hurt' reaching a dead client (its own tick has not seen the death yet)
+local kw6 = client_in_bed(2340)
+toasts = {}
+host_pawn._p["PlayerDead?"] = true
+handlers.BED({ "sleepst", "hurt", "0", "2", "Friend", "out" })
+check(not kw6._p.__inview, "dead client: the host's 'hurt' closes the window")
+check(#toasts == 0, "dead client: no 'losing health' words over the death screen")
+host_pawn._p["PlayerDead?"] = false
+-- the same with the HUD at 0 (Client_UpdateHealthUI(0) before PlayerDead?)
+local kw7 = client_in_bed(2350)
+toasts = {}
+hpbar._p.CurrentPercent = 0
+handlers.BED({ "sleepst", "hurt", "0", "2", "Friend", "out" })
+check(not kw7._p.__inview, "HUD health 0: the host's 'hurt' closes the window")
+check(#toasts == 0, "HUD health 0: no 'losing health' words")
+hpbar._p.CurrentPercent = 1.0
+-- 'hurt' while not in bed: nothing
+toasts = {}
+handlers.BED({ "sleepst", "hurt", "0", "2", "Friend", "out" })
+check(#toasts == 0, "client: 'hurt' when not in bed shows nothing")
 
 -- ------------------------------------------------------------ L. the game clock log
 print("L. clock log")

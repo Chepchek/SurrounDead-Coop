@@ -74,6 +74,9 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 - The clients' characters follow the host's saves: a world save keeps everyone's state, loading it brings everyone back to it; re-joining the same running world continues where you left. The co-op autosave every 10 minutes really saves.
 - The host opens their world with the "Co-op" button in the main menu and loads a save as usual. Friends join through Steam ("Join Game" in the friends list, or the Steam tab in the panel) or by IP.
 - The panel shows the player list: who is connecting, loading, in game, and their ping. A corner of the screen shows who is connected, through Steam or by IP, and the ping.
+- Who may join is the host's choice ("World" tab): everyone, by password, by the host's approval, or invited players only; a player limit, kick and ban. Friends can be invited through Steam right from the panel.
+- A join screen shows the stages of joining and, if joining fails, the reason and what to do.
+- The host can pull a player to their side (player list → "More").
 - A player's name comes from the "Name" field on the "Character" tab; if it is empty, from Steam.
 - A client creates their character in the game's own character creator.
 - The client's character — level, skills, inventory, health, position, discovered map locations — is stored by the host next to the host's save and comes back on the next join.
@@ -87,12 +90,16 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 - A shared map: everyone sees the places any player has discovered; the discovery experience still goes to whoever reaches the place.
 - Experience, skills, the skill tree and statistics are per player.
 - Game-style notifications to the other players: "Player died" and "Player respawned".
+- A text chat in the game's style: Enter opens the input line.
+- Optional knockdown (host rule, off by default): a fatal hit puts the player down for 60 seconds, a teammate revives them by holding F.
 
 **Combat**
 - A client's weapon damage is computed on the host with the stats of their weapon; damage numbers, headshots.
 - Grenades, pipe bombs, Molotov cocktails, bottles; grenade launcher, rocket launcher, flare gun and crossbow; camera shake only for those inside the blast.
 - Zombies hear every player's shots; hit markers for everyone.
 - A kill counts for whoever made it: counter, experience, the popup.
+- Friendly fire is off by default (host rule on the "World" tab).
+- Single-round reloads (shotguns, the sawn-off, Winchester, Mosin, revolver) stop at the weapon's capacity at any ping.
 
 **Zombies and NPCs**
 - Zombies look the same on the client as on the host: type, crawlers, bosses, effects of the acid, radiated and grenadier zombies.
@@ -104,16 +111,21 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 **Items and crafting**
 - Inventory, chests, corpses, car trunks (no "blinking" items), crafting, workbenches: dismantling, cooking, camp.
 - Medicine, food, water, canteens and jerry cans, the well, water purification, fishing, repair kits, binoculars, night vision.
+- What the host hands a client (loot boxes, the well, fishing, a picked-up building, mined rock) goes where the client's own inventory screen puts it, or at their feet if there is no room.
 
 **World**
 - Searched containers (in camps and points of interest too) and loot refills, doors, chopping trees and mining rocks, scrap metal.
 - Building and moving furniture; trash, explosive barrels and landmines, infestations and their loot.
 - Camps, settlements, random infestations, horde waves, airdrops, plane flyovers and the "blood moon" — from the host, the same for everyone. Camp and player-built turrets: shots, aim, switching off and damage are shared.
-- Time of day and weather are shared; so are electricity, switches, doors, keypad locks and scanners in labs and bunkers. Locks are picked with each player's own lockpicks.
+- Time of day and weather are shared; so are generators, levers, lights, sirens, doors, keypad locks and scanners in labs and bunkers, and their state is saved with the world. Locks are picked with each player's own lockpicks.
 - Experience for a destroyed infestation goes to every player nearby, each at their own level.
+- The map marker of a camp (lab research tents, abandoned camps and the like) disappears for everyone once any player reaches it.
+- Decontamination showers: the same cooldown, water and lights for everyone.
+- Area warnings (such as the mines around the observatory) appear for every player who walks in.
 
 **Vehicles**
-- Driver and passenger, proper poses, the passenger takes the wheel when the driver gets out.
+- Up to four seats in the 4x4, the sedan, the Charger, the sheriff car, the SUV and the Humvee; driver and passenger in the rest; proper poses.
+- When the driver gets out, passengers stay seated; G moves you to the wheel or the next free seat. Headlights, horn and flipping belong to the driver.
 - Refueling and repairs by a client, headlights, horn, color, buying a vehicle from the trader.
 
 **Diagnostics**
@@ -122,9 +134,8 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 ## Not there yet / known issues
 
 - **Joining through Steam is new**: it has seen less testing than joining by IP. If Steam does not work, IP (Radmin VPN, ZeroTier, forwarding UDP 7777) works as before. A console window flashes for a moment when the game starts — that is the Steam helper starting.
-- **No chat.**
-- **Two seats per vehicle**: driver and passenger.
-- **No "downed" state with reviving a teammate**, no kick and no server password.
+- **Rear seats in vans, trucks and pickups are not tuned yet**, so they are off (host setting `vehicle_seats_untuned`); with them on, a passenger may float or sink into the side.
+- **Knockdown is new** and off by default; it uses the game's own poses.
 - **Load**: UE4SS intercepts the game's calls, which is noticeable on weak PCs. Only a custom UE4SS build can fix that (see plans).
 - **Tested by three players.** More players should work in theory, but has not been tested.
 - **Fresh fixes** are often verified only by tests without the game — check the logs and report if something is off.
@@ -133,10 +144,10 @@ In short: in SurrounSync everyone plays their own single-player game and the mod
 ## Plans (no promises)
 
 No dates and no guarantees — as time and motivation allow:
-- chat;
 - a custom UE4SS build with fast hook lookup — less load;
-- testing with three or four players;
-- maybe a "downed" state with reviving a teammate.
+- getting back into the game after a short connection drop without losing your place;
+- tuned rear seats in vans and trucks;
+- testing with three or four players.
 
 ## Installation
 

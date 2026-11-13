@@ -177,6 +177,9 @@ ctx.scope_resolver = function(wco) if wco == gi then return nil end return nil e
 local V = require("sdc_vehicles")
 local S = { role = "host", remote = {}, remote_pcs = {}, client = nil }
 V.install(S)
+-- (the driver's exit moves nobody: a passenger takes the wheel with its seat
+-- key - the host's press runs SEATK.on_key, a client's is its VSWITCH; the
+-- key itself: mock_vehicles_seats W / K)
 
 -- ------------------------------------------------------------ world
 local CHAR_HOOK = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:VehicleInteraction"
@@ -418,10 +421,13 @@ V.tick()
 local n_exit = exits_run
 host_look = nil
 check(host_press() == "exit", "H1: the key in the car runs the game's exit")
-check(host_ch._parent == nil and V._t.seats()[r1.key].seat == "driver" and cl_ch._parent == truck,
-    "H1: host out, the passenger took the wheel (the game's get-in for it)")
+check(host_ch._parent == nil and V._t.seats()[r1.key].seat == "passenger" and cl_ch._parent == truck,
+    "H1: host out, the passenger stays in its seat")
+deliver("VSWITCH", vstr(truck), cl_pc)
+check(V._t.seats()[r1.key].seat == "driver" and cl_ch._parent == truck,
+    "H1: the passenger's seat key: the wheel (the game's get-in for it)")
 T = T + 0.1
-run_delayed()   -- the promotion's get-in: VehicleInteraction(true) 0.1 s later
+run_delayed()   -- that get-in's step: VehicleInteraction(true) 0.1 s later
 check(truck._vi_by == cl_ch, "H1: the delayed get-in step went to the new driver, not the host")
 check(host_free(), "H1: the host is free right after ONE press (no driving state, walking)")
 check((V.stats.stray_vi or 0) == 0, "H1: nothing had to be undone")
@@ -454,8 +460,10 @@ check(truck._vi_by == host_ch and host_ch._p["InVehicle?"] == true, "H2: the hos
 T = T + 20
 V.tick()
 deliver("VEXIT", with(vstr(truck), "d", "22.0", "driver"), cl_pc)
-check(cl_ch._parent == nil and host_ch._parent == truck and V._t.vs()[truck._addr].host_seat == "driver",
-    "H2: the client is out, the host took the wheel")
+check(cl_ch._parent == nil and host_ch._parent == truck and V._t.vs()[truck._addr].host_seat == "passenger",
+    "H2: the client is out, the host stays in its seat")
+V._t.seatk.on_key()
+check(host_ch._parent == truck and V._t.vs()[truck._addr].host_seat == "driver", "H2: the host's seat key: the wheel")
 check(host_ch._p["InVehicle?"] == true and host_ch._p.VehicleDrivingComponent._p.Vehicle == truck,
     "H2: the host keeps the game's driving state")
 T = T + 0.1
@@ -511,7 +519,7 @@ T = T + 3
 V.tick()
 check(host_free() and cl_ch._parent == nil, "H4: both out")
 
-print("H5. race: the passenger takes the wheel and leaves again within the get-in's 0.1 s")
+print("H5. race: the passenger takes the wheel (its key) and leaves again within the get-in's 0.1 s")
 T = T + 5
 V.tick()
 host_look = truck
@@ -526,7 +534,9 @@ check(V._t.seats()[r1.key].seat == "passenger", "H5: client passenger")
 T = T + 10
 V.tick()
 host_look = nil
-host_press()                                                      -- the host gets out; the client takes the wheel
+host_press()                                                      -- the host gets out
+deliver("VSWITCH", vstr(truck), cl_pc)                            -- the client takes the wheel with its key
+check(V._t.seats()[r1.key].seat == "driver", "H5: the client at the wheel")
 deliver("VEXIT", with(vstr(truck), "d", "0.0", "driver"), cl_pc)  -- and leaves before the 0.1 s step
 T = T + 0.1
 local cams = host_ch._cam_resets or 0
@@ -547,7 +557,7 @@ host_ch._p.CharacterMovement._p.MovementMode = 0
 local promoted = V.stats.promoted
 check(host_press() == "exit" and host_free(), "H6: the second press frees it (the game's exit)")
 check((V.stats.stray_exits or 0) == 1 and warned("although the host sat in no seat there"), "H6: logged as a stray exit")
-check(V.stats.promoted == promoted, "H6: nothing promoted")
+check(V.stats.promoted == promoted, "H6: nobody moved to the wheel")
 
 print("H7. a trader stays the host's interact target (the dialogue's trade event reads it later)")
 local npc = new_obj("BP_TraderMaster_C", "BP_Trader_C_1", { __loc = { X = 2000, Y = 0, Z = 100 } }, {})

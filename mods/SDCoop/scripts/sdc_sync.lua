@@ -31,6 +31,48 @@ local function addr(o)
     return nil
 end
 
+-- Not destroyed (sdc_sweepguard.live: KismetSystemLibrary.IsValid through its
+-- UFunction; UE4SS's own IsValid stays true until the garbage collection).
+-- Required on first use (sdc_sweepguard loads sdc_players); false when it
+-- cannot be loaded.
+local guard_mod = nil
+local function live(o)
+    if guard_mod == nil then
+        local ok, m = pcall(require, "sdc_sweepguard")
+        guard_mod = (ok and type(m) == "table" and type(m.live) == "function") and m or false
+        if not guard_mod then log.warn("ai: sdc_sweepguard.live unavailable (%s); destroyed ghosts are not told apart", tostring(m)) end
+    end
+    if guard_mod then return guard_mod.live(o) end
+    return ue.valid(o)
+end
+
+-- Tables keyed by character name (an entry per character ever seen): emptied
+-- on a level / role change (forget_world, reset_client_state) and pruned to
+-- the characters still there by the ticks that list them all.
+local by_pawn = {}
+local function pawn_table()
+    local t = {}
+    by_pawn[#by_pawn + 1] = t
+    return t
+end
+local function clear_pawn_tables()
+    for _, t in ipairs(by_pawn) do
+        for k in pairs(t) do t[k] = nil end
+    end
+end
+
+-- Drops the entries of `t` (keyed by character name) not in `present`.
+local function keep_only(t, present)
+    for k in pairs(t) do
+        if not present[k] then t[k] = nil end
+    end
+end
+
+-- Every BP_PlayerCharacter_C here (sdc_ue's shared list, valid ones only).
+local function player_chars()
+    return ue.player_chars() or {}
+end
+
 local TOD_PROP = "Time of Day"         -- Ultra_Dynamic_Sky_C, 0..2400
 local TOD_TOLERANCE = 15               -- 15/100 h ~ 9 game minutes
 local WEATHER_TRANSITION_S = 8.0
@@ -68,31 +110,6 @@ local function weather_state_string(w)
     return table.concat(parts, ";")
 end
 
--- Debug: what the sky actually shows (host and client print the same line,
--- every 30 s): sky actors, startup / animation flags, the time, the cached
--- sun vector and the sun light's pitch.
-local sky_probe_at = -1000
-function M.sky_probe(role)
-    if not log.debug_enabled or os.clock() - sky_probe_at < 30 then return end
-    sky_probe_at = os.clock()
-    local all = ue.find_all("Ultra_Dynamic_Sky_C")
-    local n = 0
-    for _, o in ipairs(all) do if ue.valid(o) and not ue.name(o):find("Default__", 1, true) then n = n + 1 end end
-    local s = sky()
-    if not s then log.info("env-probe[%s]: no sky actor (%d found)", tostring(role), n) return end
-    local function b(name) return tostring(ue.prop(s, name)) end
-    local v = ue.prop(s, "Cached Sun Vector")
-    local vz = v and ue.try(function() return v.Z end)
-    local sun = ue.prop(s, "Sun")
-    local rot = ue.valid(sun) and ue.try(function() return sun:K2_GetComponentRotation() end)
-    local pitch = rot and ue.try(function() return rot.Pitch end)
-    local inten = ue.valid(sun) and ue.prop(sun, "Intensity")
-    log.info("env-probe[%s]: skies=%d %s role=%d tod=%s repl_tod=%s animate=%s init_repl=%s repl_to_clients=%s no_runtime=%s sunZ=%s sun_pitch=%s sun_int=%s",
-        tostring(role), n, ue.short(s), ue.role(s), b("Time of Day"), b("Replicated Time of Day"),
-        b("Animate Time of Day"), b("Initial Replication"), b("Replicate Time of Day to Clients"),
-        b("Disable All Runtime Updating"), tostring(vz), tostring(pitch), tostring(inten))
-end
-
 -- Host: snapshot sent to clients.
 local env_state_log_at = -1000
 function M.env_snapshot()
@@ -101,7 +118,6 @@ function M.env_snapshot()
     local wobj = w and ue.prop(w, "Weather") or nil
     local wpath = ue.valid(wobj) and ue.path(wobj) or ""
     local state = weather_state_string(w)
-    pcall(M.sky_probe, "host")
     if not M.env_report_logged then
         M.env_report_logged = true
         log.info("env: sky=%s role=%d tod=%s | weather=%s role=%d preset=%s",
@@ -151,6 +167,51 @@ local function apply_weather_state(w, state)
     end
 end
 
+-- Client setting sync_weather_overrides off (0.7.3 wave; an in-game test of
+-- work\audit\session.md E2): the game's own random weather replication
+-- instead of the overrides above, which stop the client's random weather
+-- per channel and move it in 5 s steps. The overrides this machine has on
+-- go off again (OnRep); nothing is written into the channels; every 60 s a
+-- line compares the host's state (ENV) with this machine's Global Weather
+-- State and its random weather manager. Once, when that manager has not
+-- started while the world is in random weather mode, UDW's own Initialize
+-- Random Weather Variation runs (the audit's "native nudge": a start-order
+-- race). Back on: apply_weather_state turns the overrides on again.
+local weather_native = { released = false, logged_at = -1000, nudged = false }
+M.weather_native = weather_native   -- tests
+
+local function native_weather_check(w, state)
+    if not weather_native.released then
+        weather_native.released = true
+        local n = 0
+        for _, ch in ipairs(WEATHER_CHANNELS) do
+            local ov = ch[2] .. " - Manual Override"
+            if ue.prop(w, ov) == true and ue.set_prop(w, ov, false) then
+                ue.call(w, "OnRep_" .. ov)
+                n = n + 1
+            end
+        end
+        override_logged = {}
+        log.info("env: sync_weather_overrides off: %d manual override(s) released; the game's own random weather replication decides",
+            n)
+    end
+    if os.clock() - weather_native.logged_at < 60 then return end
+    weather_native.logged_at = os.clock()
+    local mgr = ue.prop(w, "Random Weather Manager")
+    local started, target = nil, nil   -- (not "valid and prop or nil": false is a value)
+    if ue.valid(mgr) then started, target = ue.prop(mgr, "Started"), ue.prop(mgr, "Target Random Weather Type") end
+    local mode = ue.prop(w, "Random Weather Variation State")
+    log.info("env: native weather check: host %s | here %s | random weather state=%s manager=%s started=%s target=%s",
+        tostring(state), weather_state_string(w), tostring(mode), ue.short(mgr), tostring(started),
+        ue.valid(target) and ue.short(target) or "?")
+    if started == false and type(mode) == "number" and mode > 0 and not weather_native.nudged then
+        weather_native.nudged = true
+        local ok = ue.call(w, "Initialize Random Weather Variation")
+        log.info("env: the random weather manager had not started here: UDW Initialize Random Weather Variation ok=%s",
+            tostring(ok))
+    end
+end
+
 local function tod_distance(a, b)
     local d = math.abs(a - b) % 2400
     return math.min(d, 2400 - d)
@@ -159,14 +220,28 @@ end
 local last_weather_applied = nil
 local last_weather_at = 0
 
+-- Test harness (sdc_ui ui_test.txt, screenshots): weather channels into
+-- this machine's weather actor ("cc=0.8;f=3;s=0" as in the ENV state).
+function M.test_weather(state)
+    local w = weather()
+    if not w then return false end
+    return (pcall(apply_weather_state, w, state))
+end
+
 -- Client: apply a host snapshot.
 function M.apply_env(tod, weather_path, weather_state)
     if not cfg.get("sync_env") then return end
-    pcall(M.sky_probe, "client")
     if weather_state and weather_state ~= "" then
         local wa = weather()
         if wa then
-            local ok, err = pcall(apply_weather_state, wa, weather_state)
+            local fn = apply_weather_state
+            if cfg.get("sync_weather_overrides") == false then
+                fn = native_weather_check
+            elseif weather_native.released then
+                weather_native.released, weather_native.logged_at = false, -1000
+                log.info("env: sync_weather_overrides on again: the host's weather goes into the manual overrides")
+            end
+            local ok, err = pcall(fn, wa, weather_state)
             if not ok then log.err_throttled("env-state", "weather state: %s", tostring(err)) end
         end
     end
@@ -502,7 +577,6 @@ function M.client_ai_tick()
     end
     local removed = 0
     local names = {}
-    local ksl = ue.ksl()
     each_ai(function(a)
         if ue.role(a) == ue.ROLE_AUTHORITY and ue.is_runtime_spawned(a) then
             -- the host's own AI torn off on death (corpses) also turn into
@@ -510,7 +584,7 @@ function M.client_ai_tick()
             if ue.prop(a, "bTearOff") == true then return end
             -- destroyed already: FindAllOf lists it until the next garbage
             -- collection (UE4SS IsValid only checks reachability)
-            if ksl and ue.try(function() return ksl:IsValid(a) end) == false then return end
+            if not live(a) then return end
             local key = ue.name(a)
             local n = (ghost_tries[key] or 0) + 1
             ghost_tries[key] = n
@@ -540,7 +614,10 @@ function M.reset_client_state()
     spawner_done = {}
     ghost_tries = {}
     last_weather_applied = nil
+    -- a new connection: its weather actor gets the native check from the start
+    weather_native.released, weather_native.logged_at, weather_native.nudged = false, -1000, false
     M.env_report_logged = false
+    clear_pawn_tables()
 end
 
 -- ---------------------------------------------------------------------------
@@ -552,13 +629,15 @@ end
 -- Replicated players (role 1, the host and other clients) are never touched:
 -- v0.2.x hid exactly those (it tested role == 1), which made the host
 -- invisible on the client.
-local hidden = {}
+local hidden = pawn_table()
 function M.client_hide_stale_pawns()
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    local present = {}
+    for _, p in ipairs(player_chars()) do
         if ue.valid(p) and ue.role(p) == ue.ROLE_AUTHORITY then
             local okLC, isLC = pcall(function() return p:IsLocallyControlled() end)
             if not (okLC and isLC) then
                 local key = ue.name(p)
+                present[key] = true
                 pcall(function() p:SetActorHiddenInGame(true) end)
                 pcall(function() p:SetActorEnableCollision(false) end)
                 ue.teleport(p, { X = 0, Y = 0, Z = -200000 })
@@ -570,9 +649,10 @@ function M.client_hide_stale_pawns()
             end
         end
     end
+    keep_only(hidden, present)
 end
 
--- Mesh components of an actor with their visibility flags.
+-- Mesh components of an actor with their mesh assets (log_equipment).
 function M.mesh_states(actor)
     local out = {}
     local cls = ue.find_object("/Script/Engine.MeshComponent")
@@ -593,11 +673,7 @@ function M.mesh_states(actor)
             local a = ue.prop(c, pname)
             if ue.valid(a) then asset = a break end
         end
-        out[#out + 1] = {
-            comp = c, name = ue.short(c), asset = asset and ue.path(asset) or "",
-            visible = ue.prop(c, "bVisible"), hidden_in_game = ue.prop(c, "bHiddenInGame"),
-            owner_no_see = ue.prop(c, "bOwnerNoSee"), only_owner_see = ue.prop(c, "bOnlyOwnerSee"),
-        }
+        out[#out + 1] = { name = ue.short(c), asset = asset and ue.path(asset) or "" }
     end
     if type(arr) == "table" then
         for _, c in ipairs(arr) do add(c) end
@@ -607,15 +683,6 @@ function M.mesh_states(actor)
     end
     return out
 end
-
-local function log_mesh_states(tag, p)
-    for _, m in ipairs(M.mesh_states(p)) do
-        log.info("players: %s %s.%s asset=%s visible=%s hiddenInGame=%s ownerNoSee=%s onlyOwnerSee=%s",
-            tag, ue.short(p), m.name, m.asset, tostring(m.visible), tostring(m.hidden_in_game),
-            tostring(m.owner_no_see), tostring(m.only_owner_see))
-    end
-end
-M.log_mesh_states = log_mesh_states
 
 -- ---------------------------------------------------------------------------
 -- Equipment attached to player characters (backpack, weapons, headwear...)
@@ -844,8 +911,9 @@ end
 -- host sees it smooth). For co-op between friends the client is trusted:
 -- the server skips the error check and takes the client's position.
 
-local movement_done = {}
-local netfreq_done = {}
+local movement_done = pawn_table()
+local netfreq_done = pawn_table()
+local unstuck = pawn_table()      -- M.unstick: logged once per character
 local MIN_NET_FREQ = 60
 
 -- Component replication of player characters. If the capsule (the root)
@@ -854,9 +922,9 @@ local MIN_NET_FREQ = 60
 -- OnRep_Transform: the client's own character jumps back along its path a
 -- few times a second while its velocity stays forward (the client's "back
 -- steps"). Stock ACharacter does not replicate these components; position
--- reaches others through the actor's ReplicatedMovement.
-M.capsule_rep_wanted = false            -- experiment.txt "comprep on" restores the game's setting
-local comprep_logged = {}
+-- reaches others through the actor's ReplicatedMovement. So the capsule's
+-- replication is switched off (fix_capsule_replication).
+local comprep_logged = pawn_table()
 
 local function component_replication(p)
     local key = ue.name(p)
@@ -869,10 +937,9 @@ local function component_replication(p)
             parts[#parts + 1] = cname .. "=" .. tostring(rep)
             -- only the capsule: the game may rely on the mesh's replication
             if cname == "CapsuleComponent" and cfg.get("fix_capsule_replication") ~= false then
-                local want = M.capsule_rep_wanted
-                if rep ~= nil and rep ~= want then
-                    local ok = pcall(function() comp:SetIsReplicated(want) end)
-                    parts[#parts + 1] = string.format("(%s -> %s ok=%s)", cname, tostring(want), tostring(ok))
+                if rep ~= nil and rep ~= false then
+                    local ok = pcall(function() comp:SetIsReplicated(false) end)
+                    parts[#parts + 1] = string.format("(%s -> false ok=%s)", cname, tostring(ok))
                 end
             end
         end
@@ -900,7 +967,7 @@ end
 -- to that client (SETMOVE), which applies it as the correction would have.
 local SETMODE_FN = "/Script/Engine.CharacterMovementComponent:SetMovementMode"
 local DISABLE_FN = "/Script/Engine.CharacterMovementComponent:DisableMovement"
-local setmove = { hooked = false, sent = 0, applied = 0, last = {} }
+local setmove = { hooked = false, sent = 0, applied = 0, last = pawn_table() }
 
 local function relay_mode(cmc, mode, dis)
     if not cfg.get("client_movement_authority") then return end
@@ -966,25 +1033,33 @@ function apply_setmove(f)
 end
 
 function M.host_movement_tick(remote_pcs)
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
-        if ue.valid(p) and ue.valid(ue.prop(p, "PlayerState")) then
-            local ok, err = pcall(component_replication, p)
-            if not ok then log.err_throttled("comprep", "component replication: %s", tostring(err)) end
-        end
-    end
-    -- Every player character (host's own included) replicates often enough
-    -- for smooth remote animation; a single-player game has no reason to.
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    local present = {}
+    for _, p in ipairs(player_chars()) do
         local key = ue.valid(p) and ue.name(p)
-        if key and not netfreq_done[key] and ue.valid(ue.prop(p, "PlayerState")) then
-            netfreq_done[key] = true
-            local before = ue.prop(p, "NetUpdateFrequency")
-            if type(before) ~= "number" or before < MIN_NET_FREQ then
-                local ok = ue.call(p, "SetNetUpdateFrequency", MIN_NET_FREQ)
-                if not ok then ok = ue.set_prop(p, "NetUpdateFrequency", MIN_NET_FREQ) end
-                log.info("movement: %s NetUpdateFrequency %s -> %d (ok=%s)", ue.short(p), tostring(before), MIN_NET_FREQ, tostring(ok))
+        if key then
+            present[key] = true
+            if ue.valid(ue.prop(p, "PlayerState")) then
+                local ok, err = pcall(component_replication, p)
+                if not ok then log.err_throttled("comprep", "component replication: %s", tostring(err)) end
+                -- Every player character (host's own included) replicates often
+                -- enough for smooth remote animation; a single-player game has
+                -- no reason to.
+                if not netfreq_done[key] then
+                    netfreq_done[key] = true
+                    local before = ue.prop(p, "NetUpdateFrequency")
+                    if type(before) ~= "number" or before < MIN_NET_FREQ then
+                        local okc = ue.call(p, "SetNetUpdateFrequency", MIN_NET_FREQ)
+                        if not okc then okc = ue.set_prop(p, "NetUpdateFrequency", MIN_NET_FREQ) end
+                        log.info("movement: %s NetUpdateFrequency %s -> %d (ok=%s)", ue.short(p), tostring(before),
+                            MIN_NET_FREQ, tostring(okc))
+                    end
+                end
             end
         end
+    end
+    -- characters that are gone (respawned, left, destroyed)
+    for _, t in ipairs({ netfreq_done, comprep_logged, movement_done, setmove.last, unstuck }) do
+        keep_only(t, present)
     end
 
     if not cfg.get("client_movement_authority") then return end
@@ -1080,8 +1155,6 @@ local function weapon_shot_sound(weapon)
 end
 M.weapon_shot_sound = weapon_shot_sound
 
--- Kept for sdc_session (HI handler); SNDMAP is gone, nothing to send.
-function M.send_shot_map(_) end
 
 local snd = { hooked = false, players = {}, remote = {}, seen = {}, sent = 0, window = 0, window_n = 0, far = 0 }
 
@@ -1179,16 +1252,19 @@ end
 
 -- Debug mirror (mirror_sounds, off by default): the host forwards every
 -- sound played by a player's item (PlaySoundAtLocation / SpawnSoundAtLocation)
--- to the other clients. With debug on, each new sound source is logged once.
+-- to the other clients. With debug_probes on, each new sound source is
+-- logged once.
 local function on_sound(fn, wco, sound, loc, vol, pitch)
     if not snd.active then return end
+    local mirror = cfg.get("mirror_sounds")
+    if not mirror and not log.probes_enabled then return end
     local w = wco and wco:get()
     local s = sound and sound:get()
     if not ue.valid(w) or not ue.valid(s) then return end
     local entry, direct = player_of(w)
     local cls = ue.class_name(w)
     local is_item = entry and not direct and cls:find("Pickup", 1, true) ~= nil
-    if log.debug_enabled then
+    if log.probes_enabled then
         local k = cls .. "|" .. ue.short(s)
         if not snd.seen[k] then
             snd.seen[k] = true
@@ -1196,7 +1272,7 @@ local function on_sound(fn, wco, sound, loc, vol, pitch)
                 entry and ue.short(entry.pawn) or "-", tostring(is_item))
         end
     end
-    if not is_item or not cfg.get("mirror_sounds") then return end
+    if not is_item or not mirror then return end
     if not snd_budget() then return end
     local l = loc and loc:get()
     local x, y, z = ue.try(function() return l.X end), ue.try(function() return l.Y end), ue.try(function() return l.Z end)
@@ -1244,8 +1320,13 @@ end
 
 function M.host_sound_tick(remote_pcs)
     M.remote_pcs = remote_pcs
+    if #remote_pcs == 0 then
+        -- nobody connected: nothing to relay, no character list needed
+        snd.players, snd.remote, snd.active = {}, remote_pcs, false
+        return
+    end
     local map = {}
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    for _, p in ipairs(player_chars()) do
         if ue.valid(p) and ue.valid(ue.prop(p, "PlayerState")) then
             local a = addr(p)
             if a then
@@ -1257,8 +1338,8 @@ function M.host_sound_tick(remote_pcs)
     snd.players, snd.remote = map, remote_pcs
     snd.active = #remote_pcs > 0
     -- the PlaySoundAtLocation hooks only serve the debug mirror / the
-    -- sound-source log; shot sounds come from MC_WeaponEffects
-    if snd.active and not snd.hooked and (cfg.get("mirror_sounds") or log.debug_enabled) then
+    -- sound-source log (debug_probes); shot sounds come from MC_WeaponEffects
+    if snd.active and not snd.hooked and (cfg.get("mirror_sounds") or log.probes_enabled) then
         install_sound_hooks()
     end
 end
@@ -1268,14 +1349,14 @@ end
 -- freed by the load's garbage collection). The sound hooks stay installed
 -- but do nothing while snd.active is false, as before hosting.
 function M.forget_world()
-    M.monitor_pawns = {}
     M.remote_pcs = {}
     snd.players, snd.remote, snd.active = {}, {}, false
+    clear_pawn_tables()
 end
 
 -- Client: is there a copy of this player's character here?
 local function has_copy_of(id)
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    for _, p in ipairs(player_chars()) do
         if ue.valid(p) and appearance.player_id(p) == id then return true end
     end
     return false
@@ -1322,8 +1403,20 @@ end
 -- else's weapon, the weapon's own shot sound is played at the weapon; on the
 -- host it also drives the far-shot relay.
 
-local shot = { hooked = false, played = 0, sources = {} }
+-- With debug on: one summary line per SHOT_SUMMARY_S with shots (weapon
+-- multicasts and shot sounds played since the last line), not a line per shot.
+local SHOT_SUMMARY_S = 30
+local shot = { hooked = false, played = 0, sources = {}, win_fx = 0, win_played = 0, win_at = nil }
 local FIREARM_FX = "/Game/Inventory/Items/Pickups/Weapons/Firearms/BP_FirearmPickup.BP_FirearmPickup_C:MC_WeaponEffects"
+
+local function shot_summary(now)
+    if not log.debug_enabled then return end
+    if not shot.win_at or now < shot.win_at then shot.win_at = now end
+    if now - shot.win_at < SHOT_SUMMARY_S then return end
+    log.info("shot: %d MC_WeaponEffects, %d shot sounds played in the last %.0f s (%d played in all)",
+        shot.win_fx, shot.win_played, now - shot.win_at, shot.played)
+    shot.win_at, shot.win_fx, shot.win_played = now, 0, 0
+end
 
 local shot_why = {}
 local function shot_skip(reason)
@@ -1363,12 +1456,8 @@ local function on_weapon_effects(weapon)
         gps:PlaySoundAtLocation(weapon, sound, loc, { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0, att, nil, nil, nil)
     end)
     shot.played = shot.played + 1
-    if not ok then
-        log.err_throttled("shot", "shot sound: %s", tostring(err))
-    elseif log.debug_enabled then
-        log.info("shot: played %s for %s (shooter %s, total %d)", ue.short(sound), ue.short(weapon),
-            ue.short(shooter), shot.played)
-    end
+    shot.win_played = shot.win_played + 1
+    if not ok then log.err_throttled("shot", "shot sound: %s", tostring(err)) end
 end
 
 -- Lazy: the weapon class is only in memory once a weapon exists.
@@ -1377,152 +1466,15 @@ function M.ensure_shot_sounds()
     if not ue.find_first("BP_FirearmPickup_C") then return end
     shot.hooked = true
     local ok, err = pcall(RegisterHook, FIREARM_FX, function(ctx)
-        local weapon = ctx and ctx:get()
-        if log.debug_enabled then
-            M.fx_counts = M.fx_counts or {}
-            M.fx_counts.MC_WeaponEffects = (M.fx_counts.MC_WeaponEffects or 0) + 1
-            log.info("fx: MC_WeaponEffects on %s (total %d)", ue.short(weapon), M.fx_counts.MC_WeaponEffects)
-        end
-        local okc, e = pcall(on_weapon_effects, weapon)
+        shot.win_fx = shot.win_fx + 1
+        local okc, e = pcall(function() on_weapon_effects(ctx and ctx:get()) end)
         if not okc then log.err_throttled("shot", "shot sound: %s", tostring(e)) end
-        -- other modules: one hook per BP function only
-        for name, fn in pairs(M.fx_listeners) do
-            local okl, el = pcall(fn, weapon)
-            if not okl then log.err_throttled("fx-" .. name, "weapon fx listener %s: %s", name, tostring(el)) end
-        end
+        local oks, es = pcall(shot_summary, os.clock())
+        if not oks then log.err_throttled("shot-summary", "shot summary: %s", tostring(es)) end
     end)
     log.info("shot: weapon sound hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
 end
 
-
--- ---------------------------------------------------------------------------
--- Motion probes (debug): who moves the client's character?
--- ---------------------------------------------------------------------------
--- Counts every engine/Blueprint call that can set the position of a
--- watched character (client: its own; host: remote players), per 5 s.
-
-M.fx_listeners = {}   -- [name] = fn(weapon), called after every MC_WeaponEffects
-
-local probes = { installed = false, watched = {}, counts = {}, deltas = {}, last_log = 0,
-                 resp = { n = 0, moved = 0, sum = 0, max = 0 } }
-
-local PROBE_FUNCS = {
-    "/Script/Engine.Actor:K2_SetActorLocation",
-    "/Script/Engine.Actor:K2_SetActorLocationAndRotation",
-    "/Script/Engine.Actor:K2_SetActorTransform",
-    "/Script/Engine.Actor:K2_TeleportTo",
-    "/Script/Engine.Actor:K2_AddActorWorldOffset",
-    "/Script/Engine.Actor:K2_SetActorRotation",
-    "/Script/Engine.SceneComponent:K2_SetWorldLocation",
-    "/Script/Engine.SceneComponent:K2_SetWorldLocationAndRotation",
-    "/Script/Engine.SceneComponent:K2_SetWorldTransform",
-    "/Script/Engine.Controller:ClientSetLocation",
-    "/Script/Engine.Controller:ClientSetRotation",
-    "/Script/Engine.Character:ServerMovePacked",
-    "/Script/Engine.Character:ClientAdjustPosition",
-    "/Script/Engine.Character:ClientVeryShortAdjustPosition",
-    "/Script/Engine.Actor:OnRep_ReplicatedMovement",
-    "/Script/Engine.Actor:OnRep_ReplicateMovement",
-    "/Script/Engine.Actor:OnRep_AttachmentReplication",
-    "/Script/Engine.Character:OnRep_ReplicatedBasedMovement",
-    "/Script/Engine.Character:OnRep_RootMotion",
-    "/Script/Engine.Pawn:OnRep_Controller",
-}
--- Character multicasts / server calls that drive the animation state.
--- (Svr_SetMovement left out: the movement-mode relay used to hook it; a second hook
--- on a BP function can replace the first)
-for _, fn in ipairs({ "Svr_SetActorLocation", "Svr_SetActorRotation",
-                      "MC_UpdateSpeed", "MC_UpdateCombatState", "MC_Montage", "MC_StopMontage",
-                      "MC_CrouchSprint", "MC_ADS", "MC_StopADS", "MC_UpdateWeaponSpeed", "MC_SetCapsuleSize",
-                      "MC_Crouch", "MC_UnCrouch", "MC_MeleeAim", "MC_SwimFast",
-                      "Svr_UpdateSpeed", "Svr_UpdateSprintSpeed", "Svr_UpdateWalkSpeed", "Svr_Montage",
-                      "Svr_UpdateCombatState", "Svr_CrouchSprint", "Svr_ADS" }) do
-    PROBE_FUNCS[#PROBE_FUNCS + 1] = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:" .. fn
-end
-
-function M.probe_watch(pawns)
-    local w = {}
-    for _, p in ipairs(pawns) do
-        if ue.valid(p) then
-            local a = addr(p)
-            if a then w[a] = true end
-            local cap = ue.prop(p, "CapsuleComponent")
-            local ca = ue.valid(cap) and addr(cap)
-            if ca then w[ca] = true end
-            local pc = ue.prop(p, "Controller")
-            local pa = ue.valid(pc) and addr(pc)
-            if pa then w[pa] = true end
-        end
-    end
-    probes.watched = w
-end
-
-function M.install_motion_probes()
-    if probes.installed or not log.probes_enabled then return end
-    probes.installed = true
-    for _, path in ipairs(PROBE_FUNCS) do
-        local short = path:match(":([%w_]+)$") or path
-        local cb = function(ctx)
-            local obj = ctx and ctx:get()
-            local a = obj and addr(obj)
-            if a and probes.watched[a] then
-                probes.counts[short] = (probes.counts[short] or 0) + 1
-                -- on a client: the moment a move is sent to the server
-                if short == "ServerMovePacked" then probes.last_send = os.clock() end
-            end
-        end
-        local ok, err
-        if path:sub(1, 8) == "/Script/" then
-            ok, err = pcall(RegisterHook, path, cb, function() end)
-        else
-            ok, err = pcall(RegisterHook, path, cb)
-        end
-        if not ok then log.debug("probe: cannot hook %s: %s", short, tostring(err)) end
-    end
-    -- Server move responses on the owning client: does the response itself
-    -- move the character (a correction) or is it only an acknowledgement?
-    local okr, errr = pcall(RegisterHook, "/Script/Engine.Character:ClientMoveResponsePacked", function(ctx)
-        local p = ctx and ctx:get()
-        local a = p and addr(p)
-        if a and probes.watched[a] then probes.resp_pre = ue.location(p) else probes.resp_pre = nil end
-    end, function(ctx)
-        local before = probes.resp_pre
-        probes.resp_pre = nil
-        local p = ctx and ctx:get()
-        if not before or not p then return end
-        local l = ue.location(p)
-        if not l then return end
-        local dx, dy, dz = l.X - before.X, l.Y - before.Y, l.Z - before.Z
-        local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        local r = probes.resp
-        r.n = r.n + 1
-        if d > 0.5 then
-            r.moved = r.moved + 1
-            r.sum = r.sum + d
-            if d > r.max then r.max = d end
-        end
-    end)
-    if not okr then log.debug("probe: cannot hook ClientMoveResponsePacked: %s", tostring(errr)) end
-    log.info("probe: motion probes installed")
-end
-
-function M.probe_report()
-    local now = os.time()
-    if now - probes.last_log < 5 then return end
-    probes.last_log = now
-    local r = probes.resp
-    if r.n > 0 then
-        log.info("probe: server move responses=%d, moved the character in %d (avg %.1f cm, max %.1f cm)",
-            r.n, r.moved, r.moved > 0 and r.sum / r.moved or 0, r.max)
-        probes.resp = { n = 0, moved = 0, sum = 0, max = 0 }
-    end
-    if next(probes.counts) == nil then return end
-    local parts = {}
-    for k, v in pairs(probes.counts) do parts[#parts + 1] = k .. "=" .. v end
-    table.sort(parts)
-    log.info("probe: %s", table.concat(parts, " "))
-    probes.counts = {}
-end
 
 -- A character spawned while the host's save is still being restored gets
 -- MOVE_None (movement off: hanging in the air, WASD ignored) and the game
@@ -1530,7 +1482,6 @@ end
 -- appears, MOVE_None is switched to Falling (it lands and walks). Later
 -- MOVE_None is left alone (vehicles, death, cutscenes use it).
 local MOVE_NONE, MOVE_FALLING = 0, 3
-local unstuck = {}
 function M.unstick(pawn, since, tag)
     if not ue.valid(pawn) or not since or os.time() - since > 30 then return end
     local cmc = ue.prop(pawn, "CharacterMovement")
@@ -1549,10 +1500,12 @@ end
 -- Client: remote players (simulated proxies) need network smoothing,
 -- otherwise they visibly hop between replication updates.
 local SMOOTH_DISABLED, SMOOTH_EXPONENTIAL = 0, 2
-local smoothing_done = {}
+local smoothing_done = pawn_table()
 function M.client_smoothing_tick()
-    for _, p in ipairs(((ue.find_all_recent or ue.find_all)("BP_PlayerCharacter_C") or {})) do
+    local present = {}
+    for _, p in ipairs(player_chars()) do
         local key = ue.valid(p) and ue.name(p)
+        if key then present[key] = true end
         if key and not smoothing_done[key] and ue.role(p) == ue.ROLE_SIMULATED then
             local cmc = ue.prop(p, "CharacterMovement")
             if ue.valid(cmc) then
@@ -1567,243 +1520,9 @@ function M.client_smoothing_tick()
             end
         end
     end
+    keep_only(smoothing_done, present)
+    keep_only(unstuck, present)
 end
 
--- ---------------------------------------------------------------------------
--- Movement jitter monitor (client, debug only)
--- ---------------------------------------------------------------------------
--- Samples, every frame, the client's character: on the client its own one,
--- on the host every remote player's one. Tracks the actor location and the
--- mesh location (what you actually see, network smoothing included) and
--- counts back-steps (motion against the previous frame's direction) and
--- speed spikes. Also logs this window's frame rate, since a throttled
--- background window (two copies on one PC) makes remote players hop.
-
-M.monitor_pawns = {}   -- host: remote players' pawns, set by the session tick
-
-local mon_state = {}
-local fps = { frames = 0, start = nil }
-
--- Live experiments (debug): Mods/SDCoop/experiment.txt is read every 2 s; when
--- it changes, its lines are applied once, so settings can be switched while a
--- tester keeps running and the movement monitor shows the effect per window.
---   exec <console command>
---   cmc <property> = <value>    host: remote players' CharacterMovement; client: own
---   pawn <property> = <value>   same targets, on the character itself
-local exp_state = { text = nil }
-
-local function exp_value(v)
-    if v == "true" then return true end
-    if v == "false" then return false end
-    return tonumber(v) or v
-end
-
-function M.experiment_tick(mod_dir, role)
-    if not mod_dir then return end
-    local f = io.open(mod_dir .. "/experiment.txt", "r")
-    if not f then return end
-    local text = f:read("a")
-    f:close()
-    if text == exp_state.text then return end
-    exp_state.text = text
-    local targets = {}
-    if role == "host" then
-        for _, pc in ipairs(M.remote_pcs or {}) do
-            local p = ue.pawn_of(pc)
-            if p then targets[#targets + 1] = p end
-        end
-    else
-        local p = ue.local_pawn()
-        if p then targets[#targets + 1] = p end
-    end
-    log.info("experiment: file changed, %d target character(s)", #targets)
-    -- loops not mentioned in the file are on
-    local loops_off = {}
-    -- "comprep on": give player characters' capsule / mesh back the game's
-    -- own replication (default: off, see component_replication)
-    M.capsule_rep_wanted = text:match("\ncomprep%s+on") ~= nil or text:match("^comprep%s+on") ~= nil
-    for line in text:gmatch("[^\r\n]+") do
-        line = line:gsub("^%s+", ""):gsub("%s+$", "")
-        local lname, lstate = line:match("^loop%s+(%S+)%s+(%a+)$")
-        if lname and lstate == "off" then loops_off[lname] = true end
-        local preset = line:match("^weather%s+([%w_]+)$")
-        if preset and role == "host" then
-            local w = weather()
-            local path = "/Game/UltraDynamicSky/Blueprints/Weather_Effects/Weather_Presets/" .. preset .. "." .. preset
-            local obj = ue.find_object(path)
-            if not ue.valid(obj) then
-                local okl, loaded = ue.load_asset(path, "sync")
-                obj = okl and ue.valid(loaded) and loaded or nil
-            end
-            local okw = w and obj and ue.call(w, "Change Weather", obj, 10.0)
-            log.info("experiment: weather -> %s (preset %s, ok=%s)", preset, obj and "found" or "missing", tostring(okw))
-        end
-        local cmd = line:match("^exec%s+(.+)$")
-        if cmd then
-            ue.exec(cmd)
-            local name = cmd:match("^(%S+)")
-            local ksl = ue.ksl()
-            local now = ksl and ue.try(function() return ksl:GetConsoleVariableFloatValue(name) end)
-            log.info("experiment: exec '%s' (now %s)", cmd, tostring(now))
-        end
-        local kind, prop, val = line:match("^(%a+)%s+([%w_%?]+)%s*=%s*(%S+)$")
-        if (kind == "cmc" or kind == "pawn") and prop then
-            for _, p in ipairs(targets) do
-                local obj = kind == "cmc" and ue.prop(p, "CharacterMovement") or p
-                local before = ue.prop(obj, prop)
-                ue.set_prop(obj, prop, exp_value(val))
-                log.info("experiment: %s %s.%s %s -> %s", ue.short(p), kind, prop, tostring(before), tostring(ue.prop(obj, prop)))
-            end
-        end
-    end
-    local names = {}
-    for k in pairs(loops_off) do names[#names + 1] = k end
-    ue.disabled_loops = loops_off
-    log.info("experiment: loops off: [%s]", table.concat(names, " "))
-end
-
--- Jitter trace (debug, own character, once per session): 150 consecutive
--- frames once it runs, with the position also sampled inside the
--- character's own tick (ReceiveTick) and the camera position.
-local jt = { done = false, rows = nil, tick = nil, hooked = false }
-
-local function jt_hook()
-    if jt.hooked then return end
-    jt.hooked = true
-    local ok, err = pcall(RegisterHook, "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:ReceiveTick", function(c)
-        if jt.done or not jt.rows then return end
-        local p = c and c:get()
-        local me = ue.local_pawn()
-        if p and me and addr(p) == addr(me) then jt.tick = ue.location(p) end
-    end)
-    log.info("jitter trace hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
-end
-
-local function jt_frame(pawn, t, p)
-    if jt.done or not p then return end
-    local v = ue.try(function() return pawn:GetVelocity() end)
-    local vx, vy = v and ue.try(function() return v.X end) or 0, v and ue.try(function() return v.Y end) or 0
-    local speed = math.sqrt(vx * vx + vy * vy)
-    if not jt.rows then
-        if speed < 300 then return end
-        jt.rows = {}
-        jt_hook()
-    end
-    local pc = ue.local_pc()
-    local cam = ue.try(function() return pc.PlayerCameraManager:GetCameraLocation() end)
-    local tk = jt.tick
-    jt.tick = nil
-    jt.rows[#jt.rows + 1] = string.format("%.4f %.4f pos=%.2f,%.2f v=%.0f,%.0f tick=%s cam=%s",
-        t, os.clock(), p.X, p.Y, vx, vy,
-        tk and string.format("%.2f,%.2f", tk.X, tk.Y) or "-",
-        cam and ue.try(function() return string.format("%.2f,%.2f", cam.X, cam.Y) end) or "-")
-    if #jt.rows >= 150 then
-        jt.done = true
-        log.info("jitter trace: %d frames (time, clock, actor pos, velocity, pos in own tick, camera)", #jt.rows)
-        for i, r in ipairs(jt.rows) do log.info("jt %03d %s", i, r) end
-        jt.rows = nil
-    end
-end
-
-local function track(st, p, t)
-    if st.prev and t > st.t_prev then
-        local d = { p.X - st.prev.X, p.Y - st.prev.Y }
-        local len = math.sqrt(d[1] * d[1] + d[2] * d[2])
-        local speed = len / (t - st.t_prev)
-        if len > 0.3 then
-            st.frames = st.frames + 1
-            st.dist = st.dist + len
-            local reversed = st.prev_d and (d[1] * st.prev_d[1] + d[2] * st.prev_d[2]) < 0
-            if reversed then st.back = st.back + 1 end
-            -- zigzag: forward, back, forward on consecutive frames (twitching,
-            -- as opposed to sliding off a slope)
-            if reversed and st.prev_reversed then st.zig = (st.zig or 0) + 1 end
-            if reversed and st.detail and st.detail_left > 0 then
-                st.detail_left = st.detail_left - 1
-                st.detail(d, st.prev_d, t - st.t_prev)
-            end
-            st.prev_reversed = reversed
-            if st.ema > 50 and speed > st.ema * 2.5 then st.spikes = st.spikes + 1 end
-            st.ema = st.ema == 0 and speed or (st.ema * 0.9 + speed * 0.1)
-            st.prev_d = d
-        end
-    end
-    st.prev, st.t_prev = p, t
-end
-
-local function new_track() return { frames = 0, back = 0, spikes = 0, dist = 0, ema = 0 } end
-
-function M.movement_monitor_frame()
-    if not log.probes_enabled then return end
-    local gps, ctx = ue.gameplay_statics(), ue.world_context()
-    local t = gps and ctx and ue.try(function() return gps:GetTimeSeconds(ctx) end)
-    if type(t) ~= "number" then return end
-
-    fps.frames = fps.frames + 1
-    fps.start = fps.start or t
-    if t - fps.start >= 10 then
-        log.info("perf: %.0f fps (role %s)", fps.frames / (t - fps.start), tostring(ue.net_role()))
-        fps.frames, fps.start = 0, t
-    end
-
-    local targets = {}
-    local own = ue.local_pawn()
-    if own then targets[#targets + 1] = own end
-    for _, p in ipairs(M.monitor_pawns) do
-        if ue.valid(p) then targets[#targets + 1] = p end
-    end
-
-    for _, pawn in ipairs(targets) do
-        local key = ue.name(pawn)
-        local st = mon_state[key]
-        if not st then
-            st = { actor = new_track(), mesh = new_track(), start = t }
-            mon_state[key] = st
-            if ue.role(pawn) == ue.ROLE_AUTONOMOUS then
-                -- first reversals of the client's own character, with what drives the movement
-                st.actor.detail_left = 40
-                st.actor.detail = function(d, pd, dt)
-                    local v = ue.try(function() return pawn:GetVelocity() end)
-                    local cmc = ue.prop(pawn, "CharacterMovement")
-                    local acc = ue.valid(cmc) and ue.try(function() return cmc:GetCurrentAcceleration() end)
-                    local rot = ue.rotation(pawn)
-                    local function xy(vec)
-                        if not vec then return "?" end
-                        local x, y = ue.try(function() return vec.X end), ue.try(function() return vec.Y end)
-                        if type(x) ~= "number" then return "?" end
-                        return string.format("%.1f,%.1f", x, y)
-                    end
-                    log.info("zig: dt=%.4f d=%.2f,%.2f prev=%.2f,%.2f vel=%s acc=%s mode=%s maxspeed=%s yaw=%.1f since_send=%.3f",
-                        dt, d[1], d[2], pd[1], pd[2], xy(v), xy(acc),
-                        tostring(ue.valid(cmc) and ue.prop(cmc, "MovementMode")),
-                        tostring(ue.valid(cmc) and ue.prop(cmc, "MaxWalkSpeed")), rot.Yaw,
-                        probes.last_send and (os.clock() - probes.last_send) or -1)
-                end
-            end
-        end
-        local p = ue.location(pawn)
-        local mesh = ue.prop(pawn, "Mesh")
-        local ml = ue.valid(mesh) and ue.try(function() return mesh:K2_GetComponentLocation() end)
-        if p then track(st.actor, p, t) end
-        if p and own and addr(pawn) == addr(own) and ue.role(pawn) == ue.ROLE_AUTONOMOUS then
-            pcall(jt_frame, pawn, t, p)
-        end
-        if ml then
-            local x, y = ue.try(function() return ml.X end), ue.try(function() return ml.Y end)
-            if type(x) == "number" and type(y) == "number" then track(st.mesh, { X = x, Y = y }, t) end
-        end
-        if t - st.start >= 5 then
-            local a, m = st.actor, st.mesh
-            if a.dist > 100 then
-                local kind = (pawn == own) and (ue.role(pawn) == ue.ROLE_AUTONOMOUS and "own-client" or "own-host") or "remote"
-                log.info("move: %s %s dist=%.0f frames=%d | actor back=%d zig=%d spikes=%d | mesh back=%d zig=%d spikes=%d | speed=%.0f",
-                    kind, ue.short(pawn), a.dist, a.frames, a.back, a.zig or 0, a.spikes,
-                    m.back, m.zig or 0, m.spikes, a.ema)
-            end
-            for _, s in ipairs({ a, m }) do s.frames, s.back, s.spikes, s.dist, s.zig = 0, 0, 0, 0, 0 end
-            st.start = t
-        end
-    end
-end
 
 return M

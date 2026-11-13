@@ -1,4 +1,4 @@
--- sdc_consume: items a use gives (client placeholder removal + IGAIN, host AddNewItemSomewhere),
+-- sdc_consume: items a use gives (client placeholder removal + IGAIN, host: where the client's screen put it),
 -- local drop removal, stale pending slots, desync line with slots
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
@@ -192,22 +192,38 @@ pc.__pawn = guest
 local shirt = { ["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] = G(9),
   ["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"] = { ["Count_8_DD79AF2A46126A338C8DCCB4616D91CD"] = 3,
     ["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] = { __name = "DA_GreenShirt" } } }
+-- (the grid the client's screen puts gains in: uid 1; 2026-11-13 the host adds
+-- there, not with the plugin's AddNewItemSomewhere - see mock_consume_lootbox)
+local inv = { shirt }
 local djig = { __name = "GuestJig", GetOwner = function() return guest end,
-  MainJigContainers = arr({ { ["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] = arr({ shirt }) } }) }
-djig.AddNewItemSomewhere = function(_, da, n, inside, inside_n, drop_ok, spec, a, d, uid, to)
-  calls[#calls + 1] = { da = da, n = n, inside = inside, drop_ok = drop_ok, spec = spec }
-  a.Added = true; d["Dropped?"] = false; uid.A, uid.B, uid.C, uid.D = 5, 6, 7, 8
+  MainJigContainers = arr({ { ["ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"] = G(1),
+    ["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] = arr(inv) } }) }
+djig.AddNewItemSomewhere = function() error("the any-grid add is not used for gains") end
+local next_new = 500
+djig.Generate_AddNewItemToContainer = function(_, g, da, n, info, res)
+  calls[#calls + 1] = { da = da, n = n, grid = g.A }
+  next_new = next_new + 1
+  inv[#inv + 1] = { ["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] = G(next_new),
+    ["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"] = { ["Count_8_DD79AF2A46126A338C8DCCB4616D91CD"] = n,
+      ["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] = da }, SubContainers_35_9B8F8C174A191BE2B5DAE19C1EB3FAAE = arr({}) }
+  res["Added?"] = true
+end
+local adds = {}
+djig.CLIENT_AddNewItem = function(_, it, content, comp, pend)
+  adds[#adds + 1] = { a = it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"].A, n = #content, comp = comp, pend = pend.A }
 end
 guest.BP_JigMultiplayer = djig
 assets[cloth.__path] = cloth
 items.host_tick({ pc })
 assert(hooks[JIG .. "SERVER_RequestConsumeItem"], "use hook missing")
 -- IGAIN before its use request: waits, then paid
-handlers.IGAIN({ cloth.__path, "2" }, pc)
+handlers.IGAIN({ cloth.__path, "2", "c", "1:0:0:0", "4" }, pc)
 assert(#calls == 0, "paid without a use request")
 hooks[JIG .. "SERVER_RequestConsumeItem"](C(djig), P(djig), P(G(9)), P(1), P(""))
-assert(#calls == 1 and calls[1].da == cloth and calls[1].n == 2 and calls[1].drop_ok == true and calls[1].spec == "None", "not added after the use")
-assert(has_log("guest gets Cloth x2 from using an item: added=true dropped=false uid 5:6:7:8"), "grant log wrong")
+assert(#calls == 1 and calls[1].da == cloth and calls[1].n == 2 and calls[1].grid == 1, "not added after the use")
+assert(#adds == 1 and adds[1].a == 501 and adds[1].n == 0 and adds[1].comp == djig and adds[1].pend == 0, "client not told")
+assert(has_log("guest gets Cloth x2 from using an item, where its screen put it (its slot 4): new item 501:0:0:0 in grid 1:0:0:0"),
+  "grant log wrong")
 -- a use of an item the host does not have (a slot left on the client): nothing used, the client told, no gain
 local told = {}
 djig.CLIENT_UpdateCount = function(_, target, g, n) told[#told + 1] = { target = target, a = g.A, n = n } end
@@ -215,19 +231,27 @@ hooks[JIG .. "SERVER_RequestConsumeItem"](C(djig), P(djig), P(G(66)), P(1), P(""
 assert(#told == 1 and told[1].target == djig and told[1].a == 66 and told[1].n == 0, "ghost not removed on the client")
 assert(has_log("used uid 66:0:0:0 x1, which is not in their inventory here", "warn"), "ghost use log")
 -- IGAIN right after a use request: paid at once
-handlers.IGAIN({ cloth.__path, "1" }, pc)
+handlers.IGAIN({ cloth.__path, "1", "c", "1:0:0:0", "5" }, pc)
 assert(#calls == 2, "not paid right after a use")
 -- an asset loaded on demand
 local can = { __name = "DA_Can", __cls = "JigsawItem_DataAsset_C" }
 assets["later:/Game/Items/DA_Can.DA_Can"] = can
-handlers.IGAIN({ "/Game/Items/DA_Can.DA_Can", "1" }, pc)
+handlers.IGAIN({ "/Game/Items/DA_Can.DA_Can", "1", "c", "1:0:0:0", "6" }, pc)
 assert(#calls == 3 and calls[3].da == can, "asset not loaded")
+-- no word where the client's screen put it: at its feet (single player's no-room drop)
+local drops = {}
+guest.JigMP_OnRequestDropItem = function(_, info, cname, out)
+  drops[#drops + 1] = { da = info["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"], n = info["Count_8_DD79AF2A46126A338C8DCCB4616D91CD"] }
+  out.ActorRef = { __name = "pickup", SetPickupCount = function(self, cnt) self.n = cnt end }
+end
+handlers.IGAIN({ cloth.__path, "1" }, pc)
+assert(#calls == 3 and #drops == 1 and drops[1].da == cloth and drops[1].n == 1, "no word: not dropped at the feet")
 -- no use around it: refused after the window
 offset = offset + 10
-handlers.IGAIN({ cloth.__path, "1" }, pc)
+handlers.IGAIN({ cloth.__path, "1", "c", "1:0:0:0", "7" }, pc)
 offset = offset + 7
 items.host_tick({ pc })
-assert(#calls == 3 and has_log("with no item use around it; not added", "warn"), "unbacked IGAIN not refused")
-print("host: gains added through AddNewItemSomewhere, unbacked refused")
+assert(#calls == 3 and #drops == 1 and has_log("with no item use around it; not added", "warn"), "unbacked IGAIN not refused")
+print("host: gains added where the client's screen put them, unbacked refused")
 for _, l in ipairs(logs) do if l:find("^err") and l:find("consume:", 1, true) then error("error logged: " .. l) end end
 print("ALL OK")

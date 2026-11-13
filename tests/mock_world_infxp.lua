@@ -401,9 +401,140 @@ pump()
 check(#xps(CW) == n_before + 1 and #CW.notes == notes0, "Game.XpPopUp off: the XP, no note")
 CV["Game.XpPopUp"] = true
 
+-- ===========================================================================
+-- Camp discovery XP for every player (sdc_world PF, 0.7.3): the host's placed
+-- camp spawner pays player 0 (the host) in DistanceToPrefab; a client within its
+-- DistanceToDiscoverPrefab gets the same payment once (WCAMPXP)
+-- ===========================================================================
+local CAMP_FN = "/Game/Prefabs/BP_PrefabSpawner.BP_PrefabSpawner_C:DistanceToPrefab"
+local function spawner(w, name, at, r)
+    WORLD = w
+    return new(w, { "BP_PrefabSpawner_C", "BP_MasterObject_C" }, name, { DistanceToDiscoverPrefab = r, _loc = at })
+end
+HS.remote[rpc._full] = { name = "Player 2" }   -- (sdc_session's record: the player's name)
+local base = #xps(CW)
+
+print("== X8. a host camp: the client far away gets nothing, within its radius the game's payment once")
+local sp1 = spawner(HW, "BP_PrefabSpawner_C_7", { X = 20000, Y = 0, Z = 0 }, 2000)
+check(HW.hooks[CAMP_FN] ~= nil, "DistanceToPrefab hooked on the host")
+fire(HW, CAMP_FN, param(sp1))                 -- the camp's discovery timer runs on the host
+fire(HW, CAMP_FN, param(sp1))                 -- (and again 2-6 s later)
+check(H.world._t.prefabs.ncamps == 1, "the camp noted once")
+rpawn._p._loc = { X = 5000, Y = 0, Z = 0 }    -- 150 m away
+pump()
+check(#xps(CW) == base and sent(HW, "WCAMPXP") == 0, "150 m away: nothing")
+rpawn._p._loc = { X = 21500, Y = 0, Z = 0 }   -- 15 m away
+local host0 = #xps(HW)
+pump()
+local cx8 = xps(CW)
+check(#cx8 == base + 1 and cx8[#cx8] >= 5 * 40 * 1.2 and cx8[#cx8] <= 5 * 60 * 1.2,
+    "15 m away: the client's own XP = its level 5 x 40..60 x its multiplier 1.2 (" .. tostring(cx8[#cx8]) .. ")")
+check(#xps(HW) == host0, "the host is not paid by this (its own discovery is the game's timer)")
+check(H.world._t.prefabs.camps[LVL .. "BP_PrefabSpawner_C_7"].paid["nPlayer 2"] ~= nil, "no Steam id known: paid per player name")
+pump(); pump()
+check(#xps(CW) == base + 1, "staying there: once only")
+WORLD = CW; C.net.handlers.WCAMPXP({ "~LongdownValley~BP_PrefabSpawner_C_7" }, CW.pc)
+check(#xps(CW) == base + 1, "the same camp again on the client: nothing")
+
+print("== X9. a dead client is not paid; alive again it is; world_prefabs off: nobody")
+local sp2 = spawner(HW, "BP_PrefabSpawner_C_8", { X = -20000, Y = 0, Z = 0 }, 3000)
+fire(HW, CAMP_FN, param(sp2))
+rpawn._p._loc = { X = -21000, Y = 0, Z = 0 }  -- 10 m
+rpawn._p["PlayerDead?"] = true
+pump()
+check(#xps(CW) == base + 1, "dead at the camp: nothing")
+rpawn._p["PlayerDead?"] = nil
+pump()
+check(#xps(CW) == base + 2, "alive: paid (its radius 30 m)")
+CFGO.world_prefabs = false
+local sp3 = spawner(HW, "BP_PrefabSpawner_C_9", { X = 0, Y = 30000, Z = 0 }, 2000)
+fire(HW, CAMP_FN, param(sp3))
+rpawn._p._loc = { X = 0, Y = 30500, Z = 0 }
+pump()
+check(H.world._t.prefabs.ncamps == 2 and #xps(CW) == base + 2, "world_prefabs = false: not noted, nothing paid")
+CFGO.world_prefabs = nil
+rpawn._p._loc = { X = 5000, Y = 0, Z = 0 }
+
+print("== X10. a world reset forgets the camps (a new world rolls its own)")
+WORLD = HW; H.world.reset("test")
+check(H.world._t.prefabs.ncamps == 0 and next(H.world._t.prefabs.camps) == nil, "host: no camps after the reset")
+WORLD = CW; C.world.reset("test")
+check(next(C.world._t.prefabs.camp_got) == nil, "client: its paid camps forgotten")
+
+print("== X11. a horde boss gone with its player's death: logged with the living players near it")
+local HORDE_FN = "/Game/AI/Zombies/Boss/Types/Horde/BP_ZombieBossHorde_Infestation.BP_ZombieBossHorde_Infestation_C:Event_PlayerDead"
+check(HW.hooks[HORDE_FN] ~= nil, "Event_PlayerDead of the horde boss hooked")
+WORLD = HW
+local boss1 = new(HW, { "BP_ZombieBossHorde_Infestation_C", "BP_ZombieBoss_C" }, "BP_ZombieBossHorde_Infestation_C_2147400001",
+    { _loc = { X = 1000, Y = 0, Z = 0 } })
+local boss2 = new(HW, { "BP_ZombieBossHorde_Infestation_C", "BP_ZombieBoss_C" }, "BP_ZombieBossHorde_Infestation_C_2147400002",
+    { _loc = { X = 900000, Y = 0, Z = 0 } })
+local hs = H.world.stats
+local l0, f0 = hs.horde_lost, hs.horde_lost_fight
+fire(HW, HORDE_FN, param(boss1))   -- the host 10 m away, the client 40 m away (both alive)
+check(hs.horde_lost == l0 + 1 and hs.horde_lost_fight == f0 + 1, "lost while 2 living players were near it: counted as a lost fight")
+fire(HW, HORDE_FN, param(boss2))   -- nobody near
+check(hs.horde_lost == l0 + 2 and hs.horde_lost_fight == f0 + 1, "lost far from everyone: counted, not as a fight")
+WORLD = CW; fire(CW, HORDE_FN, param(boss1))
+check(C.world.stats.horde_lost == 0, "the client counts nothing (the boss is the host's)")
+
 print("== X7. status")
 WORLD = HW; local sl = H.world.status_line(); print(sl)
 check(sl:find("xp shared=", 1, true) ~= nil, "status: xp shared=N")
+check(sl:find("camp discovery xp=2", 1, true) ~= nil, "status: camp discovery xp=2 (sent)")
+
+print("== X12. two clients of the same name (two \"User\"s): each paid once, kept by its Steam id; a rejoin is not paid again")
+-- (made-up ids: sdc_persist.steam_of answers with the id the player sent)
+local SIDS = {}
+package.loaded["sdc_persist"] = { steam_of = function(k) return SIDS[k] end }
+local function remote2(n, at)
+    WORLD = HW
+    local box = {}
+    local cn = new(HW, { "IpConnection" }, "IpConnection_" .. n)
+    local pw = new(HW, { "BP_PlayerCharacter_C", "Character" }, "BP_PlayerCharacter_C_" .. n, { _loc = at })
+    local pc = new(HW, { "BP_PlayerController_C", "PlayerController" }, "BP_PlayerController_C_" .. n,
+        { NetConnection = cn, Player = cn, Pawn = pw }, { ClientMessage = function(self, msg) box[#box + 1] = msg end })
+    pw._p.Controller = pc
+    HW.pcs[#HW.pcs + 1] = pc
+    HS.remote_pcs[#HS.remote_pcs + 1] = pc
+    return pc, pw, box
+end
+local function camps_in(box) local n = 0 for _, m in ipairs(box) do if m:find("|WCAMPXP|", 1, true) then n = n + 1 end end return n end
+local sp4 = spawner(HW, "BP_PrefabSpawner_C_10", { X = 0, Y = -30000, Z = 0 }, 2000)
+fire(HW, CAMP_FN, param(sp4))
+local rpc2, rpawn2, box2 = remote2(2, { X = 900000, Y = 0, Z = 0 })
+HS.remote[rpc._full] = { name = "User" }
+HS.remote[rpc2._full] = { name = "User" }
+SIDS[rpc._full], SIDS[rpc2._full] = "11111111111111111", "22222222222222222"
+local c0 = #xps(CW)
+rpawn._p._loc = { X = 0, Y = -29000, Z = 0 }          -- the first "User" at the camp
+pump()
+check(#xps(CW) == c0 + 1, "the first \"User\": paid")
+rpawn2._p._loc = { X = 500, Y = -30500, Z = 0 }       -- the second "User" at the same camp
+pump()
+check(camps_in(box2) == 1, "the second \"User\" (another Steam id): paid too")
+pump(); pump()
+check(#xps(CW) == c0 + 1 and camps_in(box2) == 1, "both staying there: once each")
+local cps = H.world._t.prefabs.camps[LVL .. "BP_PrefabSpawner_C_10"]
+check(cps.paid["s11111111111111111"] ~= nil and cps.paid["s22222222222222222"] ~= nil and cps.paid["nUser"] == nil,
+    "kept by Steam id, not by the shared name")
+-- the second one rejoins: a new controller (new session key), the same Steam id
+rpawn2._valid = false
+rpc2._valid = false
+local rpc3, rpawn3, box3 = remote2(3, { X = 500, Y = -30500, Z = 0 })
+HS.remote[rpc3._full] = { name = "User" }
+SIDS[rpc3._full] = "22222222222222222"
+pump(); pump()
+check(camps_in(box3) == 0, "rejoined (same Steam id): not paid again")
+-- a player whose Steam id reached the host only after its payment (paid by name then)
+local rpc4, _, box4 = remote2(4, { X = -500, Y = -30500, Z = 0 })
+HS.remote[rpc4._full] = { name = "Late" }
+pump()
+check(camps_in(box4) == 1 and cps.paid["nLate"] == rpc4._full, "no id yet: paid, kept by its name for this connection")
+SIDS[rpc4._full] = "33333333333333333"
+pump(); pump()
+check(camps_in(box4) == 1, "its Steam id came later: the same connection is not paid again")
+package.loaded["sdc_persist"] = nil
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

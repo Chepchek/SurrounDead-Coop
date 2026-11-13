@@ -90,7 +90,7 @@ end
 
 local function place_name(a)
     local s = ue.prop(a, "POI")
-    if s == nil then return ue.short(a) end
+    if ue.missing(s) then return ue.short(a) end
     local n = ue.str(ue.try(function() return s[POI_NAME] end))
     if n == "" then return ue.short(a) end
     return n

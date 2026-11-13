@@ -336,13 +336,11 @@ local cont = new(CW, { "JSIContainer_C" }, "Pockets_0", { ArrayOfItems = {
 -- the same container seen twice (two widgets): counted once
 CW.jig._p.LocalJSIContainers = { cont, cont }
 local lpui = new(CW, { "LockpickUI_C" }, "LockpickUI_C_1", { UseLockpick = true, LPRef = new(CW, { "LockPickingComponent_C" }, "LP_0", { LPDurability = 25 }) })
-local n_p, t_p = param(0), param(FText("Lockpicks: 0"))
-fire(CW, UI .. ":GetLockpickAmount", param(lpui), t_p, n_p)
+-- (as UE4SS 3.0.1 calls a Blueprint hook: (Context, Lockpicks), no ReturnValue)
+local n_p = param(0)
+fire(CW, UI .. ":GetLockpickAmount", param(lpui), n_p)
 check(n_p._v() == 5, "out Lockpicks = 5 (3 + 2 in a bag; the bandages not; one container seen twice) - " .. tostring(n_p._v()))
-check(t_p._v():ToString() == "Lockpicks: 5", "its text")
-local r_p = param(FText("Lockpicks: 0"))
-fire(CW, UI .. ":GetLockpickAmountText", param(lpui), r_p)
-check(r_p._v():ToString() == "Lockpicks: 5", "the text binding says 5")
+check(CW.hooks[UI .. ":GetLockpickAmountText"] == nil, "no hook on GetLockpickAmountText (a Blueprint hook gets no return value)")
 -- none in the widgets, the game's own lookup finds one
 CW.jig._p.LocalJSIContainers = {}
 CW.jig._m.FindJigItemByDA = function(self, da, t, a, b, n, out) out.Result = da == da_c end
@@ -431,6 +429,15 @@ local hui = new(HW, { "KeypadUI_C" }, "KeypadUI_C_1", { DoorRef = hkp, _inv = tr
     IsInViewport = function(self) return self._p._inv end,
     PausePressed = function(self) self._p._inv = false; self._calls[#self._calls + 1] = { "PausePressed" } end,
 })
+-- UMG widgets: the game's WidgetBlueprintLibrary.GetAllWidgetsOfClass finds them (FindAllOf does not)
+new(HW, { "BlueprintGeneratedClass" }, "KeypadUI_C", {}, {}, KEYUI)
+new(HW, { "WidgetBlueprintLibrary" }, "WBL", {}, {
+    GetAllWidgetsOfClass = function(self, wc, arr, cls, top)
+        for _, o in ipairs(HW.objects) do
+            if o._valid and derives(o, cls._name) and (not top or o._p._inv) then arr[#arr + 1] = o end
+        end
+    end,
+}, "/Script/UMG.Default__WidgetBlueprintLibrary")
 fire(HW, KEYPAD .. ":OnServerExecuteInteract", param(hkp), param({}), param(rpawn), param({}))
 check(called(hui, "PausePressed") ~= nil, "the host's screen: that keypad closed the widget's own way")
 check(out_has(HW, "WKEYUI"), "the presser is told to open its keypad")

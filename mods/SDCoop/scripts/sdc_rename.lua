@@ -62,9 +62,12 @@
 --   RNOPEN|class|x,y,z|uid            host -> client
 --   RNREQ|class|x,y,z|uid|name        client -> host
 --   RNAME|class|x,y,z|uid|name        host -> client(s)
+--   RNAME|class!x,y,z!uid!name;...    host -> client (the RNAMEQ answer: every
+--                                     renamed container in messages of at most
+--                                     CHUNK characters)
 --   RNAMEQ                            client -> host
--- name: control characters removed, at most NAME_MAX characters, '%' and '|'
--- written %25 / %7C.
+-- name: control characters removed, at most NAME_MAX characters, '%', '|'
+-- and ';' written %25 / %7C / %3B.
 -- Hooks: post only, wrapped in pcall, return nothing; parameters are read
 -- inside the callback; no engine object is kept between calls (class, place,
 -- UID and name strings only).
@@ -93,6 +96,7 @@ local HOOK_RETRY_S = 2
 local PASS_S = 3            -- client: names put on copies that appeared
 local SNAP_AFTER_S = 3      -- client: in the world this long before asking for the names
 local KNOWN_MAX = 1000
+local CHUNK = 1500          -- characters of one RNAME list message
 
 local clock = os.clock
 local S
@@ -143,7 +147,7 @@ local function clean(s)
     return s
 end
 local function esc(s)
-    return (tostring(s or ""):gsub("[%%|]", function(c) return string.format("%%%02X", c:byte()) end))
+    return (tostring(s or ""):gsub("[%%|;]", function(c) return string.format("%%%02X", c:byte()) end))
 end
 local function unesc(s)
     return (tostring(s or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
@@ -373,27 +377,37 @@ local function req_msg(f, pc)
     broadcast(box, "renamed by " .. who .. " - the host's copy, saved with the world")
 end
 
--- RNAMEQ (client -> host): the names of every renamed container.
+-- RNAMEQ (client -> host): the names of every renamed container, as lists
+-- (RNAME|class!x,y,z!uid!name;...) of at most CHUNK characters.
 local function snap_msg(_, pc)
     if not S or S.role ~= "host" or not on() then return end
-    local n, total = 0, 0
+    local items, total = {}, 0
     for _, box in ipairs(ue.find_all(BASE_CLS)) do
         if ue.valid(box) and is_box(box) then
             total = total + 1
             local name, def = clean(name_of(box)), default_name(box)
             if name ~= "" and def ~= nil and name ~= clean(def) then
                 local cls, loc, uid = wire_of(box)
-                if cls then
-                    net.send_to(pc, "RNAME", cls, loc, uid, esc(name))
-                    n = n + 1
-                end
+                if cls then items[#items + 1] = table.concat({ cls, loc, uid, esc(name) }, "!") end
             end
         end
     end
+    local msgs, buf, len = 0, {}, 0
+    local function flush()
+        if #buf == 0 then return end
+        if net.send_to(pc, "RNAME", table.concat(buf, ";")) then msgs = msgs + 1 end
+        buf, len = {}, 0
+    end
+    for _, it in ipairs(items) do
+        if len + #it + 1 > CHUNK then flush() end
+        buf[#buf + 1] = it
+        len = len + #it + 1
+    end
+    flush()
     M.stats.snapshots = M.stats.snapshots + 1
-    M.stats.names_sent = M.stats.names_sent + n
-    log.info("rename: host: %s asked for the containers' names: %d of %d container(s) renamed, sent (RNAME)",
-        who_of(pc), n, total)
+    M.stats.names_sent = M.stats.names_sent + #items
+    log.info("rename: host: %s asked for the containers' names: %d of %d container(s) renamed, sent (RNAME, %d message(s))",
+        who_of(pc), #items, total, msgs)
 end
 
 -- ---------------------------------------------------------------------------
@@ -440,15 +454,14 @@ local function open_msg(f)
         name_of(box), ok and "" or (" - FAILED: " .. tostring(err)))
 end
 
--- RNAME|class|x,y,z|uid|name (host -> client): the host's name for it.
-local function name_msg(f)
-    if not S or S.role ~= "client" or not on() then return end
-    local cls, loc, uid, name = f[1], parse_loc(f[2]), f[3] or "", clean(unesc(f[4]))
+-- The host's name for one container (`at`: its place as sent, for the log).
+local function name_one(cls, at, uid, name)
+    local loc = parse_loc(at)
     if type(cls) ~= "string" or cls == "" or not loc or name == "" then return end
     remember(cls, loc, uid, name)
     local box = find_box(cls, loc, uid, candidates(cls, ue.find_all_recent(cls, 1)))
     if not box then
-        log.debug("rename: '%s' (%s at %s) kept for when that container is here", name, cls, f[2])
+        log.debug("rename: '%s' (%s at %s) kept for when that container is here", name, cls, at)
         return
     end
     if name_of(box) == name then
@@ -458,6 +471,17 @@ local function name_msg(f)
     apply_name(box, name)
     M.stats.names_applied = M.stats.names_applied + 1
     log.info("rename: %s is called '%s' here, as on the host", ue.short(box), name)
+end
+
+-- RNAME|class|x,y,z|uid|name or RNAME|class!x,y,z!uid!name;... (host ->
+-- client): the host's names.
+local function name_msg(f)
+    if not S or S.role ~= "client" or not on() then return end
+    if f[2] ~= nil then return name_one(f[1], f[2], f[3] or "", clean(unesc(f[4]))) end
+    for e in tostring(f[1] or ""):gmatch("[^;]+") do
+        local cls, at, uid, name = e:match("^([^!]+)!([^!]+)!([^!]*)!(.*)$")
+        if cls then name_one(cls, at, uid, clean(unesc(name))) end
+    end
 end
 
 -- Every PASS_S while names are known: copies that appeared get theirs.

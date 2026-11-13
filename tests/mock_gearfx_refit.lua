@@ -110,7 +110,7 @@ end
 -- ------------------------------------------------------------ stubs
 local equipped = {}   -- [pawn] = { { actor =, slot = } }
 package.loaded["sdc_items"] = { equipped_of = function(p) return equipped[p] or {} end }
-package.loaded["sdc_pawnstate"] = { aim_of = function() return nil end }
+package.loaded["sdc_pawnstate"] = { others = function() return {} end }
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -230,7 +230,7 @@ local l = last_line("BP_BlackOpsMP5Pickup_C_2 of BP_PlayerCharacter_C_2147466856
 check(l ~= nil, "refit line names the weapon, its owner and the module count")
 check(l and l:find("ok=true", 1, true) and l:find("was sight none, suppressor no, muzzle brake no -> now sight DA_Acog4x32Scope, suppressor yes, muzzle brake no", 1, true),
     "refit line shows the state before and after")
-check(gearfx.stats.refits == 1, "refit counted")
+check(count_lines("arrived fitted with %d module%(s%): ProcessAttachments run again %(ok=true") == 1, "one refit")
 
 out("== not refitted")
 local bare = make_firearm("BP_AR15Pickup_C", "BP_AR15Pickup_C_3", P, 1, {})
@@ -254,7 +254,7 @@ local bad = make_firearm("BP_M4Pickup_C", "BP_M4Pickup_C_7", P, 1, { { uid = "e1
 bad.pc._throw = true
 local okb = pcall(arrive, bad, { no_onrep = true })
 check(okb, "ProcessAttachments throwing: the hook swallows it")
-check(gearfx.stats.refit_errors == 1 and last_line("BP_M4Pickup_C_7 .*%(ok=false ") ~= nil, "failure counted and logged")
+check(count_lines("ProcessAttachments run again %(ok=false ") == 1 and last_line("BP_M4Pickup_C_7 .*%(ok=false ") ~= nil, "failure logged")
 bad.pc._throw = nil
 
 -- ============================================================ persist: PSDONE passes
@@ -302,9 +302,9 @@ net.handlers.PSSET({ "g3", "", "-", "0", "inv" })
 net.handlers.PSDONE({ "g3", "14", "5" })
 check(#delayed == 2, "a new restore schedules again")
 S.client = {}   -- left and joined again before the pass
-local sweeps = gearfx.stats.refit_sweeps
+local sweeps = count_lines("own firearm%(s%), %d+ refitted now")
 run_delayed()
-check(gearfx.stats.refit_sweeps == sweeps, "pass of an old connection does nothing")
+check(count_lines("own firearm%(s%), %d+ refitted now") == sweeps, "pass of an old connection does nothing")
 S.role = "host"
 check(gearfx.refit_own("test") == 0, "refit_own on the host: nothing")
 S.role = "client"

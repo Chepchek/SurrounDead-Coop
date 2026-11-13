@@ -283,12 +283,14 @@ local function describe(a)
     return e
 end
 
--- every turret of this world, described; fn(actor, entry) for each (the actor only during the call)
+-- every turret of this world, described; fn(actor, entry) for each (the actor only during the call);
+-- second result: false when a class could not be listed (the registry is incomplete)
 local function scan(fn)
-    local reg = {}
+    local reg, all = {}, true
     for _, cp in ipairs({ P.MASTER, P.BUILD }) do
         local list, err = actors_of(cp)
         if list == false then
+            all = false
             log.err_throttled("turrets.scan", "turrets: GetAllActorsOfClass failed: %s", tostring(err))
         else
             for _, a in ipairs(list) do
@@ -300,7 +302,7 @@ local function scan(fn)
             end
         end
     end
-    return reg
+    return reg, all
 end
 
 -- the registry entry of the same class nearest to x, y, z (within MATCH_CM)
@@ -862,7 +864,8 @@ local function client_pass(now)
     local pawn = ue.local_pawn()
     local l = pawn and ue.location(pawn)
     local own = l and pt(l) or nil
-    st.client_reg = scan(function(a, e)
+    local scan_ok
+    st.client_reg, scan_ok = scan(function(a, e)
         local d = own and dist(own, e) or math.huge
         if d > C.NEAR_CM then return end
         local comp = comp_of(a, e.kind)
@@ -889,6 +892,17 @@ local function client_pass(now)
     end
     for path, t in pairs(st.engine) do
         if now - t > 60 then st.engine[path] = nil end
+    end
+    -- copies that are gone here: a camp turret streams in again under a new
+    -- path, so these tables only grew (only after a complete scan)
+    if scan_ok then
+        local here = {}
+        for _, e in ipairs(st.client_reg) do here[e.path] = true end
+        for _, t in ipairs({ st.seen, st.off_sent, st.off_host, st.cwoken }) do
+            for path in pairs(t) do
+                if not here[path] then t[path] = nil end
+            end
+        end
     end
 end
 
@@ -967,19 +981,30 @@ local HOOKS = {
     { path = P.MASTER .. ":Damage_Object", fn = on_damage_object, label = "BP_MasterTurret Damage_Object" },
 }
 
--- each once its class is loaded (a turret exists), retried every 5 s
+-- each once its class is loaded (a turret exists), retried every 5 s. A
+-- failed registration (UFunction::Func 0x0 while the class loads) is tried
+-- again, up to HOOK_TRIES times (up to 0.7.3 "failed" counted as done).
+local HOOK_TRIES = 24
 local function ensure_hooks(now)
     if now < st.hooks_next then return end
     st.hooks_next = now + 5
     for _, h in ipairs(HOOKS) do
-        if not h.done and ue.find_object(h.path) then
+        if not h.done and (h.tries or 0) < HOOK_TRIES and ue.find_object(h.path) then
             local fn = h.fn
             local ok, err = pcall(RegisterHook, h.path, function(c, ...)
                 local okc, e = pcall(fn, c, ...)
                 if not okc then log.err_throttled("turrets.hook", "turrets: hook: %s", tostring(e)) end
             end)
-            h.done = ok and true or "failed"
-            log.info("turrets: hook %s %s%s", h.label, ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
+            h.tries = (h.tries or 0) + 1
+            h.done = ok or nil
+            if ok then
+                log.info("turrets: hook %s ok%s", h.label, h.tries > 1 and string.format(" (try %d)", h.tries) or "")
+            elseif h.tries == 1 then
+                log.warn("turrets: hook %s FAILED %s; tried again every 5 s (up to %d tries)", h.label, tostring(err),
+                    HOOK_TRIES)
+            elseif h.tries >= HOOK_TRIES then
+                log.err("turrets: hook %s FAILED %d times, given up: %s", h.label, h.tries, tostring(err))
+            end
         end
     end
 end
@@ -1046,5 +1071,8 @@ function M.status_line()
         .. " (refused %d), client hits %d (%.0f damage), states sent %d", s.shots, s.fire_msgs, s.fire_entries,
         s.wakes, s.offs, s.off_refused, s.hits, s.hit_dmg, s.states)
 end
+
+-- Test access (mock harness).
+M._t = { st = function() return st end }
 
 return M

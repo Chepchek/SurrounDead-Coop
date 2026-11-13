@@ -825,6 +825,15 @@ end
 -- the clients' records on it) - and checks COOP_VERIFY_MS later that a save
 -- really started (this module's save-pre hook); if not, it says why and
 -- tries again COOP_RETRY_S later.
+-- Somebody is down (sdc_down's knockdown): its state is not in the game's
+-- save, so the mod's own saves wait (the autosave) or refuse (save_now).
+function M.someone_down()
+    local dn = package.loaded["sdc_down"]
+    if type(dn) ~= "table" or type(dn.any_down) ~= "function" then return false end
+    local ok, v = pcall(dn.any_down)
+    return ok and v == true
+end
+
 local function coop_autosave(now, gm, pawn)
     local ws = world_state
     if not ws.coop_on then
@@ -846,8 +855,8 @@ local function coop_autosave(now, gm, pawn)
     end
     local base = math.max(ws.last_save or ws.coop_base, ws.coop_base)
     if now - base < COOP_AUTOSAVE_S or now < (ws.coop_retry_at or 0) then return end
-    if ue.prop(pawn, "PlayerDead?") == true then
-        ws.coop_retry_at = now + COOP_RETRY_S   -- the game itself skips it (@115-280)
+    if ue.prop(pawn, "PlayerDead?") == true or M.someone_down() then
+        ws.coop_retry_at = now + COOP_RETRY_S   -- the game itself skips a dead host (@115-280); a downed player waits
         return
     end
     local t_call = clock()
@@ -961,7 +970,11 @@ local function begin_save(data)
     -- the co-op autosave counts from this machine's last save (savecheck on or off)
     if r.role ~= "client" then world_state.last_save = r.t0 end
     guards_before_save(r)
-    if not opt("savecheck") then return end   -- guards only, no record / lines
+    -- savecheck off: the record still follows the save to its end (save_now
+    -- waits for it), quietly - no files read, no [SAVE] lines
+    r.quiet = not opt("savecheck")
+    rec = r
+    if r.quiet then return end
     if r.role ~= "client" then
         M.stats.saves = M.stats.saves + 1
         -- set by the host character's own SERVER_RequestSaveGame (its ActorPreSave)
@@ -971,7 +984,6 @@ local function begin_save(data)
         if ps and ue.try(function() return ps:IsInViewport() end) == true then r.guess = "pause menu" end
     end
     r.before = slot_prints(r.slot)
-    rec = r
 end
 
 local function finish_counts(job)
@@ -1004,9 +1016,18 @@ local function finish_save(result)
     if not r then return end
     rec = nil
     local now = clock()
+    local ok = result == "ok"
+    if r.quiet then
+        -- savecheck off: the end only (save_now, status), the client's junk slot
+        if r.junk then ue.delay("savecheck-junk", 500, function() cleanup_junk(r.junk) end) end
+        if r.role == "client" then return end
+        if ok then M.stats.saves_ok = M.stats.saves_ok + 1 else M.stats.saves_failed = M.stats.saves_failed + 1 end
+        M.last = { n = r.n, wall = r.wall, ok = ok, slot = r.slot, trigger = r.trigger or "?", result = result,
+                   line = string.format("save #%d %s (savecheck off: no details)", r.n, ok and "OK" or tostring(result)) }
+        return
+    end
     local after = slot_prints(r.slot)
     local files, nchanged = files_report(r.before, after)
-    local ok = result == "ok"
     if r.role == "client" then
         log.info("[SAVE] client save #%d %s in %.1f s: slot '%s' (this game's own throwaway copy; the world is saved by the host)%s",
             r.n, ok and "done" or result, now - r.t0, tostring(r.slot),
@@ -1058,7 +1079,7 @@ local function finish_save(result)
     else
         log.warn("%s", line)
     end
-    M.last = { n = r.n, wall = r.wall, ok = ok, slot = r.slot, trigger = trig, line = line }
+    M.last = { n = r.n, wall = r.wall, ok = ok, slot = r.slot, trigger = trig, line = line, result = result }
     if p and p.ok == false then
         M.stats.player_mismatch = M.stats.player_mismatch + 1
         if p.remote_inv then schedule_repair(r) end
@@ -1169,6 +1190,37 @@ local function on_inventory_save(c)
     end
 end
 
+-- XP the game itself gave again while this world loaded: Narrative refires a
+-- finished quest's events on every quest load (sdc_quests, "refire"), e.g.
+-- Quest_TheSafeZone's 300 XP, times the difficulty's XP multiplier
+-- (LevellingComponent.AddXP: XP * Difficulty_MultiplierValue). 13.11 host
+-- logs: +1200 (300 x 2 events x 2.0) at every load of the same save. The
+-- game loads the host's quests in the new character's Event_LoadPlayer
+-- (BP_PlayerCharacter: Delay 1.2 s, then @14446 Load) - 13.11: 1.2 s after
+-- EMS began loading the actors (r.t0); the window reaches 30 s before r.t0
+-- too. Only rewards of the host's CURRENT character count: a real quest
+-- reward of the world before the load (the old character, gone in the main
+-- menu the load starts from) is no refire (review of 13.11 fix 16).
+-- Returns the XP and a text, or 0.
+local REFIRE_BEFORE_S = 30
+local function refired_quest_xp(r, pc, pawn)
+    local q = package.loaded["sdc_quests"]
+    if type(q) ~= "table" or type(q.host_rewards_since) ~= "function" then return 0, "" end
+    local ok, list = pcall(q.host_rewards_since, r.t0 - REFIRE_BEFORE_S)
+    if not ok or type(list) ~= "table" or #list == 0 then return 0, "" end
+    local cur = ue.valid(pawn) and ue.name(pawn) or nil
+    local mult = tonumber(ue.prop(ue.prop(pc, "LevellingComponent"), "Difficulty_MultiplierValue")) or 1
+    local sum, names = 0, {}
+    for _, e in ipairs(list) do
+        if cur == nil or e.pawn == nil or e.pawn == cur then
+            sum = sum + (tonumber(e.amount) or 0)
+            names[#names + 1] = string.format("'%s' %s", tostring(e.name), num(e.amount))
+        end
+    end
+    if sum <= 0 then return 0, "" end
+    return sum * mult, string.format("%s, x%s XP multiplier", table.concat(names, ", "), num(mult))
+end
+
 local function host_load_report(r)
     local pc, pawn = ue.local_pc(), ue.local_pawn()
     local st = pc_stats(pc)
@@ -1176,6 +1228,7 @@ local function host_load_report(r)
     local loc = pawn and ue.location(pawn) or nil
     local last = history_read()[r.slot or ""]
     local verdict = "no earlier save of this slot recorded"
+    local re_xp, re_txt = refired_quest_xp(r, pc, pawn)
     if last and st then
         local diffs = {}
         local function cmp(name, a, b)
@@ -1184,7 +1237,11 @@ local function host_load_report(r)
             end
         end
         cmp("level", last.level, tonumber(st.level))
-        cmp("xp", last.xp, tonumber(st.xp))
+        -- exactly the refired rewards (same level): the game's own, not a save problem
+        local xp_now = tonumber(st.xp)
+        local refired = re_xp > 0 and last.xp ~= nil and xp_now ~= nil and last.level == tonumber(st.level)
+            and math.abs((xp_now - last.xp) - re_xp) < 1
+        if not refired then cmp("xp", last.xp, xp_now) end
         cmp("skill points", last.sp, tonumber(st.sp))
         cmp("zombie kills", last.zk, tonumber(st.ZombieKills))
         if inv and last.h then
@@ -1201,6 +1258,13 @@ local function host_load_report(r)
         else
             verdict = "DIFFERS from the last save of this slot (" .. tostring(last.when) .. "): " .. table.concat(diffs, ", ")
         end
+        if refired then
+            verdict = verdict .. string.format("; xp %s -> %s is the game's own: quest reward(s) given again by its quest load (%s; Narrative refires quest events on every load)",
+                num(last.xp), num(xp_now), re_txt)
+        end
+    end
+    if re_xp > 0 and not verdict:find("is the game's own", 1, true) then
+        verdict = verdict .. string.format("; +%s XP of quest reward(s) the game gave again while loading (%s)", num(re_xp), re_txt)
     end
     local line = string.format("[SAVE] load from slot '%s' done in %.1f s: host %s, inventory %s - %s", tostring(r.slot),
         (r.t_done or clock()) - r.t0, stats_str(st), inv_str(inv), verdict)
@@ -1235,39 +1299,57 @@ local function on_loaded(c)
     end)
 end
 
--- With savecheck off only the guards run (save-pre); every other hook only
--- feeds the record.
-local function guarded(name, fn)
+-- `always`: the hook runs with savecheck off too - the guards (save-pre) and
+-- the save's own start / end, so the record follows every save quietly
+-- (save_now waits for its end) - and the load start (the co-op autosave
+-- counts from it). The other hooks only feed the [SAVE] lines.
+local function guarded(name, fn, always)
     return function(...)
-        if name ~= "save-pre" and not opt("savecheck") then return end
+        if not always and not opt("savecheck") then return end
         local ok, err = pcall(fn, ...)
         if not ok then log.err_throttled("savecheck." .. name, "[SAVE] %s hook: %s", name, tostring(err)) end
     end
 end
 
--- { path, name, fn, post = fn (native only), native = true }
+-- { path, name, fn (nil: no pre callback), post = fn (native only), native = true,
+--   always = true (see guarded), trigger = true (labels only: host / single player, savecheck on) }
 local HOOKS = {
-    { F_SAVE, "save-pre", on_save_pre, post = on_save_post, native = true },
-    { F_LOAD, "load-pre", on_load_pre, native = true },
-    { F_CUSTOM, "save-custom", function() end, post = on_save_custom, native = true },
-    { PC .. ":" .. ACTORS_DONE, "actors-saved", on_actors_saved },
-    { PC .. ":" .. ACTORS_FAILED, "actors-failed", on_actors_failed },
-    { PC .. ":" .. CHECK_DONE, "verified", on_verified },
-    { PC .. ":" .. CHECK_FAILED, "verify-failed", function(c) on_verify_failed(c, "failed") end },
-    { PC .. ":" .. CHECK_VERSION, "verify-failed", function(c) on_verify_failed(c, "version mismatch") end },
+    { F_SAVE, "save-pre", on_save_pre, post = on_save_post, native = true, always = true },
+    { F_LOAD, "load-pre", on_load_pre, native = true, always = true },
+    { F_CUSTOM, "save-custom", nil, post = on_save_custom, native = true },
+    { PC .. ":" .. ACTORS_DONE, "actors-saved", on_actors_saved, always = true },
+    { PC .. ":" .. ACTORS_FAILED, "actors-failed", on_actors_failed, always = true },
+    { PC .. ":" .. CHECK_DONE, "verified", on_verified, always = true },
+    { PC .. ":" .. CHECK_FAILED, "verify-failed", function(c) on_verify_failed(c, "failed") end, always = true },
+    { PC .. ":" .. CHECK_VERSION, "verify-failed", function(c) on_verify_failed(c, "version mismatch") end, always = true },
     { PC .. ":" .. LOAD_DONE, "loaded", on_loaded },
-    { GM .. ":AutoSaveGame", "trigger", function() trigger("autosave") end },
-    { SAVEMENU .. ":SaveGameToSlot", "trigger", function() trigger("save menu") end },
+    { GM .. ":AutoSaveGame", "trigger", function() trigger("autosave") end, trigger = true },
+    { SAVEMENU .. ":SaveGameToSlot", "trigger", function() trigger("save menu") end, trigger = true },
     { SLEEPUI .. ":BndEvt__Button_60_K2Node_ComponentBoundEvent_0_OnButtonClickedEvent__DelegateSignature", "trigger",
-      function() trigger("sleep") end },
-    { CHAR .. ":InpActEvt_IA_QuickSave_K2Node_EnhancedInputActionEvent_2", "trigger", function() trigger("quick save key") end },
+      function() trigger("sleep") end, trigger = true },
+    { CHAR .. ":InpActEvt_IA_QuickSave_K2Node_EnhancedInputActionEvent_2", "trigger", function() trigger("quick save key") end,
+      trigger = true },
     { JIG .. ":SERVER_RequestSaveGame", "inventory-save", on_inventory_save },
 }
 
+-- The trigger hooks only name the trigger in the host's [SAVE] line: not
+-- registered on a client or with savecheck off (each costs a hook lookup
+-- on every call of its Blueprint function).
+local function wanted(h)
+    if not h.trigger then return true end
+    local r = role()
+    return opt("savecheck") and (r == "host" or r == "standalone")
+end
+
 local function hooks_done()
-    local n = 0
-    for _, h in ipairs(HOOKS) do if hooked[h[1]] then n = n + 1 end end
-    return n, #HOOKS
+    local n, total = 0, 0
+    for _, h in ipairs(HOOKS) do
+        if hooked[h[1]] or wanted(h) then
+            total = total + 1
+            if hooked[h[1]] then n = n + 1 end
+        end
+    end
+    return n, total
 end
 
 local function try_hooks(force)
@@ -1276,15 +1358,18 @@ local function try_hooks(force)
     hook_try_at = now
     for _, h in ipairs(HOOKS) do
         local path = h[1]
-        if not hooked[path] and ue.find_object(path) then
+        if not hooked[path] and wanted(h) and ue.find_object(path) then
             local ok, err
-            if h.native then
+            if h.native and not h.post then
+                -- native, pre only: one engine hook shared with other modules (sdc_ue)
+                ok, err = ue.hook_native(path, "savecheck", guarded(h[2], h[3], h.always))
+            elseif h.native then
                 -- native: pre-hook (Context, params...), post-hook (Context, ReturnValue, params...)
-                local post = h.post and guarded(h[2] .. "-post", h.post) or function() end
-                ok, err = pcall(RegisterHook, path, guarded(h[2], h[3]), post)
+                local pre = h[3] and guarded(h[2], h[3], h.always) or function() end
+                ok, err = pcall(RegisterHook, path, pre, guarded(h[2] .. "-post", h.post, h.always))
             else
                 -- Blueprint function: one callback, after it ran
-                ok, err = pcall(RegisterHook, path, guarded(h[2], h[3]))
+                ok, err = pcall(RegisterHook, path, guarded(h[2], h[3], h.always))
             end
             hooked[path] = ok == true
             log.info("[SAVE] hook %s %s%s", path:match("([%w_]+[.:][%w_]+)$") or path, ok and "ok" or "FAILED",
@@ -1366,6 +1451,51 @@ function M.after_backup(dst, code)
         log.warn("[SAVE] backups: old backups kept (this one did not succeed)")
     end
     return ok
+end
+
+-- ---------------------------------------------------------------------------
+-- Save now (sdc_session: opening a single-player world for friends)
+-- ---------------------------------------------------------------------------
+-- The game's own save of the current slot - player 0's SaveGameToSlot, what
+-- the quick save runs (no pause / permadeath gate, unlike AutoSaveGame) -
+-- then done(ok, why, slot) once it ended: the game's file check (the record
+-- of this module, kept with savecheck off too), or SAVE_NOW_SETTLE_S after
+-- the actors were saved when the check never reports (or there is no record:
+-- EMS hook missing). ok = false when no save started within
+-- SAVE_NOW_START_S or it did not end in SAVE_NOW_MAX_S.
+local SAVE_NOW_START_S, SAVE_NOW_MAX_S, SAVE_NOW_SETTLE_S = 6, 45, 4
+function M.save_now(reason, done)
+    local function finish(ok, why, slot)
+        log.info("[SAVE] save for %s: %s%s (slot '%s')", reason, ok and "done" or "FAILED",
+            why and (": " .. why) or "", tostring(slot or ue.ems_current_slot()))
+        pcall(done, ok, why, slot or ue.ems_current_slot())
+    end
+    local pc, pawn = ue.local_pc(), ue.local_pawn()
+    if not pc or not pawn then return finish(false, "no character") end
+    if ue.prop(pawn, "PlayerDead?") == true then return finish(false, "the character is dead") end
+    if M.someone_down() then return finish(false, "somebody is down (knockdown)") end
+    if rec and clock() - rec.t0 < SAVE_TIMEOUT_S then return finish(false, "another save is running") end
+    local n0, t_call = save_n, clock()
+    local ok, err = pcall(function() pc:SaveGameToSlot() end)
+    if not ok then return finish(false, "SaveGameToSlot: " .. tostring(err)) end
+    log.info("[SAVE] save for %s: the game's SaveGameToSlot called (slot '%s')", reason, tostring(ue.ems_current_slot()))
+    local started_at = nil
+    local function poll()
+        local now = clock()
+        if not started_at and (save_n > n0 or (world_state.last_save or -1) >= t_call) then started_at = now end
+        if not started_at then
+            if now - t_call > SAVE_NOW_START_S then return finish(false, "no save started") end
+        elseif M.last and M.last.n > n0 then
+            return finish(M.last.ok, not M.last.ok and tostring(M.last.result or "the game's file check failed") or nil,
+                M.last.slot)
+        elseif now - started_at >= SAVE_NOW_SETTLE_S and (not rec or (rec.t_actors and now - rec.t_actors >= SAVE_NOW_SETTLE_S)) then
+            -- no record (EMS hook missing) or the check did not report: the actors are written
+            return finish(true, rec and "actors saved, file check not reported" or nil)
+        end
+        if now - t_call > SAVE_NOW_MAX_S then return finish(false, "the save did not end in " .. SAVE_NOW_MAX_S .. " s") end
+        ue.delay("savecheck-savenow", 250, poll)
+    end
+    ue.delay("savecheck-savenow", 250, poll)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1482,7 +1612,9 @@ end
 -- New world: drop what belonged to the old one (hooks stay).
 function M.reset(why)
     if rec then
-        log.warn("[SAVE] save #%d (slot '%s') still unfinished at a level change (%s)", rec.n, tostring(rec.slot), tostring(why))
+        if not rec.quiet then
+            log.warn("[SAVE] save #%d (slot '%s') still unfinished at a level change (%s)", rec.n, tostring(rec.slot), tostring(why))
+        end
         rec = nil
     end
     load_rec = nil

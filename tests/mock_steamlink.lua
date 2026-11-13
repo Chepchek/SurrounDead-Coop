@@ -255,8 +255,9 @@ T = T + 1; helper_status(); sl.tick()
 ok, why, key = sl.join("76561190000000302")
 check(not ok and key == "already_client", "no second join while connected")
 H.join_state = "closed"
-T = T + 1; helper_status(); sl.tick()
-check(last_toast().text == sl.tr("sl_tunnel_lost"), "tunnel closed while playing: notification")
+-- in a world status.txt is read every 3 s (0.9.x: once a second cost ~7 ms/s)
+for _ = 1, 3 do T = T + 1; helper_status(); sl.tick() end
+check(last_toast().text == sl.tr("sl_tunnel_lost"), "tunnel closed while playing: notification (within 3 s)")
 ROLE, S.role, MENU, S.in_menu = "standalone", "standalone", true, true
 T = T + 1; helper_status(); sl.tick()
 cmds = take_cmds(L)
@@ -305,8 +306,9 @@ H.join_state = "idle"
 io.write("G. invites\n")
 ROLE, S.role, MENU, S.in_menu = "standalone", "standalone", false, false   -- single-player world
 H.invite_seq, H.invite_host = 1, "76561190000000300"
-T = T + 1; helper_status(); sl.tick()
-check(last_toast().text:find("выйдите в главное меню", 1, true) ~= nil and L.join == nil, "in a single-player world: asks to quit to the menu")
+for _ = 1, 3 do T = T + 1; helper_status(); sl.tick() end
+check(last_toast().text:find("выйдите в главное меню", 1, true) ~= nil and L.join == nil,
+    "in a single-player world: asks to quit to the menu (status read within 3 s)")
 take_cmds(L)
 MENU, S.in_menu = true, true
 T = T + 1; helper_status(); sl.tick()
@@ -338,6 +340,14 @@ check(sl.invite() == true, "invite(): overlay dialog through SteamCore")
 steam.invite = function() return false, "no_steam" end
 ok, why, key = sl.invite()
 check(not ok and key == "sl_st_no_steam", "invite(): no Steam")
+-- the host's Invite on a friend's row: the helper's own "invite" (Steam sends it, the helper lets that friend in)
+take_cmds(L)
+check(sl.invite_friend(" 76561190000000300 ") == true and take_cmds(L)[1] == "invite 76561190000000300",
+    "invite_friend(id): 'invite <SteamID>' to the helper")
+ok, why, key = sl.invite_friend("12345")
+check(not ok and key == "sl_bad_id" and #take_cmds(L) == 0, "invite_friend: not a SteamID, nothing sent")
+ok, why, key = sl.invite_friend("76561190000000100")
+check(not ok and key == "sl_self", "invite_friend: not oneself")
 steam.server_api_pending = true
 check(sl.status().state == "error" and sl.status().restart_needed, "status: restart needed after the Engine.ini write")
 ok, why, key = sl.join("76561190000000300")
@@ -393,6 +403,238 @@ steam.ensure_server_api(cfg)
 check(steam.server_api_pending == false and #toasts == nt, "already set: no notice, no restart")
 real_execute('attrib -R "' .. ini:gsub("/", "\\") .. '" >nul 2>&1')
 ENV.SteamAppId = false
+
+-- ------------------------------------------------------------ L. status.txt reads
+-- The tick runs every 0.5 s (two ticks per os.time second here); the status
+-- file is read once a second, every tick only during a join or right after a
+-- command (its answer).
+io.write("L. status reads\n")
+S.role, S.in_menu, ROLE, MENU = "standalone", true, "standalone", true
+L.join, L.pending_invite = nil, nil
+-- command files of an earlier run in this folder (same session id: os.time is
+-- fixed here) would make a rename fail and the config be sent again each tick
+for i = 1, L.seq + 100 do os.remove(string.format("%s/cmd_%s_%06d.txt", DIR, L.session, i)) end
+T = T + 10
+helper_status()
+sl.tick()
+take_cmds(L)
+L.sent_t = nil
+T = T + 1
+helper_status()
+sl.tick()
+local r0 = L.reads
+sl.tick()
+check(L.reads == r0, "idle: the second tick of the same second does not read status.txt")
+T = T + 1; helper_status(); sl.tick(); sl.tick()
+check(L.reads == r0 + 1, "idle: once in the next second")
+check(sl.invite_friend("76561190000000300") == true, "a command to the helper")
+take_cmds(L)
+sl.tick()
+check(L.reads == r0 + 2, "right after a command: read on the next tick of the same second (its answer)")
+T = T + 3; helper_status(); sl.tick(); sl.tick()
+check(L.reads == r0 + 3, "3 s after the command: once a second again")
+L.join = { sid = "76561190000000300", name = "x", deadline = T + 120, attempt = 1, req = "rq", sent_at = T }
+sl.tick(); sl.tick()
+check(L.reads == r0 + 5, "a join under way: every tick")
+S.role = "client"
+L.join.connected = true
+T = T + 1; helper_status(); sl.tick(); sl.tick()
+check(L.reads == r0 + 6, "connected through the tunnel: once a second")
+S.role = "standalone"
+L.join = nil
+L.sent_t = nil
+check(sl._status_due(L.read_t) == false and sl._status_due(L.read_t + 1) == true, "status_due: a new second is due, the same one not")
+local sls = ue.sub_stats["sl:status"]
+check(sls ~= nil and sls.calls == L.reads, "every read timed in [PERF] parts as sl:status (" .. tostring(sls and sls.calls) .. ")")
+
+-- ------------------------------------------------------------ M. the host does not answer (13.11 review, item 9)
+-- The host's game crashed; the client's "Try again" got "timeout" from the
+-- helper five times and showed "has not opened a world yet" for 2 minutes.
+io.write("M. host does not answer\n")
+S.role, S.in_menu, ROLE, MENU = "standalone", true, "standalone", true
+L.join, L.pending_invite, L.left, L.sent_t = nil, nil, nil, nil
+H.join_state, H.join_reason = "idle", ""
+T = T + 5; helper_status(); sl.tick(); take_cmds(L)
+local function toasted_since(n, pat)
+    for i = n + 1, #toasts do if toasts[i].text:find(pat, 1, true) then return true end end
+    return false
+end
+local function fail_current(reason)
+    H.join_req, H.join_state, H.join_reason = L.join and L.join.req or H.join_req, "failed", reason
+end
+local nt0 = #toasts
+check(sl.join("76561190000000302") == true, "M1 join a friend who never connected here")
+take_cmds(L)
+fail_current("timeout")
+T = T + 1; helper_status(); sl.tick()
+check(toasted_since(nt0, "не отвечает через Steam") and toasted_since(nt0, "закрыта или вылетела"),
+    "M1 timeout: 'does not answer through Steam - closed or crashed?' (" .. tostring(last_toast().text) .. ")")
+check(not toasted_since(nt0, "ещё не открыл мир"), "M1 ... and not 'has not opened a world yet'")
+check(sl.status().detail_key == "sl_st_silent" and sl.status().silent == true
+    and sl.status().detail:find("не отвечает", 1, true) ~= nil, "M1 status line (join screen): the host does not answer")
+check(logged_has("does not answer through Steam"), "M1 English text in the log")
+local n1 = #toasts
+for _ = 1, 8 do fail_current("timeout"); T = T + 1; helper_status(); sl.tick(); take_cmds(L) end
+check(#toasts == n1 and L.join ~= nil and (L.join.attempt or 0) >= 2, "M1 still no answer: retried, the notice not repeated")
+-- the host's game is back, its world still loading: the other notice
+local n2 = #toasts
+for _ = 1, 8 do fail_current("not_hosting"); T = T + 1; helper_status(); sl.tick(); take_cmds(L) end
+check(toasted_since(n2, "ещё не открыл мир") and sl.status().detail_key == "sl_st_waiting",
+    "M1 then 'not_hosting': 'has not opened a world yet' and the waiting status")
+-- Cancel (join screen / console)
+local replies = {}
+sl.console({ "cancel" }, function(s) replies[#replies + 1] = s end)
+cmds = take_cmds(L)
+check(L.join == nil and cmds[#cmds] == "leave" and replies[1] == "Steam join cancelled", "M2 sdcoop_steam cancel: tunnel closed, join over")
+check(sl.cancel() == false, "M2 nothing to cancel any more")
+check(sl.status().state ~= "joining", "M2 status no longer 'joining'")
+-- connected to a host, the connection drops, Try again: the host's game is gone
+H.join_state, H.join_reason = "idle", ""
+sl.join("76561190000000300")
+take_cmds(L)
+H.join_req, H.join_state, H.join_port = L.join.req, "ready", 50124
+T = T + 1; helper_status(); sl.tick()
+-- Cancel never closes a tunnel the game already uses (skeptic: a mutation
+-- without that guard survived)
+local function no_leave() for _, c in ipairs(take_cmds(L)) do if c == "leave" then return false end end return true end
+take_cmds(L)
+check(L.join and L.join.opened == true and sl.cancel("test") == false and no_leave() and L.join ~= nil,
+    "M2b tunnel open, the game connecting through it: cancel refused, no 'leave'")
+ROLE, S.role, MENU, S.in_menu = "client", "client", false, false
+T = T + 1; helper_status(); sl.tick()
+check(L.join and L.join.connected == true, "M3 playing at the host through the tunnel")
+take_cmds(L)
+local creplies = {}
+sl.console({ "cancel" }, function(s) creplies[#creplies + 1] = s end)
+check(no_leave() and L.join ~= nil and L.join.connected == true and creplies[1] == "no Steam join to cancel",
+    "M2b playing: sdcoop_steam cancel leaves the tunnel alone")
+ROLE, S.role, MENU, S.in_menu = "standalone", "standalone", true, true   -- connection lost
+T = T + 1; helper_status(); sl.tick()
+cmds = take_cmds(L)
+check(L.join == nil and L.left and L.left.sid == "76561190000000300", "M3 the end of that connection is remembered")
+H.join_state, H.join_reason = "idle", ""
+T = T + 13
+local n3 = #toasts
+sl.join("76561190000000300")
+take_cmds(L)
+fail_current("timeout")
+T = T + 1; helper_status(); sl.tick()
+check(toasted_since(n3, "похоже, игра хоста закрылась или вылетела (вы были подключены 14 с назад)"),
+    "M3 timeout 14 s after that: says the host's game seems to have closed or crashed (" .. tostring(last_toast().text) .. ")")
+check(logged_has("you were connected 14 s ago"), "M3 English text in the log")
+check(sl.status().detail_key == "sl_st_silent_left" and sl.status().detail:find("игра хоста закрылась", 1, true) ~= nil,
+    "M3 the join screen's line says it too (the notice itself is quiet under the join screen)")
+do
+    local f = io.open(SCRIPTS .. "/sdc_ui.lua", "rb")
+    local src = f and f:read("a") or ""
+    if f then f:close() end
+    local quiet = src:match("JC%.QUIET = (%b{})") or ""
+    check(quiet:find("sl_host_silent = true", 1, true) and quiet:find("sl_host_silent_left = true", 1, true),
+        "M3 sdc_ui: the two notices are quiet while the join screen shows its own line")
+end
+sl.cancel()
+take_cmds(L)
+-- rendezvous counts as no answer too; much later the plain notice
+T = T + 200
+local n4 = #toasts
+sl.join("76561190000000300")
+take_cmds(L)
+fail_current("rendezvous")
+T = T + 1; helper_status(); sl.tick()
+check(toasted_since(n4, "не отвечает через Steam") and not toasted_since(n4, "вы были подключены"),
+    "M4 rendezvous 3+ min after the connection ended: the plain 'does not answer' notice")
+sl.cancel()
+take_cmds(L)
+H.join_state, H.join_reason = "idle", ""
+
+-- ------------------------------------------------------------ N. status.txt reads in a world (item 18)
+io.write("N. status reads in a world\n")
+ROLE, S.role, MENU, S.in_menu = "standalone", "standalone", false, false   -- a single-player world
+L.join, L.sent_t = nil, nil
+T = T + 5; helper_status(); sl.tick()
+local rw = L.reads
+for _ = 1, 2 do T = T + 1; helper_status(); sl.tick(); sl.tick() end
+check(L.reads == rw, "N1 in a world: no read for 2 s")
+T = T + 1; helper_status(); sl.tick(); sl.tick()
+check(L.reads == rw + 1, "N1 in a world: one read every 3 s (" .. (L.reads - rw) .. ")")
+check(sl._helper_alive(T + 9) == true and sl._helper_alive(T + 10) == false,
+    "N1 the helper counts as running between reads (6 s + the 3 s gap after the last read), not longer")
+-- a slow read (a virus scanner): logged, the next one 6 s later
+local real_clock = os.clock
+local fake_c = 0
+os.clock = function() fake_c = fake_c + 0.05; return fake_c end
+T = T + 3; helper_status(); sl.tick()
+os.clock = real_clock
+check(L.read_slow == true and logged_has("status.txt is read at most every 6 s"), "N2 a slow read (50 ms) is logged")
+local rs = L.reads
+for _ = 1, 5 do T = T + 1; helper_status(); sl.tick() end
+check(L.reads == rs, "N2 after a slow read: no read for 5 s")
+T = T + 1; helper_status(); sl.tick()
+check(L.reads == rs + 1 and L.read_slow == false, "N2 read again 6 s later; a fast read goes back to every 3 s")
+check(L.down_logged == false and sl.status().helper == true, "N2 the helper never counted as stopped meanwhile")
+local nlog = #logged
+os.clock = function() fake_c = fake_c + 0.05; return fake_c end
+T = T + 3; helper_status(); sl.tick()
+os.clock = real_clock
+local again = false
+for i = nlog + 1, #logged do if logged[i]:find("status.txt is read at most", 1, true) then again = true end end
+check(L.read_slow == true and not again, "N2 a second slow read soon after: not logged again")
+-- a join under way still reads every tick, even in a world
+L.join = { sid = "76561190000000300", name = "x", deadline = T + 120, attempt = 1, req = "rq2", sent_at = T }
+local rj = L.reads
+sl.tick(); sl.tick()
+check(L.reads == rj + 2, "N3 a join under way: every tick")
+L.join = nil
+local slf = ue.sub_stats["sl:status"]
+check(slf ~= nil and slf.wmax >= 50, "N4 [PERF] parts sl:status keeps the slow read as its max")
+-- N5 / N6 (skeptic): a slow status read and, in the same tick, a quick
+-- friends.txt read (the list changed): the 6 s pause stays; a slow
+-- friends.txt read sets the pause too, only a fast status read ends it.
+-- Reads cost what the file costs: 50 ms for `slow_file`, else 1 ms.
+L.join, L.sent_t, L.read_slow = nil, nil, false
+local real_open = io.open
+local slow_file, fc = nil, 0
+os.clock = function() return fc end
+io.open = function(p, m)
+    if slow_file and type(p) == "string" and p:find(slow_file, 1, true) then fc = fc + 0.05 else fc = fc + 0.001 end
+    return real_open(p, m)
+end
+local function next_read_after()
+    local r0, first = L.reads, nil
+    for i = 1, 7 do
+        T = T + 1; helper_status(); sl.tick()
+        if L.reads > r0 then first = i; break end
+    end
+    return first
+end
+T = T + 3; helper_status(); sl.tick()   -- an ordinary read: the 3 s rhythm starts here
+slow_file = "status.txt"
+H.friends_seq = H.friends_seq + 1
+wr(DIR .. "/friends.txt", "seq=" .. H.friends_seq .. "\n76561190000000301\t1\t0.7.0\tBob\n")
+T = T + 3; helper_status(); sl.tick()
+slow_file = nil
+check(L.friends_seq == tostring(H.friends_seq) and L.read_slow == true,
+    "N5 slow status read + quick friends.txt read in the same tick: the pause stays on")
+local gap5 = next_read_after()
+check(gap5 == 6, "N5 ... the next status read comes 6 s later, not 3 (" .. tostring(gap5) .. " s)")
+check(L.read_slow == false, "N5 that read was fast: back to every 3 s")
+slow_file = "friends.txt"
+L.slow_logged = nil
+H.friends_seq = H.friends_seq + 1
+wr(DIR .. "/friends.txt", "seq=" .. H.friends_seq .. "\n76561190000000301\t0\t\tBob\n")
+local nl6 = #logged
+T = T + 3; helper_status(); sl.tick()
+slow_file = nil
+local said6 = false
+for i = nl6 + 1, #logged do if logged[i]:find("reading the helper's friends.txt took 50 ms", 1, true) then said6 = true end end
+check(L.friends_seq == tostring(H.friends_seq) and L.read_slow == true and said6,
+    "N6 a slow friends.txt read (status fast): logged by its file name, status reads paused too")
+local gap6 = next_read_after()
+check(gap6 == 6 and L.read_slow == false, "N6 ... next status read 6 s later; fast, so the pause ends (" .. tostring(gap6) .. " s)")
+io.open = real_open
+os.clock = real_clock
+MENU, S.in_menu = true, true
+L.read_slow = false
 
 -- ------------------------------------------------------------ K. off by config / missing exe
 io.write("K. off\n")

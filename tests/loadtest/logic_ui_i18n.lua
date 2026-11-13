@@ -183,11 +183,16 @@ if #nolabel > 0 then
     io.stderr:write("note: bool settings without a hand-written label (cut from the description): "
         .. table.concat(nolabel, ", ") .. "\n")
 end
-for _, k in ipairs({ "language", "ui_show_steam", "ui_open_at_menu" }) do
-    ok(i18n.schema_row(k) ~= nil, "new SCHEMA key " .. k)
+for _, k in ipairs({ "language", "ui_open_at_menu", "persist_early_id" }) do
+    ok(i18n.schema_row(k) ~= nil, "SCHEMA key " .. k)
 end
-ok(cfg.get("language") == "auto" and cfg.get("ui_show_steam") == false and cfg.get("ui_open_at_menu") == false,
-    "new keys default to auto / false / false")
+ok(cfg.get("language") == "auto" and cfg.get("ui_open_at_menu") == false and cfg.get("persist_early_id") == true,
+    "keys default to auto / false / true")
+for _, k in ipairs({ "ui_show_steam", "host_by_ip", "steam_p2p" }) do
+    ok(i18n.schema_row(k) == nil and i18n.DESC_EN[k] == nil and i18n.LABEL[k] == nil and i18n.GROUP_OF[k] == nil,
+        "removed setting " .. k .. ": no SCHEMA row, description, label or group")
+end
+ok(cfg.get("ai_kill_log") == false and cfg.get("stealth_trace") == false, "diagnostic logs ai_kill_log / stealth_trace default off")
 for _, k in ipairs(i18n.MAIN) do ok(i18n.schema_row(k) ~= nil, "curated setting exists: " .. k) end
 -- every bool lands in exactly one group
 local grouped = {}
@@ -299,8 +304,9 @@ local function texts_with(pattern)
 end
 ok(texts_with("^Кооператив$") == 1, "title in Russian")
 ok(texts_with("^Открыть мир для друзей$") == 1, "host button label")
-ok(UI.steam_later and UI.steam_later._vis ~= 1 and UI.steam_status_row._vis == 1,
-    "without sdc_steamlink: one dim line about 0.7.0, no status row")
+UI.refresh_status()
+ok(UI.steam_later == nil and UI.steam_status_row._vis ~= 1 and UI.steam_status._text == "Ошибка Steam-соединения.",
+    "without sdc_steamlink: the status row says the Steam link is broken")
 -- no text shows a raw catalog key
 local raw = {}
 for _, w in ipairs(created) do
@@ -313,8 +319,11 @@ ok(#raw == 0, "no raw keys on screen: " .. table.concat(raw, ", "))
 -- settings: «Основное» built (open), «Все функции мода» lazily
 UI.pick_tab("settings")
 ok(UI.tab == "settings", "settings tab")
+-- (besides the World tab's own boxes: friendly_fire is not in «Основное»)
 local main_n = 0
-for _ in pairs(UI.checks) do main_n = main_n + 1 end
+for k in pairs(UI.checks) do
+    if not (UI.world_checks or {})[k] or #UI.checks[k] > 1 then main_n = main_n + 1 end
+end
 ok(main_n == #i18n.MAIN, "Основное: " .. main_n .. " checkboxes")
 local all_sec = nil
 for _, sec in ipairs(UI.sections) do if sec.name == "all" then all_sec = sec end end
@@ -337,6 +346,62 @@ for _, row in ipairs(schema) do
     end
 end
 ok(reach == nbool, "every bool setting has a checkbox (" .. reach .. "/" .. nbool .. ")")
+-- number settings right under their switch (i18n.NUMS_OF): a label and a box bound to the key
+local nnum = 0
+for sw, list in pairs(i18n.NUMS_OF or {}) do
+    ok(UI.checks[sw] ~= nil, "a switch with numbers has its checkbox: " .. sw)
+    for _, nk in ipairs(list) do
+        nnum = nnum + 1
+        local row = i18n.schema_row(nk)
+        ok(row ~= nil and row[2] == "int", "number setting is an int in SCHEMA: " .. nk)
+        ok(i18n.LABEL[nk] ~= nil, "number setting has a label: " .. nk)
+        local e = UI.inputs[nk]
+        ok(e ~= nil and tostring(e._text) == tostring(cfg.get(nk)), "its box shows the setting: " .. nk)
+        ok(e ~= nil and e._tip == i18n.desc(nk), "its box's tooltip = the full description: " .. nk)
+    end
+end
+ok(nnum >= 8, "number rows: toughness, the zombie cap, player scaling (" .. nnum .. ")")
+-- a typed number is kept with the footer's Save (a scratch config file)
+local save_rec
+for _, b in ipairs(UI.buttons) do if b.label == "btn_save" then save_rec = b end end
+ok(save_rec ~= nil, "the footer's Save button")
+local cfg_path0 = cfg.path
+cfg.path = "../_tmp/ui_i18n_config.ini"
+local tough_box, max_box = UI.inputs.ai_toughness_health_pct, UI.inputs.ai_host_cap_max
+local dmg_box, per_box = UI.inputs.ai_toughness_damage_pct, UI.inputs.ai_host_cap_per_player
+cfg.set("ai_host_cap_max", 320)          -- the host's own value before: kept when the box holds no number
+if tough_box then tough_box._text = "40" end
+if max_box then max_box._text = "abc" end
+if dmg_box then dmg_box._text = "30 %" end
+if per_box then per_box._text = "1,5" end
+local n_lines = #log_lines
+if save_rec then save_rec.fn() end
+ok(cfg.get("ai_toughness_health_pct") == 40, "typed 40 + Save: ai_toughness_health_pct = 40")
+ok(cfg.get("ai_host_cap_max") == 320, "not a number + Save: the value it had (320), not the default")
+ok(max_box ~= nil and tostring(max_box._text) == "320", "its box shows the value kept: " .. tostring(max_box and max_box._text))
+ok(cfg.get("ai_toughness_damage_pct") == 30 and dmg_box ~= nil and tostring(dmg_box._text) == "30",
+    "'30 %' + Save: 30, its box shows 30")
+ok(cfg.get("ai_host_cap_per_player") == 1 and per_box ~= nil and tostring(per_box._text) == "1",
+    "'1,5' + Save: 1, its box shows 1")
+local num_note
+for i = n_lines + 1, #log_lines do
+    if log_lines[i]:find("[TOAST] Not a number: ", 1, true) then num_note = log_lines[i] end
+end
+ok(num_note ~= nil and num_note:find(log.ascii(i18n.label("ai_host_cap_max")), 1, true) ~= nil
+    and not num_note:find(log.ascii(i18n.label("ai_toughness_damage_pct")), 1, true),
+    "a notice names the box with no number (only it): " .. tostring(num_note))
+ok(cfg.set("ai_host_cap_max", "") == false and cfg.get("ai_host_cap_max") == 320, "an empty box: kept as well")
+ok(cfg.set("ai_host_cap_max", "250 zombies") == true and cfg.get("ai_host_cap_max") == 250, "'250 zombies': 250")
+ok(cfg.set("ai_host_cap_max", "1e3") == true and cfg.get("ai_host_cap_max") == 1000, "a number as Lua reads it: as before")
+cfg.path = cfg_path0
+cfg.set("ai_toughness_health_pct", 25)
+cfg.set("ai_toughness_damage_pct", 15)
+cfg.set("ai_host_cap_per_player", 25)
+cfg.set("ai_host_cap_max", 300)
+if tough_box then tough_box._text = "25" end
+if max_box then max_box._text = "300" end
+if dmg_box then dmg_box._text = "15" end
+if per_box then per_box._text = "25" end
 -- tooltips carry the full description
 local cb = UI.checks.no_pause[1]
 ok(cb._tip == i18n.desc("no_pause"), "tooltip = full description")
@@ -388,20 +453,63 @@ ok(UI.players_title._text == "Players (2)" and UI.player_rows[1].name._text == "
     and UI.player_rows[2].name._text == "Bob" and UI.player_rows[2].ping._text == "42 ms"
     and UI.player_rows[2].state._text == "in game", "host: players section lists the host and Bob")
 ok(UI.disconnect_row._vis == 1 and UI.host_row._vis == 1, "host in game: neither Disconnect nor Open the world")
+-- the players table (top right): hidden while the panel is open (the panel lists them)
+UI.update_players_hud()
+ok(UI.players_hud._vis == 1 and UI.players_hud_model().why == "panel", "players table hidden while the panel is open")
+UI.set_open(false)
+ok(UI.players_hud._vis == 3, "players table shown when the panel closes (hit-test invisible)")
+local hm = UI.players_hud_model()
+ok(hm.visible and hm.title == "Players: 2" and hm.hint == "F8 to hide", "host table title / hint")
+ok(hm.rows[1].name == "Me (you)" and hm.rows[1].ping == "" and hm.rows[2].name == "Bob" and hm.rows[2].ping == "42 ms",
+    "host table: the host without a ping, then Bob with his ping")
+ok(UI.hud_heads.name._text == "Player" and UI.hud_heads.ping._text == "Ping" and UI.hud_rows[2].name._text == "Bob"
+    and UI.hud_rows[2].ping._text == "42 ms" and UI.hud_rows[3].row._vis == 1, "host table widgets: heads, Bob, no third row")
 session.state.role = "client"
 session.state.client = { host_name = "Alice", ping = 55, host_version = "0.6.99" }
+session.state.client.roster = {
+    { name = "Alice", state = "host", host = true },
+    { name = "Me", state = "game", me = true, ping = 70 },
+    { name = "Bob", state = "dead", ping = 90 },
+}
+UI.update_players_hud()
+hm = UI.players_hud_model()
+ok(hm.visible and hm.title == "Players: 3", "client table: three players")
+ok(hm.rows[1].name == "Alice" and hm.rows[1].ping == "55 ms",
+    "client table: its own ping to the host (its own measure) on the host's row")
+ok(hm.rows[2].name == "Me (you)" and hm.rows[2].ping == "" and hm.rows[3].name == "Bob" and hm.rows[3].ping == "",
+    "client table: no ping on its own row or another client's")
+ok(UI.hud_rows[1].ping._text == "55 ms" and UI.hud_rows[3].name._text == "Bob" and UI.hud_rows[3].row._vis ~= 1,
+    "client table widgets")
+session.state.client.ping = nil
+hm = UI.players_hud_model()
+ok(hm.rows[1].ping == "70 ms", "client table: no own measure yet: the host's measure of this client")
+session.state.client.ping = 55
+-- the key hides / shows it and keeps the setting
+UI.on_players_key()
+ok(cfg.get("players_hud") == false and UI.players_hud._vis == 1 and UI.players_hud_model().why == "off",
+    "key: table hidden, setting off")
+UI.on_players_key()
+ok(cfg.get("players_hud") == true and UI.players_hud._vis == 3, "key again: table shown")
+-- nobody else: no table
+local saved_roster = session.state.client.roster
+session.state.role = "standalone"
+UI.update_players_hud()
+ok(UI.players_hud._vis == 1, "single player: no table")
+session.state.role = "client"
+session.state.client.roster = saved_roster
+UI.set_open(true)
 UI.refresh_status()
 ok(UI.status_title._text == "You are in Alice's world.", "status client: " .. tostring(UI.status_title._text))
-UI.update_chip()
-ok(UI.chip_text._text == "Host Alice, ping 55 ms", "chip: " .. tostring(UI.chip_text._text))
 i18n.set("ru")
 ok(UI.status_title._text == "Вы в мире хоста Alice.", "status relabelled to Russian: " .. tostring(UI.status_title._text))
--- death opens the character tab
 UI.set_open(false)
-UI.set_dead(true)
-ok(UI.open and UI.tab == "char", "death opens the character tab")
-ok(UI.respawn_row._vis ~= 1, "respawn button shown when dead")
-UI.set_dead(false)
+UI.update_players_hud()
+ok(UI.hud_title._text == "Игроки: 3" and UI.hud_heads.ping._text == "Пинг" and UI.hud_rows[2].name._text == "Me (вы)",
+    "players table relabelled to Russian: " .. tostring(UI.hud_title._text))
+-- no "respawn near the host" row any more (the game's own respawn buttons)
+ok(UI.set_dead == nil and UI.respawn_row == nil and session.ui_hooks.dead == nil, "no respawn row, no death hook")
+UI.set_open(false)
+UI.pick_tab("char")
 -- a world change drops every reference
 UI.forget_world("loadmap")
 ok(UI.widget == nil and #UI.buttons == 0 and next(UI.checks) == nil, "forget_world drops references")
@@ -443,9 +551,17 @@ for _, pt in ipairs(i18n.TOAST_PATTERNS) do tcounts[pt[3]] = tcounts[pt[3]] + 1 
 io.stderr:write(string.format("classes: log.say keys game=%d mod=%d; toast texts/patterns game=%d mod=%d%s",
     counts.game, counts.mod, tcounts.game, tcounts.mod, string.char(10)))
 
--- routing: gameplay -> the game's widget (toast_sink), the mod -> the panel-style toast
+-- routing (rule of 2026-11-13): everything goes the game's way (toast_sink: its
+-- widget in a world; sdc_lobby falls back to the mod's toast with no HUD or the
+-- panel open); only the mod's own failures (kind err) -> the panel-style toast
 local game_got = {}
 log.toast_sink = function(text, kind, seconds, class) game_got[#game_got + 1] = { text = text, class = class } end
+local function game_got_n() return game_got end
+local function last_route_text()
+    local g = game_got[#game_got]
+    local m = UI.toasts[#UI.toasts]
+    return (m and m.text) or (g and g.text)
+end
 UI.toasts = {}
 cfg.set("language", "ru")
 log.say("player_joined", "ok", 6, "Bob")
@@ -457,23 +573,32 @@ ok(#game_got == 2 and #UI.toasts == 1 and UI.toasts[1].class == "mod" and UI.toa
     "listen failed -> the mod's toast")
 log.toast("Мод обновил сетевые настройки игры. Перезапустите игру один раз, чтобы открыть мир для друзей или подключиться.",
     "warn", 12, "steam restart")
-ok(#game_got == 2 and #UI.toasts == 2 and UI.toasts[2].class == "mod", "Steam settings -> the mod's toast")
+ok(#game_got == 3 and #UI.toasts == 1, "a mod warning (not a failure) -> the game's way")
+ok(i18n.topic("Мод обновил сетевые настройки игры. Перезапустите игру один раз, чтобы открыть мир для друзей или подключиться.")
+    == "mod", "its topic is still the mod's")
 log.toast("Some new mod failure", "err", 6)
-ok(#UI.toasts == 3 and UI.toasts[3].class == "mod", "an unlisted error -> the mod's toast")
+ok(#UI.toasts == 2 and UI.toasts[2].class == "mod", "an unlisted error -> the mod's toast")
 log.toast("Some new gameplay line", "info", 6)
-ok(#game_got == 3, "an unlisted info -> the game's widget")
+ok(#game_got == 4, "an unlisted info -> the game's widget")
 UI.slow_tick()
 ok(UI.toast_box._vis == 3 and UI.toast_hint._vis == 3, "mod error toast shown with the report hint")
 ok(type(UI.toast_hint._text) == "string" and UI.toast_hint._text:find("Сообщить об ошибке", 1, true) ~= nil,
     "hint names the panel's report section: " .. tostring(UI.toast_hint._text))
 UI.toasts = {}
+-- with the join cover on (the default) a lost connection shows on it (mock_join_cover); off: the mod's toast
 log.say("connection_lost", "warn", 8)
+ok(#UI.toasts == 0 and UI._jc.s and UI._jc.s.finished == "failed", "a lost connection with the join cover on: on the cover, no toast")
+UI._jc.dismiss("test")
+require("sdc_config").set("join_cover", false)
+log.say("connection_lost", "warn", 8)
+require("sdc_config").set("join_cover", true)
 UI.toasts_dirty = true
 UI.slow_tick()
-ok(#UI.toasts == 1 and UI.toasts[1].class == "mod" and UI.toast_hint._vis == 1, "a lost connection: mod toast, no report hint")
+ok(#UI.toasts == 0 and #game_got == 5 and game_got[5].text == "Соединение с хостом потеряно.",
+    "a lost connection (cover off): the game's way, no mod toast")
 UI.disabled = true
 log.say("listen_failed", "err", 10)
-ok(#game_got == 4, "menu disabled: mod messages go the game's way")
+ok(#game_got == 6, "menu disabled: even the mod's failures go the game's way")
 UI.disabled = false
 -- the game's fallback (no HUD) shows gameplay toasts without the hint
 UI.toasts = {}
@@ -510,7 +635,7 @@ ok(link ~= nil and link.tab == nil, "footer link on every tab")
 UI.toasts = {}
 UI.on_bug_form()
 ok(launched[#launched] == UI.issue_url(), "the form button launches the issue url")
-ok(#UI.toasts == 1 and UI.toasts[1].class == "mod", "a mod toast says where it opened")
+ok(#UI.toasts + #game_got_n() >= 1, "a toast says where it opened (the game's way: the panel's toast while it is open)")
 UI.on_bug_logs()
 ok(launched[#launched] == "file:///C:/Games/SurrounDead/Binaries/Win64/ue4ss", "the folder button launches a file:// url: "
     .. tostring(launched[#launched]))
@@ -549,10 +674,19 @@ UI.refresh_status()
 ok(not vis(UI.players_box) and UI.status_title._text == "Your world is closed to friends.",
     "players: menu, world closed -> no list, the status says it")
 ok(vis(UI.host_row) and not vis(UI.disconnect_row), "header: Open the world in the main menu")
--- single player: no list, no Open the world (it needs the main menu)
+-- single player: no list; no Open the world until there is a character
 ue.in_main_menu = function() return false end
 UI.refresh_status()
-ok(not vis(UI.players_box) and not vis(UI.host_row), "players: single player")
+ok(not vis(UI.players_box) and not vis(UI.host_row), "players: single player, no character yet")
+-- with a character: Open the world (the game saves and loads it again open)
+local real_lp = ue.local_pawn
+ue.local_pawn = function() return {} end
+UI.refresh_status()
+ok(vis(UI.host_row) and vis(UI.host_caption_world) and not vis(UI.host_caption_menu),
+    "single player world: Open the world with the reload caption")
+ok(UI.host_caption_world._text:find("loads this world again", 1, true) ~= nil, "reload caption: " .. tostring(UI.host_caption_world._text))
+ue.local_pawn = real_lp
+UI.refresh_status()
 -- a connection pending: Disconnect in the header
 ue.has_pending_connection = function() return true end
 UI.refresh_status()
@@ -596,8 +730,8 @@ session.roster = function()
              { name = "An-Extremely-Long-Player-Name-From-Steam", state = "game", ping = 5 } }
 end
 UI.refresh_status()
-ok(utf8.len(UI.player_rows[2].name._text) <= 26 and UI.player_rows[2].name._text:find("…", 1, true) ~= nil,
-    "players: long names cut: " .. UI.player_rows[2].name._text)
+ok(UI.player_rows[2].name._text == "An-Extremely-Long-Playe…",
+    "players: long names cut past 24 characters: " .. UI.player_rows[2].name._text)
 session.roster = saved_roster
 -- client: the host's list, Disconnect in the header
 session.state.role = "client"
@@ -621,21 +755,23 @@ i18n.set("en")
 session.state.role, session.state.client = "standalone", nil
 ue.in_main_menu = function() return true end
 
--- Steam block without the module: one line about 0.7.0
+-- Steam block without the module (a broken install): an error line
 package.loaded["sdc_steamlink"] = nil
 UI.steam_missing_at = nil
 UI.refresh_status()
-ok(vis(UI.steam_later) and UI.steam_later._text:find("0.7.0", 1, true) ~= nil and not vis(UI.steam_status_row)
-    and not vis(UI.steam_invite) and vis(UI.steam_to_ip) and not vis(UI.steam_help),
-    "steam: no module -> the 0.7.0 line and the way to the IP tab: " .. tostring(UI.steam_later and UI.steam_later._vis) .. "/" .. tostring(UI.steam_status_row and UI.steam_status_row._vis) .. "/" .. tostring(UI.steam_invite and UI.steam_invite._vis) .. "/" .. tostring(UI.steam_to_ip and UI.steam_to_ip._vis) .. "/" .. tostring(UI.steam_help and UI.steam_help._vis))
+ok(vis(UI.steam_status_row) and UI.steam_status._text == "Steam link error." and not vis(UI.steam_invite)
+    and vis(UI.steam_to_ip) and not vis(UI.steam_help),
+    "steam: no module -> an error line and the way to the IP tab: " .. tostring(UI.steam_status_row and UI.steam_status_row._vis)
+    .. "/" .. tostring(UI.steam_status and UI.steam_status._text) .. "/" .. tostring(UI.steam_invite and UI.steam_invite._vis)
+    .. "/" .. tostring(UI.steam_to_ip and UI.steam_to_ip._vis) .. "/" .. tostring(UI.steam_help and UI.steam_help._vis))
 UI.user_tab = nil
 ok(UI.default_tab() == "ip", "default tab without the Steam link: IP")
 -- a stand-in module in every state
 local sl_calls = {}
 local sl_friends = {
     { id = "1", name = "Alice", joinable = true, status = "hosting, 0.7.0" },
-    { id = "2", name = "Boris", joinable = false },
-    { id = "3", name = "Cleo", joinable = true },
+    { id = "2", name = "Boris", joinable = false, status = "in the game" },
+    { id = "3", name = "Cleo", joinable = true, status = "hosting" },
 }
 local sl_state, sl_detail, sl_restart, sl_key = "ready", nil, false, nil
 local sl_join_result = { true }
@@ -657,8 +793,7 @@ local expect = {
 }
 for _, st in ipairs({ "off", "no_steam", "starting", "ready", "hosting", "joining", "connected", "error" }) do
     sl_state = st
-    sl_detail = (st == "error" and "The Steam helper stopped.") or (st == "hosting" and "Open to your Steam friends. Connected: 1")
-        or (st == "no_steam" and "Steam is not running.") or nil
+    sl_detail = expect[st]   -- the module's own sentence (sdc_steamlink.status gives one for every state)
     UI.refresh_status()
     local usable = st == "ready" or st == "hosting" or st == "connected"
     ok(vis(UI.steam_status_row) and UI.steam_status._text == expect[st] and not vis(UI.steam_later),
@@ -673,7 +808,7 @@ sl_state, sl_detail, sl_key = "error", "Restart the game once: the mod changed i
 UI.refresh_status()
 ok(UI.steam_status._text == "Restart the game once: the mod changed its network settings."
     and not vis(UI.steam_invite) and vis(UI.steam_to_ip), "steam: restart needed (error state)")
-sl_state, sl_detail, sl_key, sl_restart = "ready", nil, nil, true
+sl_state, sl_detail, sl_key, sl_restart = "ready", expect.ready, nil, true
 UI.refresh_status()
 ok(vis(UI.steam_detail) and UI.steam_detail._text:find("Restart the game once", 1, true) ~= nil,
     "steam: restart needed under another state")
@@ -684,8 +819,8 @@ ok(UI.friend_rows[1].name._text == "Alice" and UI.friend_rows[2].name._text == "
     and UI.friend_rows[3].name._text == "Boris", "steam: joinable friends first")
 ok(vis(UI.friend_rows[1].join) and vis(UI.friend_rows[2].join) and not vis(UI.friend_rows[3].join),
     "steam: Join only on joinable friends")
-ok(UI.friend_rows[1].status._text == "hosting, 0.7.0" and UI.friend_rows[3].status._text == "playing",
-    "steam: the module's status text, else ours")
+ok(UI.friend_rows[1].status._text == "hosting, 0.7.0" and UI.friend_rows[3].status._text == "in the game",
+    "steam: the module's status text")
 ok(vis(UI.steam_help) and not vis(UI.steam_to_ip), "Steam ready: how it works, no pointer to IP")
 sl_friends = {
     { id = "1", name = "Alice", joinable = true, version = session.VERSION, status = "hosting" },
@@ -698,8 +833,8 @@ ok(UI.can_join_friend({ joinable = true }) and not UI.can_join_friend({ joinable
     and not UI.can_join_friend({ joinable = true, version = "0.1" }), "can_join_friend")
 sl_friends = {
     { id = "1", name = "Alice", joinable = true, status = "hosting, 0.7.0" },
-    { id = "2", name = "Boris", joinable = false },
-    { id = "3", name = "Cleo", joinable = true },
+    { id = "2", name = "Boris", joinable = false, status = "in the game" },
+    { id = "3", name = "Cleo", joinable = true, status = "hosting" },
 }
 UI.refresh_status()
 UI.user_tab = nil
@@ -727,14 +862,12 @@ join_btn.fn()
 ok(sl_calls[#sl_calls] == "join 1" and #UI.toasts == 0, "steam: Join calls join(id) of that row (started: no toast)")
 sl_join_result = { false, "You are connected to another server.", "already_client" }
 join_btn.fn()
-ok(#UI.toasts == 1 and UI.toasts[1].text == "You are connected to another server." and UI.toasts[1].class == "mod",
-    "steam: a refused join shows the module's reason")
+ok(last_route_text() == "You are connected to another server.", "steam: a refused join shows the module's reason")
 sl_join_result = { true }
 UI.toasts = {}
 invite_btn.fn()
-ok(sl_calls[#sl_calls] == "invite" and #UI.toasts == 1 and UI.toasts[1].class == "mod"
-    and UI.toasts[1].text == "The Steam overlay did not open.",
-    "steam: Invite calls invite(); its failure is a mod toast")
+ok(sl_calls[#sl_calls] == "invite" and last_route_text() == "The Steam overlay did not open.",
+    "steam: Invite calls invite(); its failure is told")
 sl_friends = {}
 UI.refresh_status()
 ok(vis(UI.steam_none) and not vis(UI.friend_rows[1].row), "steam: no friends playing")
@@ -745,7 +878,7 @@ ok(UI.status_body._text == "Nobody has joined yet. Friends join through Steam or
     "host hint mentions Steam")
 package.loaded["sdc_steamlink"] = function() end   -- a broken module value
 UI.refresh_status()
-ok(vis(UI.steam_later), "steam: a broken module counts as missing")
+ok(UI.steam_status._text == "Steam link error." and vis(UI.steam_to_ip), "steam: a broken module counts as missing")
 package.loaded["sdc_steamlink"] = nil
 session.state.role = "standalone"
 

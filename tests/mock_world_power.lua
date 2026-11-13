@@ -272,6 +272,11 @@ local function timeline(w, name, on_finish)
     t._m.Play = function(self) self._playing, self._rev = true, false; self._calls[#self._calls + 1] = { "Play" } end
     t._m.PlayFromStart = function(self) self._pos, self._playing, self._rev = 0, true, false; self._calls[#self._calls + 1] = { "PlayFromStart" } end
     t._m.Reverse = function(self) self._playing, self._rev = true, true; self._calls[#self._calls + 1] = { "Reverse" } end
+    -- (UTimelineComponent: Stop ends the play without the finished event; SetNewTime
+    -- moves the position and runs the update only)
+    t._m.Stop = function(self) self._playing = false; self._calls[#self._calls + 1] = { "Stop" } end
+    t._m.GetTimelineLength = function() return 1 end
+    t._m.SetNewTime = function(self, v) self._pos = v; self._calls[#self._calls + 1] = { "SetNewTime", v } end
     w.tls[#w.tls + 1] = t
     return t
 end
@@ -492,12 +497,17 @@ local function objects(w)
             if not self._p["DamageToActivate?"] and self._p["CanInteract?"] then self:Event_Door() end
             post(w, P.cbox .. ":OnExecuteInteract", self, actor, opt)
         end,
+        -- the levers' end (TL_Levers__FinishedFunc -> @3918): its doors unlocked,
+        -- its switches toggled (Event_LightSwitch), no more interaction
+        TL_Levers__FinishedFunc = function(self)
+            self._calls[#self._calls + 1] = { "TL_Levers__FinishedFunc" }
+            for _, d in ipairs(self._p.Doors) do d._p.Unlocked = true; d:OnRep_Unlocked() end
+            for _, s in ipairs(self._p.LightSwitches) do s:Event_LightSwitch() end
+            self._p["CanInteract?"] = false
+        end,
     })
     levers = timeline(w, "TL_Levers_" .. w.id, function(rev)
-        if rev then return end
-        for _, d in ipairs(o.cbox._p.Doors) do d._p.Unlocked = true; d:OnRep_Unlocked() end
-        for _, s in ipairs(o.cbox._p.LightSwitches) do s:Event_LightSwitch() end
-        o.cbox._p["CanInteract?"] = false
+        if not rev then o.cbox:TL_Levers__FinishedFunc() end
     end)
     o.cbox._p.TL_Levers = levers
     -- bunker doors, the lever, the generator, the scanner
@@ -640,6 +650,8 @@ local function objects(w)
             post(w, P.siren .. ":OnExecuteInteract", self, actor, opt)
         end,
     })
+    -- the level loaded again: a new siren actor (silent, its flip-flop false) at the old one's address
+    o.siren_new = function() flip = false; o.siren._p.Playing = false end
     local audio = new(w, { "AudioComponent" }, "RadioAudio_" .. w.id, { VolumeMultiplier = 0 }, {
         SetVolumeMultiplier = function(self, v) self._p.VolumeMultiplier = v end,
     })
@@ -926,10 +938,13 @@ check(CO.siren._p.Playing == false, "the client's own random siren stopped")
 WORLD = HW; HO.siren:ActivateSiren()   -- the host's random timer
 ticks(2, 0.25)
 check(CO.siren._p.Playing == true, "the host's siren plays on the client")
-WORLD = CW; CO.siren:OnExecuteInteract(CW.pawn, OPT1)   -- flip-flop: on here (no change)
-WORLD = CW; CO.siren:OnExecuteInteract(CW.pawn, OPT1)   -- off
+-- the press is a flip-flop of each machine's own: after a change it did not make
+-- (the host's state applied here) it is put back in step, so ONE press switches it
+-- (before 0.7.3 the first press repeated "on" and did nothing)
+WORLD = CW; CO.siren:OnExecuteInteract(CW.pawn, OPT1)   -- one press: off
 run_timers(CW); deliver()
-check(HO.siren._p.Playing == false, "the client's press stops the host's siren (its AI noise)")
+check(CO.siren._p.Playing == false, "the client's first press switches the host's siren off here")
+check(HO.siren._p.Playing == false, "and stops the host's siren (its AI noise)")
 ticks(2, 0.25)
 check(CO.siren._p.Playing == false, "off on the client")
 
@@ -947,6 +962,37 @@ check(HO.radio._p.Audio._p.VolumeMultiplier == 0, "the step reached the host")
 ticks(10, 0.25)
 check(CO.sw2._p["On?"] == true and CO.BP_LaboratoryLight2_C_3._p["LightOn?"] == true, "4 s after its step the client got every state again")
 check(CO.radio._p.Audio._p.VolumeMultiplier == 0, "and kept its own step")
+
+print("== P10b. sirens: the client switches it on, the host's own first press switches it off; no loop")
+WORLD = CW; CO.siren:OnExecuteInteract(CW.pawn, OPT1)   -- on
+run_timers(CW); deliver()
+ticks(2, 0.25)
+check(HO.siren._p.Playing == true and CO.siren._p.Playing == true, "the client's press: on, on both")
+local al0 = H.world.stats.siren_aligned + C.world.stats.siren_aligned
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- the host's own press
+ticks(2, 0.25)
+check(HO.siren._p.Playing == false and CO.siren._p.Playing == false, "the host's first press: off, on both")
+ticks(6, 0.25)
+check(H.world.stats.siren_aligned + C.world.stats.siren_aligned == al0 + 1,
+    "put in step once (the client's, after the host's change), then nothing more")
+
+print("== P10c. a press the host did not see (before its hooks): putting it in step does not switch the siren")
+local SIREN_EXEC = P.siren .. ":OnExecuteInteract"
+local saved_hooks = HW.hooks[SIREN_EXEC]
+HW.hooks[SIREN_EXEC] = nil
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- unseen: its flip-flop moves, the module's note does not
+HW.hooks[SIREN_EXEC] = saved_hooks
+ticks(2, 0.25)
+check(HO.siren._p.Playing == true and CO.siren._p.Playing == true, "that press switched it on, and it stays on (on both)")
+local al1 = H.world.stats.siren_aligned + C.world.stats.siren_aligned
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- the host's next press
+ticks(2, 0.25)
+check(HO.siren._p.Playing == false and CO.siren._p.Playing == false, "the host's next press switches it off, on both")
+ticks(8, 0.25)
+local al2 = H.world.stats.siren_aligned + C.world.stats.siren_aligned
+ticks(8, 0.25)
+check(H.world.stats.siren_aligned + C.world.stats.siren_aligned == al2 and al2 - al1 <= 1 and HO.siren._p.Playing == false,
+    "then it stays off and nothing keeps pressing it (no loop)")
 
 print("== P12. a joining client gets the host's states (snapshot)")
 CO.reset()
@@ -996,6 +1042,14 @@ check(HO.sdoor3._p.Unlocked == true and HO.sdoor3._p["XPGiven?"] == true and HO.
     "doors and scanner as saved")
 local saved_cbox = txt and txt:match("BP_LaboratoryCircuitBox_C_1=(%d)")
 check(saved_cbox == "2" and st(HPW, HW, HO.cbox) == "2", "the circuit box done")
+-- its levers' chain ran inside the restore: when every timeline has ended, its
+-- switch is still as saved (before: the levers ended after the restore and
+-- toggled it back - the next save had it the other way, and so on)
+local saved_sw2 = txt and txt:match("BP_LaboratoryLightSwitch_C_2=(%w)")
+finish(HW)
+ticks(20, 0.25)
+check(saved_sw2 ~= nil and st(HPW, HW, HO.sw2) == saved_sw2,
+    "the box's switch keeps its saved state after the levers end (" .. tostring(saved_sw2) .. " / " .. st(HPW, HW, HO.sw2) .. ")")
 WORLD = HW; fire(HW, P.delete, param(nil), param(HW.pc), param("Slot1"), param(0))
 check(file_text(SAVE_FILE) == nil, "the deleted slot's file is gone")
 
@@ -1171,6 +1225,29 @@ print("== P16. status")
 WORLD = HW; print(H.world.status_line())
 WORLD = CW; print(C.world.status_line())
 check(H.world.status_line():find("puzzle objs=", 1, true) ~= nil, "status line has the puzzle part")
+
+print("== P10d. the press's memory: kept over a role change, forgotten with the world (a reloaded siren at the old address)")
+local SIREN_P = LVL .. "BP_Siren_C_1"
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- the host's press: on
+ticks(2, 0.25)
+check(HO.siren._p.Playing == true and HPW.flip[SIREN_P] and HPW.flip[SIREN_P].v == true, "on: its flip-flop noted on")
+WORLD = HW; H.world.reset("role host -> host")
+check(HPW.flip[SIREN_P] and HPW.flip[SIREN_P].v == true, "a role change (the same actors): the note kept")
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- off again (its flip-flop is in step)
+ticks(2, 0.25)
+check(HO.siren._p.Playing == false, "the next press after the role change: off")
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- on: noted on
+ticks(2, 0.25)
+-- the host loads the save: a new siren, silent, flip-flop false, the same path and address
+HO.siren_new()
+WORLD = HW; H.world.reset("world:loadmap")
+check(HPW.flip[SIREN_P] == nil, "a world reset forgets the note")
+WORLD = HW; HO.siren:ActivateSiren()   -- the host's random timer switches the new one on
+ticks(4, 0.25)
+check(HO.siren._p.Playing == true, "the random timer's siren plays")
+WORLD = HW; HO.siren:OnExecuteInteract(HW.pawn, OPT1)   -- the host's first press
+ticks(2, 0.25)
+check(HO.siren._p.Playing == false, "the host's first press after the reload switches it off")
 
 os.remove(SAVE_FILE)
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))

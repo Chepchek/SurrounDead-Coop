@@ -452,18 +452,17 @@ local function doc(name)
     return d and json_dec(d) or nil
 end
 
-local SAVE_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:SaveGameToSlot"
+-- 2026-11-13 (critic B1/B5): one save hook, EMS's AsyncSaveActors, pre only
 local EMS_SAVE = "/Script/EasyMultiSave.EMSAsyncSaveGame:AsyncSaveActors"
 local SAVED = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:OnCompleted_9CDBA9034C950D925C1539BE037C23EF"
 local FAILED = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:OnFailed_9CDBA9034C950D925C1539BE037C23EF"
 local DELETE = "/Script/EasyMultiSave.EMSFunctionLibrary:DeleteAllSaveDataForSlot"
 local function hook(path) local h = hooks[path]; return h and h[#h] end
--- the game saves into `slot`: both save hooks, then (end = true / false /
+-- the game saves into `slot`: the save hook, then (end = true / false /
 -- nil) the game's "actors saved" / "failed" / nothing yet
 local function game_save(slot, done)
     current_slot = slot
-    hook(SAVE_FN).pre(param(host_pc))
-    hook(EMS_SAVE).post(param(nil), param(nil), param(host_pc), param(3))
+    hook(EMS_SAVE).pre(param(nil), param(host_pc), param(3))
     run_delayed()
     if done ~= nil then
         hook(done and SAVED or FAILED).pre(param(host_pc))
@@ -646,7 +645,7 @@ check(exists(SAVEDIR .. "CoopA_SDCoop_" .. KA .. "_c2.sav") and exists(SAVEDIR .
 current_slot = "CoopA"
 hook(SAVED).pre(param(host_pc))
 run_delayed()
-hook(SAVE_FN).pre(param(host_pc))
+hook(EMS_SAVE).pre(param(nil), param(host_pc), param(3))
 run_delayed()
 check(doc("CoopA_SDCoop_commit.json").gen == 4, "the game's save end seen first: committed with the records")
 -- a save the game never reports done: dropped after the wait

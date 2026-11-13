@@ -46,9 +46,6 @@
 --   * Every tick: each remote player's pawn mesh is set to
 --     AlwaysTickPoseAndRefreshBones. The knife swings on the host, and AI
 --     traces meet the client's real pose.
---   * Log lines (first few) and counters: a client's damage to an animal
---     (the animal's ReceiveAnyDamage), and an animal's damage to a client's
---     pawn (GameplayStatics.ApplyDamage, post).
 -- No object is kept: each comes from the hook or from this tick's controllers.
 --
 -- 3. Zombies hit a client from stale hands (work\audit\npc_bosses.md).
@@ -70,14 +67,12 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local ctx = require("sdc_ctx")
 
-local M = { stats = { animals = 0, pawns = 0, client_hits = 0, animal_hits = 0, zombies = 0, zombies_back = 0 } }
+local M = { stats = { animals = 0, pawns = 0, zombies = 0, zombies_back = 0 } }
 local core
 
 local clock = os.clock
 local addr = ctx.addr
 
-local ALWAYS = 0                   -- EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
-local TICK_PROP = "VisibilityBasedAnimTickOption"
 local ZOMBIE_DEFAULT = 2           -- OnlyTickMontagesWhenNotRendered (BP_MasterZombie CharacterMesh0)
 local ZOMBIE_NEAR_CM = 800         -- an attack this close to a remote player
 local ZOMBIE_FAR_CM = 3000         -- back to its own value beyond this from every remote player
@@ -90,35 +85,7 @@ local ATTACKERS = {
     "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C",
     "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
 }
-local ANIMALS = {
-    "/Game/AI/Animals/Deer/BP_AnimalDeer.BP_AnimalDeer_C", "/Game/AI/Animals/Rabbit/BP_AnimalRabbit.BP_AnimalRabbit_C",
-    "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C", "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
-}
-local APPLY_DAMAGE = "/Script/Engine.GameplayStatics:ApplyDamage"
 local BB_LIB = "/Script/AIModule.Default__AIBlueprintHelperLibrary"
-
-local function get(p)
-    if p == nil then return nil end
-    local ok, v = pcall(function() return p:get() end)
-    if ok then return v end
-    return nil
-end
-
-local function num(v)
-    if type(v) == "number" then return v end
-    return -1
-end
-
--- The mesh of `actor` -> full ticking. Returns the previous value when it
--- changed it, nil when it was already set (or there is no mesh).
-local function full_pose(actor)
-    local mesh = ue.prop(actor, "Mesh")
-    if not ue.valid(mesh) then return nil end
-    local v = ue.prop(mesh, TICK_PROP)
-    if v == ALWAYS then return nil end
-    if not ue.set_prop(mesh, TICK_PROP, ALWAYS) then return nil end
-    return v == nil and "?" or v
-end
 
 -- "<pawn> (client <pc>)" / "<pawn> (host)" / "<actor>", for log lines
 local function who(actor)
@@ -145,7 +112,7 @@ end
 local function on_attack(c)
     local a = c:get()
     if not ue.valid(a) or ue.prop(a, "IsDead?") == true then return end
-    local was = full_pose(a)
+    local was = core.full_pose(a, "?")
     if was == nil then return end
     M.stats.animals = M.stats.animals + 1
     if core.first("offscreen.animal", 5) then
@@ -178,15 +145,15 @@ local function on_zombie_attack(c)
     local rec = zticking[a]
     if rec and rec.key == key then
         rec.last = clock()
-        if ue.prop(mesh, TICK_PROP) ~= ALWAYS then ue.set_prop(mesh, TICK_PROP, ALWAYS) end
+        if ue.prop(mesh, core.TICK_PROP) ~= core.ALWAYS_TICK then ue.set_prop(mesh, core.TICK_PROP, core.ALWAYS_TICK) end
         return
     end
     local loc = ue.location(z)
     if not loc then return end
     local v, d = nearest_viewer(loc, ZOMBIE_NEAR_CM)
     if not v then return end
-    local was = ue.prop(mesh, TICK_PROP)
-    if was == ALWAYS or not ue.set_prop(mesh, TICK_PROP, ALWAYS) then return end   -- not ours to revert
+    local was = ue.prop(mesh, core.TICK_PROP)
+    if was == core.ALWAYS_TICK or not ue.set_prop(mesh, core.TICK_PROP, core.ALWAYS_TICK) then return end   -- not ours to revert
     zticking[a] = { key = key, was = type(was) == "number" and was or ZOMBIE_DEFAULT, last = clock() }
     M.stats.zombies = M.stats.zombies + 1
     if core.first("offscreen.zombie", 5) then
@@ -199,23 +166,18 @@ end
 local function zombie_pass(now)
     if next(zticking) == nil or zpass.broken or now - zpass.last < ZOMBIE_PASS_S then return end
     zpass.last = now
-    local cls, gps, wc = ue.find_object(core.ZOMBIE_CLASS), ue.gameplay_statics(), ue.local_pc()
-    if not cls or not gps or not wc then return end
     -- the engine's actor iterator: live actors of this world only
-    local out = {}
-    local ok, err = pcall(function() gps:GetAllActorsOfClass(wc, cls, out) end)
-    if not ok then
+    local out, err = ue.actors_of(core.ZOMBIE_CLASS)
+    if out == false then
         zpass.broken = true
         zticking = {}
         log.warn("ai: offscreen: GetAllActorsOfClass failed (%s); attacking zombies keep ticking", tostring(err))
         return
     end
+    if not out then return end
     local live = {}
     for i = 1, #out do
-        -- out-array elements come as params (read with :get())
-        local e = out[i]
-        local okg, z = pcall(function() return e:get() end)
-        if not okg then z = e end
+        local z = ue.elem(out[i])
         local a = ue.valid(z) and addr(z) or nil
         local rec = a and zticking[a]
         if rec and ue.name(z) == rec.key then
@@ -231,7 +193,9 @@ local function zombie_pass(now)
             end
             if why then
                 local mesh = ue.prop(z, "Mesh")
-                if ue.valid(mesh) and ue.prop(mesh, TICK_PROP) == ALWAYS then ue.set_prop(mesh, TICK_PROP, rec.was) end
+                if ue.valid(mesh) and ue.prop(mesh, core.TICK_PROP) == core.ALWAYS_TICK then
+                    ue.set_prop(mesh, core.TICK_PROP, rec.was)
+                end
                 zticking[a] = nil
                 M.stats.zombies_back = M.stats.zombies_back + 1
                 if core.first("offscreen.zombie_back", 5) then
@@ -246,35 +210,6 @@ local function zombie_pass(now)
     end
 end
 
--- <Animal>.ReceiveAnyDamage(Damage, DamageType, InstigatedBy, DamageCauser),
--- post (host): a client's hit arrived.
-local function on_animal_damage(c, dmg_p, _, inst_p, causer_p)
-    local causer = get(causer_p)
-    local pc = core.remote_pc_of(get(inst_p), causer)
-    if not pc then return end
-    M.stats.client_hits = M.stats.client_hits + 1
-    if core.first("offscreen.hit", 5) then
-        local a = c:get()
-        log.info("ai: offscreen: %s took %.1f damage from %s (%s), health now %.1f", ue.short(a), num(get(dmg_p)),
-            ue.short(pc), ue.short(causer), num(ue.prop(a, "Health")))
-    end
-end
-
--- GameplayStatics.ApplyDamage(DamagedActor, BaseDamage, EventInstigator,
--- DamageCauser, DamageTypeClass) -> float, post (host): an animal hit a client.
-local function on_apply_damage(_, ret_p, victim_p, dmg_p, _, causer_p)
-    local causer = get(causer_p)
-    if not ue.valid(causer) or not core.is_animal(causer) then return end
-    local victim = get(victim_p)
-    if not core.is_remote_pc(ue.prop(victim, "Controller")) then return end
-    M.stats.animal_hits = M.stats.animal_hits + 1
-    if core.first("offscreen.bite", 5) then
-        local med = ue.prop(victim, "MedicalComponent")
-        log.info("ai: offscreen: %s hit %s: %.1f damage (applied %.1f), health now %.1f", ue.short(causer), who(victim),
-            num(get(dmg_p)), num(get(ret_p)), num(ue.prop(med, "Health")))
-    end
-end
-
 function M.init(c)
     core = c
     for _, path in ipairs(ATTACKERS) do
@@ -282,13 +217,6 @@ function M.init(c)
         core.hook({ path = path .. ":AttackPlayer", kind = "bp", role = "host", feature = "offscreen",
                     name = "offscreen." .. short, fn = on_attack })
     end
-    for _, path in ipairs(ANIMALS) do
-        local short = path:match("%.([%w_]+)$")
-        core.hook({ path = path .. ":ReceiveAnyDamage", kind = "bp", role = "host", feature = "offscreen",
-                    name = "offscreen.damage." .. short, fn = on_animal_damage })
-    end
-    core.hook({ path = APPLY_DAMAGE, kind = "post", role = "host", feature = "offscreen", name = "offscreen.bite",
-                fn = on_apply_damage })
     core.hook({ path = core.ZM .. "PlayAttackMontage", kind = "bp", role = "host", feature = "offscreen",
                 name = "offscreen.zombie", fn = on_zombie_attack })
 end
@@ -301,7 +229,7 @@ function M.host_tick(now)
     if not core.host.active then return end
     for _, pc in ipairs(core.S.remote_pcs or {}) do
         local pawn = ue.pawn_of(pc)
-        local was = pawn and core.has_tag(pawn, "Player") and full_pose(pawn)
+        local was = pawn and core.has_tag(pawn, "Player") and core.full_pose(pawn, "?")
         if was then
             M.stats.pawns = M.stats.pawns + 1
             if core.first("offscreen.pawn", 5) then
@@ -322,8 +250,8 @@ function M.status_line()
     local s = M.stats
     local n = 0
     for _ in pairs(zticking) do n = n + 1 end
-    return string.format("ai: offscreen animals set=%d pawns set=%d zombies set=%d back=%d now=%d | client hits on animals=%d "
-        .. "animal hits on clients=%d", s.animals, s.pawns, s.zombies, s.zombies_back, n, s.client_hits, s.animal_hits)
+    return string.format("ai: offscreen animals set=%d pawns set=%d zombies set=%d back=%d now=%d", s.animals, s.pawns,
+        s.zombies, s.zombies_back, n)
 end
 
 return M

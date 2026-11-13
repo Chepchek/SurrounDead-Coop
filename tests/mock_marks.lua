@@ -135,7 +135,9 @@ package.preload["sdc_log"] = function()
     return L
 end
 package.preload["sdc_config"] = function()
-    local C = { v = {} }
+    -- sdc_config's SCHEMA defaults of the keys sdc_playermarks reads
+    local C = { v = { player_names = true, player_names_range = 40, player_names_near = 4, gps_markers = true,
+                      gps_compass = true, map_markers_shared = true } }
     C.get = function(k) return C.v[k] end
     C.player_name = function() return W.my_name end
     return C
@@ -163,6 +165,12 @@ package.preload["sdc_ue"] = function()
         for _, h in ipairs(W.huds or {}) do if h._class == c then out[#out + 1] = h end end
         return out
     end
+    -- sdc_ue.player_chars: the shared list of valid player characters
+    U.player_chars = function()
+        local out = {}
+        for _, p in ipairs(U.find_all("BP_PlayerCharacter_C")) do if U.valid(p) then out[#out + 1] = p end end
+        return out
+    end
     U.find_object = function(path)
         if path:find("WidgetComponent") then return obj("Class") end
         if path:find("ConsoleUtils") then return W.CU end
@@ -186,8 +194,11 @@ end
 
 local function new_cu(vals)
     local cu = obj("ConsoleUtils", { vals = vals })
-    cu.GetBoolCVar = function(self, n) return self.vals[n._fname] end
+    local function typed(want) return function(self, n) local v = self.vals[n._fname]; if type(v) == want then return v end end end
+    cu.GetBoolCVar = typed("boolean")
     cu.SetBoolCVar = function(self, n, v) self.vals[n._fname] = v end
+    cu.GetFloatCVar = typed("number")
+    cu.SetFloatCVar = function(self, n, v) self.vals[n._fname] = v end
     return cu
 end
 local pm = require("sdc_playermarks")
@@ -345,11 +356,219 @@ T = T + 1; pm.tick()
 check(sei["EquippedCompass_59_E0A6289D4D59B1D4ABEB43AC8A5527BB"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] == nil, "client compass slot cleared")
 check(sei["EquippedGPS_58_A18BCF9B44989D75939B038888DBFC9C"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] ~= nil, "client GPS slot written")
 check(me2.InGameUI.Compass.vis == 2, "client HUD compass hidden on unequip")
+-- (0.7.3 wave, p.3) another HUD in the viewport that only sdc_players.
+-- screen_huds sees (GetAllWidgetsOfClass; FindAllOf misses UMG widgets):
+-- its compass is hidden too
+do
+    local umg = new_pawn(998, { X = 0, Y = 0, Z = 0 }, { hud = true, compass_vis = 4 })   -- not in W.pawns / W.huds
+    local asked = 0
+    package.loaded["sdc_players"] = { screen_huds = function() asked = asked + 1; return { me2.InGameUI, umg.InGameUI } end }
+    local LOGL, print0 = {}, print
+    print = function(s, ...) LOGL[#LOGL + 1] = tostring(s); return print0(s, ...) end
+    T = T + 5; pm.tick()
+    print = print0
+    local line = nil
+    for _, l in ipairs(LOGL) do
+        if l:find("another HUD " .. umg.InGameUI._name, 1, true) and l:find("showed a compass; hidden", 1, true) then line = l end
+    end
+    check(asked >= 1 and umg.InGameUI.Compass.vis == 2, "a HUD only sdc_players.screen_huds sees: its compass hidden")
+    check(line ~= nil, "  logged «another HUD ... showed a compass; hidden»")
+    check(me2.InGameUI.Compass.vis == 2, "  the own HUD's compass left as the slot says")
+    package.loaded["sdc_players"] = nil
+end
 -- leaving: own MapVisibility comes back
 S2.role = "standalone"
 T = T + 1; pm.tick()
 check(W.CU.vals["Difficulty.MapVisibility"] == false, "own MapVisibility restored on leaving")
 -- own entry never shown
 check(#mw2.made == 1, "no marker for self")
+
+-- ===================================================================== DIFFICULTY (0.7.3 wave)
+-- every listed Difficulty.* CVar the player's own machine uses, typed (bool /
+-- float), one PCVAR with every pair (MapVisibility first: an older client
+-- reads the first pair only); host_difficulty_sync off: MapVisibility only;
+-- the client's own values kept on disk while replaced and given back on
+-- leaving, and at the next start after a session that did not end cleanly
+print("DIFFICULTY")
+local cfgm = require("sdc_config")
+local TESTDIR = (arg[0]:match("^(.*)[/\\]") or ".")
+local TMPDIR = TESTDIR .. "/_tmp"
+os.execute('mkdir "' .. TMPDIR:gsub("/", "\\") .. '" >nul 2>&1')
+cfgm.path = TMPDIR .. "/mock_marks_config.ini"
+local OWNF = TMPDIR .. "/client_cvars_own.txt"
+local function read_own()
+    local f = io.open(OWNF, "r")
+    if not f then return nil end
+    local s = f:read("a")
+    f:close()
+    return s
+end
+local function pcvars(to)
+    local out = {}
+    for _, m in ipairs(sent) do if m.kind == "PCVAR" and (to == nil or m.to == to) then out[#out + 1] = m end end
+    return out
+end
+-- host
+local S3 = { role = "host", remote = {}, remote_pcs = {} }
+W = { CU = new_cu({ ["Difficulty.MapVisibility"] = true, ["Difficulty.XPMultiplier"] = 2.5, ["Difficulty.SearchTime"] = 0.5,
+                    ["Difficulty.HeadshotMode"] = false }),
+      actors = {}, my_name = "Host", cam_loc = { X = 0, Y = 0, Z = 160 }, cam_rot = { Pitch = 0, Yaw = 0 } }
+pm.init(S3)
+local h3 = new_pawn(256, { X = 0, Y = 0, Z = 100 }, { is_local = true })
+local c3pc = new_pc(257)
+c3pc.pawn = new_pawn(257, { X = 1000, Y = 0, Z = 100 })
+W.pc, W.me, W.pawns = new_pc(256), h3, { h3, c3pc.pawn }
+W.loc_of_mesh = function(mesh) for _, p in ipairs(W.pawns) do if p.Mesh == mesh then return p.loc end end end
+S3.remote["PC_c3"] = { key = "PC_c3", pc = c3pc, name = "Петя", hello = true }
+S3.remote_pcs = { c3pc }
+sent = {}
+T = T + 1; pm.tick()
+local pv = pcvars(c3pc)
+local f1 = pv[1] and pv[1].f or {}
+check(#pv >= 1 and table.concat(f1, "|") == "Difficulty.MapVisibility|1|Difficulty.XPMultiplier|2.5|Difficulty.SearchTime|0.5|Difficulty.HeadshotMode|0",
+    "host: one PCVAR, every readable pair, MapVisibility first: " .. table.concat(f1, "|"))
+sent = {}
+T = T + 1; pm.tick()
+T = T + 1.5; pm.tick()
+check(#pcvars() == 0, "unchanged: nothing more (before the 10 s resync)")
+W.CU.vals["Difficulty.XPMultiplier"] = 3
+T = T + 2.1; pm.tick()   -- (T carries an earlier + 0.2: not exactly 2 s apart)
+pv = pcvars(c3pc)
+check(#pv == 1 and pv[1].f[4] == "3", "a change: sent again (XPMultiplier 3)")
+cfgm.v.host_difficulty_sync = false
+sent = {}
+T = T + 2.1; pm.tick()
+pv = pcvars(c3pc)
+check(#pv == 1 and table.concat(pv[1].f, "|") == "Difficulty.MapVisibility|1",
+    "host_difficulty_sync off: MapVisibility only: " .. #pv .. " " .. table.concat((pv[1] or { f = {} }).f, "|"))
+cfgm.v.host_difficulty_sync = nil
+-- client
+local S4 = { role = "client" }
+W = { CU = new_cu({ ["Difficulty.MapVisibility"] = false, ["Difficulty.XPMultiplier"] = 1, ["Difficulty.SearchTime"] = 1,
+                    ["Difficulty.HeadshotMode"] = true }),
+      actors = {}, my_name = "Петя", cam_loc = { X = 0, Y = 0, Z = 160 }, cam_rot = { Pitch = 0, Yaw = 0 } }
+pm.init(S4)
+local me4 = new_pawn(257, { X = 0, Y = 0, Z = 100 }, { is_local = true, role = 2 })
+W.pc, W.me, W.pawns = new_pc(257), me4, { me4 }
+W.loc_of_mesh = function() return nil end
+T = T + 1; pm.tick()
+net.handlers.PCVAR({ "Difficulty.MapVisibility", "1", "Difficulty.XPMultiplier", "2.5", "Difficulty.SearchTime", "0.5",
+                     "Difficulty.HeadshotMode", "0", "Debug.NoClip", "1", "Difficulty.WeaponDurabilityMultiplier", "abc" })
+T = T + 1; pm.tick()
+local v = W.CU.vals
+check(v["Difficulty.MapVisibility"] == true and v["Difficulty.XPMultiplier"] == 2.5 and v["Difficulty.SearchTime"] == 0.5
+    and v["Difficulty.HeadshotMode"] == false, "client: the host's values (bool and float)")
+check(v["Debug.NoClip"] == nil and v["Difficulty.WeaponDurabilityMultiplier"] == nil, "unlisted CVar / bad number ignored")
+check(read_own() == "Difficulty.HeadshotMode=1\nDifficulty.MapVisibility=0\nDifficulty.SearchTime=1\nDifficulty.XPMultiplier=1",
+    "own values kept on disk while replaced: " .. tostring(read_own()))
+-- (every PCVAR is the whole set the host shares)
+net.handlers.PCVAR({ "Difficulty.MapVisibility", "1", "Difficulty.XPMultiplier", "4", "Difficulty.SearchTime", "0.5",
+                     "Difficulty.HeadshotMode", "0" })
+T = T + 1; pm.tick()
+check(v["Difficulty.XPMultiplier"] == 4 and (read_own() or ""):find("XPMultiplier=1", 1, true) ~= nil,
+    "a later change: the own value stays the first one")
+S4.role = "standalone"
+T = T + 1; pm.tick()
+check(v["Difficulty.MapVisibility"] == false and v["Difficulty.XPMultiplier"] == 1 and v["Difficulty.SearchTime"] == 1
+    and v["Difficulty.HeadshotMode"] == true, "leaving: every own value back")
+check(read_own() == "", "  the file emptied")
+-- a session that did not end cleanly: the next start gives the own values back once
+local fo = io.open(OWNF, "w")
+fo:write("Difficulty.XPMultiplier=1.5\nDifficulty.HeadshotMode=0\nDebug.NoClip=1\n")
+fo:close()
+v["Difficulty.XPMultiplier"], v["Difficulty.HeadshotMode"] = 2.5, true
+package.loaded["sdc_playermarks"] = nil
+local pm2 = require("sdc_playermarks")
+local S5 = { role = "client" }
+pm2.init(S5)
+T = T + 1; pm2.tick()
+check(v["Difficulty.XPMultiplier"] == 2.5, "not while connected")
+S5.role = "standalone"
+T = T + 1; pm2.tick()
+check(v["Difficulty.XPMultiplier"] == 1.5 and v["Difficulty.HeadshotMode"] == false and v["Debug.NoClip"] == nil,
+    "the next start outside a session: own values back from the disk (listed CVars only)")
+check(read_own() == "", "  the file emptied")
+v["Difficulty.XPMultiplier"] = 7
+T = T + 1; pm2.tick()
+check(v["Difficulty.XPMultiplier"] == 7, "  once")
+
+-- the host turns host_difficulty_sync off while a client is connected: its
+-- next PCVAR has MapVisibility only, and the rest is the client's own again
+-- at once (not only on leaving); a PCVAR with nothing usable drops nothing
+print("DIFFICULTY: the host turns the sync off while connected")
+package.loaded["sdc_playermarks"] = nil
+local pm3 = require("sdc_playermarks")
+local S6 = { role = "client" }
+W = { CU = new_cu({ ["Difficulty.MapVisibility"] = false, ["Difficulty.XPMultiplier"] = 1, ["Difficulty.SearchTime"] = 1,
+                    ["Difficulty.HeadshotMode"] = true }),
+      actors = {}, my_name = "Петя", cam_loc = { X = 0, Y = 0, Z = 160 }, cam_rot = { Pitch = 0, Yaw = 0 } }
+pm3.init(S6)
+local me6 = new_pawn(257, { X = 0, Y = 0, Z = 100 }, { is_local = true, role = 2 })
+W.pc, W.me, W.pawns = new_pc(257), me6, { me6 }
+W.loc_of_mesh = function() return nil end
+T = T + 1; pm3.tick()
+local FULL = { "Difficulty.MapVisibility", "1", "Difficulty.XPMultiplier", "2.5", "Difficulty.SearchTime", "0.5",
+               "Difficulty.HeadshotMode", "0" }
+net.handlers.PCVAR(FULL)
+T = T + 1; pm3.tick()
+local v6 = W.CU.vals
+check(v6["Difficulty.MapVisibility"] == true and v6["Difficulty.XPMultiplier"] == 2.5 and v6["Difficulty.SearchTime"] == 0.5
+    and v6["Difficulty.HeadshotMode"] == false, "connected: the host's whole set")
+net.handlers.PCVAR({ "Debug.NoClip", "1", "Difficulty.XPMultiplier", "abc" })
+T = T + 1; pm3.tick()
+check(v6["Difficulty.XPMultiplier"] == 2.5 and v6["Difficulty.SearchTime"] == 0.5 and v6["Difficulty.HeadshotMode"] == false,
+    "a PCVAR with nothing usable in it: nothing dropped")
+net.handlers.PCVAR({ "Difficulty.MapVisibility", "1" })
+check(v6["Difficulty.XPMultiplier"] == 1 and v6["Difficulty.SearchTime"] == 1 and v6["Difficulty.HeadshotMode"] == true,
+    "sync off on the host (MapVisibility only): the rest is the own value again at once")
+check(v6["Difficulty.MapVisibility"] == true, "  MapVisibility still the host's")
+check(read_own() == "Difficulty.MapVisibility=0", "  only MapVisibility's own value left on disk: " .. tostring(read_own()))
+T = T + 1; pm3.tick()
+T = T + 1; pm3.tick()
+check(v6["Difficulty.XPMultiplier"] == 1 and v6["Difficulty.SearchTime"] == 1 and v6["Difficulty.HeadshotMode"] == true,
+    "  not set to the host's again by the 1 s tick")
+net.handlers.PCVAR(FULL)
+T = T + 1; pm3.tick()
+check(v6["Difficulty.XPMultiplier"] == 2.5 and v6["Difficulty.HeadshotMode"] == false
+    and (read_own() or ""):find("XPMultiplier=1", 1, true) ~= nil, "on again: the host's values again, the own ones on disk")
+S6.role = "standalone"
+T = T + 1; pm3.tick()
+check(v6["Difficulty.MapVisibility"] == false and v6["Difficulty.XPMultiplier"] == 1 and v6["Difficulty.SearchTime"] == 1
+    and v6["Difficulty.HeadshotMode"] == true and read_own() == "", "leaving: every own value back, the file emptied")
+
+-- a float CVar reads back as the engine's float (0.1 -> 0.100000001490116):
+-- the host's "0.1" is the same value, set once, no line every second
+print("DIFFICULTY: float read-back")
+package.loaded["sdc_playermarks"] = nil
+local pm4 = require("sdc_playermarks")
+local S7 = { role = "client" }
+local sets7 = 0
+local cu7 = new_cu({ ["Difficulty.XPMultiplier"] = 1 })
+cu7.SetFloatCVar = function(self, nm, val)
+    sets7 = sets7 + 1
+    self.vals[nm._fname] = string.unpack("<f", string.pack("<f", val))   -- a 32-bit float, as the engine keeps it
+end
+W = { CU = cu7, actors = {}, my_name = "Петя", cam_loc = { X = 0, Y = 0, Z = 160 }, cam_rot = { Pitch = 0, Yaw = 0 } }
+pm4.init(S7)
+local me7 = new_pawn(257, { X = 0, Y = 0, Z = 100 }, { is_local = true, role = 2 })
+W.pc, W.me, W.pawns = new_pc(257), me7, { me7 }
+W.loc_of_mesh = function() return nil end
+T = T + 1; pm4.tick()
+net.handlers.PCVAR({ "Difficulty.XPMultiplier", "0.1" })
+local LOG7, print7 = {}, print
+print = function(s, ...) LOG7[#LOG7 + 1] = tostring(s); return print7(s, ...) end
+for _ = 1, 4 do T = T + 1; pm4.tick() end
+print = print7
+local lines7 = 0
+for _, l in ipairs(LOG7) do if l:find("from the host", 1, true) then lines7 = lines7 + 1 end end
+check(cu7.vals["Difficulty.XPMultiplier"] ~= 0.1 and math.abs(cu7.vals["Difficulty.XPMultiplier"] - 0.1) < 1e-6,
+    "the engine keeps 0.1 as " .. string.format("%.15g", cu7.vals["Difficulty.XPMultiplier"]))
+check(sets7 == 1 and lines7 == 1, "set once in 4 s, one «from the host» line (sets " .. sets7 .. ", lines " .. lines7 .. ")")
+S7.role = "standalone"
+T = T + 1; pm4.tick()
+check(cu7.vals["Difficulty.XPMultiplier"] == 1, "leaving: the own 1 back")
+
+os.remove(OWNF)
+os.remove(cfgm.path)
 
 print(fails == 0 and "ALL OK" or (fails .. " FAILURES"))

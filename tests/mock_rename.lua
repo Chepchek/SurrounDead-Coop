@@ -431,8 +431,9 @@ local snap = take("RNAME")
 local sent = {}
 for _, m in ipairs(snap) do sent[#sent + 1] = m.msg end
 local all = table.concat(sent, " ; ")
-check(#snap == 3, "host: 3 renamed containers sent: " .. all)
-check(all:find("|Guns", 1, true) ~= nil, "the name loaded from the save is sent")
+local _, nentries = (snap[1] and snap[1].msg or ""):gsub("[^;]+", "")
+check(#snap == 1 and nentries == 3, "host: 3 renamed containers sent in one RNAME list: " .. all)
+check(all:find("!Guns", 1, true) ~= nil, "the name loaded from the save is sent")
 check(all:find("3000,0,0", 1, true) == nil and all:find("2600,0,0", 1, true) == nil, "default-named containers are not sent")
 deliver(snap)
 check(cbox2.ContainerName == "Guns", "client: copy without UID found by class and place")

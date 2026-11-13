@@ -33,16 +33,13 @@ local function timer_active(ksl, pawn, name)
     return v == true
 end
 
-function M.reset()
-    st.key, st.since, st.done, st.tries = nil, 0, false, 0
-end
-
-local sky_probe -- defined below
+local note_played -- defined below (the main menu sublevel)
 
 -- Client tick: pawn = own character (or nil).
 function M.tick(pawn, now)
+    M.install_hooks()
     if not ue.valid(pawn) then st.key = nil return end
-    pcall(sky_probe, now)
+    note_played()
     if not ue.class_name(pawn):find("PlayerCharacter", 1, true) then return end
     local key = ue.name(pawn)
     if key ~= st.key then
@@ -114,19 +111,27 @@ end
 local MENU_LEVEL = "MainMenu"
 local LOAD_LEVEL_FN = "/Script/Engine.GameplayStatics:LoadStreamLevel"
 local menu = { key = nil, done = false, tries = 0, at = 0, played = false }
-local hook = { done = false, failed_logged = false, blocked = 0 }
+local hook = { done = false, tries = 0, blocked = 0 }
+local HOOK_TRIES = 5   -- a failed registration is retried on later ticks this often
 
 -- Set by sdc_respawn: how a client leaves the server (sdc_session.disconnect).
 M.on_client_quit_to_menu = nil
-
-function M.reset_menu_level()
-    menu.key, menu.done, menu.tries, menu.at, menu.played = nil, false, 0, 0, false
-end
 
 local function world_key()
     local pc = ue.local_pc()
     local key = ue.world_path and ue.world_path() or "world"
     return key .. "|" .. (pc and ue.name(pc) or "")
+end
+
+-- The own character exists in this world: the client plays here, so a later
+-- LoadStreamLevel(MainMenu) is the death screen's "Quit to main menu". Every
+-- client tick (M.tick), whatever unload_menu_level says.
+note_played = function()
+    local key = world_key()
+    if menu.key ~= key then
+        menu.key, menu.done, menu.tries, menu.at = key, false, 0, 0
+    end
+    menu.played = true
 end
 
 local function charcreate_open()
@@ -185,28 +190,31 @@ local function on_load_level(wco_p, level_p)
     end
 end
 
--- Registered once; safe to call again (from the ticks) until it is in.
+-- Registered once (shared pre-only engine hook, sdc_ue.hook_native); safe to
+-- call again from the ticks: a failed registration is retried HOOK_TRIES times.
 function M.install_hooks()
     if hook.done then return true end
-    local ok, err = pcall(RegisterHook, LOAD_LEVEL_FN, function(_, wco_p, level_p)
+    if hook.tries >= HOOK_TRIES then return false end
+    hook.tries = hook.tries + 1
+    local ok, err = ue.hook_native(LOAD_LEVEL_FN, "localinit.menulevel", function(_, wco_p, level_p)
         local okc, e = pcall(on_load_level, wco_p, level_p)
         if not okc then log.err_throttled("localinit-loadlevel", "localinit: LoadStreamLevel hook: %s", tostring(e)) end
-    end, function() end)
-    hook.done = true
-    if not ok and not hook.failed_logged then hook.failed_logged = true end
-    log.info("localinit: LoadStreamLevel hook %s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)))
-    return ok
+    end)
+    hook.done = ok == true
+    if ok or hook.tries == 1 or hook.tries == HOOK_TRIES then
+        log.info("localinit: LoadStreamLevel hook %s%s%s", ok and "ok" or "FAILED", ok and "" or (" " .. tostring(err)),
+            (not ok and hook.tries == HOOK_TRIES) and "; not tried again" or "")
+    end
+    return hook.done
 end
 
 -- Client tick: pawn = own character (only once it exists the client plays).
+-- Safe to call every tick whatever the settings: with unload_menu_level =
+-- false it only says once per world whether the sublevel is there.
 function M.menu_level_tick(pawn, now, keep)
-    if not hook.done then M.install_hooks() end
+    M.install_hooks()
     if not ue.valid(pawn) then return end
-    local key = world_key()
-    if menu.key ~= key then
-        menu.key, menu.done, menu.tries, menu.at = key, false, 0, 0
-    end
-    menu.played = true
+    note_played()
     if menu.done or keep or now - menu.at < 3 then return end
     menu.at = now
     local gps = ue.gameplay_statics()
@@ -239,53 +247,6 @@ function M.menu_level_tick(pawn, now, keep)
         menu.done = true
         log.warn("localinit: %s sublevel still loaded after %d tries", MENU_LEVEL, menu.tries)
     end
-end
-
--- ---------------------------------------------------------------------------
--- Sky / weather probe (client): which Ultra Dynamic Sky / Weather actors this
--- world has, from which level, and whether they started (Run Context 3 =
--- running; a client's sky starts when its first replication arrives, see
--- docs: work\audit\session.md section 3). Once 10 s after the own character
--- appears, then every 120 s with debug on.
--- ---------------------------------------------------------------------------
-local probe = { key = nil, since = 0, last = -1000, count = 0 }
-
-local function level_of(actor)
-    return ue.path(actor):match("^/Game/Levels/([%w_]+)%.") or ue.path(actor):match("^/Game/([%w_/]+)%.") or "?"
-end
-
-local function describe_sky(s)
-    local tod = ue.prop(s, "Time of Day")
-    return string.format("%s@%s rc=%s role=%d tod=%s repl_tod=%s",
-        ue.short(s), level_of(s), tostring(ue.prop(s, "Run Context")), ue.role(s),
-        type(tod) == "number" and string.format("%.1f", tod) or tostring(tod),
-        tostring(ue.prop(s, "Replicated Time of Day")))
-end
-
-local function describe_weather(w)
-    local mgr = ue.prop(w, "Random Weather Manager")
-    local target = ue.prop(mgr, "Target Random Weather Type")
-    return string.format("%s@%s rc=%s role=%d random_state=%s mgr_started=%s target=%s",
-        ue.short(w), level_of(w), tostring(ue.prop(w, "Run Context")), ue.role(w),
-        tostring(ue.prop(w, "Random Weather Variation State")), tostring(ue.prop(mgr, "Started")),
-        ue.valid(target) and ue.short(target) or "none")
-end
-
-sky_probe = function(now)
-    local key = world_key()
-    if key ~= probe.key then probe.key, probe.since, probe.count = key, now, 0 end
-    if now - probe.since < 10 then return end
-    if probe.count >= 1 and (not log.debug_enabled or now - probe.last < 120) then return end
-    probe.last, probe.count = now, probe.count + 1
-    local parts = {}
-    for _, cls in ipairs({ "Ultra_Dynamic_Sky_C", "Ultra_Dynamic_Weather_C" }) do
-        for _, a in ipairs(ue.find_all(cls)) do
-            if ue.valid(a) and not ue.short(a):find("^Default__") then
-                parts[#parts + 1] = cls == "Ultra_Dynamic_Sky_C" and describe_sky(a) or describe_weather(a)
-            end
-        end
-    end
-    log.info("localinit: sky probe: %s", #parts > 0 and table.concat(parts, " | ") or "no sky / weather actors")
 end
 
 return M

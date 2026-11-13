@@ -145,35 +145,50 @@ assert(has_log("no such station in reach", "warn"), "reach check")
 guest.__loc = { X = 1100, Y = 2000, Z = 50 }
 print("host: disassembly runs on the station, drops when full, refuses bad requests")
 
--- loot-box weapon: default attachments into its sub-containers, the client told
+-- loot-box weapon: added where the client's screen put it (grid 5), default
+-- attachments into its sub-containers, the client told once with its contents
+-- (2026-11-13: CLIENT_AddNewItem with the content; see mock_consume_lootbox)
 local rifle = { __name = "DA_Rifle", __cls = "JigsawItem_DataAsset_C", __path = "/Game/I/DA_Rifle.DA_Rifle",
   DefaultAttachments = arr({ { ID_21_A45B60654D588805C5D52BA4BC5CD4FD = { __name = "DA_Mag" },
     MinCount_31_E62F0FA548FC7DB0BDB860B4C0D695B6 = 1, AddToContainerIndex_11_3CB23949434BAB8C7EEBE09362324A4C = 1 } }) }
 assets[rifle.__path] = rifle
 local gens, told = {}, {}
 local djig = { __name = "GuestJig", GetOwner = function() return guest end }
-djig.AddNewItemSomewhere = function(_, da, n, inside, inside_n, drop_ok, spec, a, d, uid)
-  a.Added = true; d["Dropped?"] = false; uid.A, uid.B, uid.C, uid.D = 7, 0, 0, 0
-end
-djig.MainJigContainers = arr({ { [F_ITEMS] = arr({ { [F_USID] = G(7), [F_INFO] = { [F_ITEMID] = rifle, [F_COUNT] = 1 },
-  SubContainers_35_9B8F8C174A191BE2B5DAE19C1EB3FAAE = arr({ { UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7 = G(70) },
-    { UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7 = G(71) } }) } }) } })
-djig.Generate_AddNewItemToContainer = function(_, sub, id, n, info, added)
-  gens[#gens + 1] = { sub = sub.A, id = id, n = n }
+djig.AddNewItemSomewhere = function() error("the any-grid add is not used for gains") end
+local REP = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"
+local MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
+local SUBS = "SubContainers_35_9B8F8C174A191BE2B5DAE19C1EB3FAAE"
+local conts = { { [REP] = G(5), _t = {} } }
+conts[1][F_ITEMS] = arr(conts[1]._t)
+djig.MainJigContainers = arr(conts)
+djig.Generate_AddNewItemToContainer = function(_, g, id, n, info, added)
+  gens[#gens + 1] = { grid = g.A, id = id, n = n }
+  local c
+  for _, x in ipairs(conts) do if x[REP].A == g.A then c = x end end
+  if not c then added["Added?"] = false return end
+  local it = { [F_USID] = G(700 + #gens), [F_INFO] = { [F_ITEMID] = id, [F_COUNT] = n }, [MOTHER] = g, [SUBS] = arr({}) }
+  if id == rifle then
+    it[SUBS] = arr({ { UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7 = G(70) }, { UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7 = G(71) } })
+    for _, s in ipairs({ 70, 71 }) do
+      local t = {}
+      conts[#conts + 1] = { [REP] = G(s), [F_ITEMS] = arr(t), _t = t }
+    end
+  end
+  table.insert(c._t, it)
   added["Added?"] = true
-  info[F_INFO] = { [F_ITEMID] = id }; info[F_USID] = G(700)
-  info.ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D = G(71); info.SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD = 0
-  info.Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56 = false
 end
-djig.CLIENT_NewItemAdded = function(_, iinfo, uid, to, idx, rot, upd, rem, subs, clear)
-  told[#told + 1] = { uid = uid.A, to = to.A, idx = idx, rot = rot, cnt = upd.NewCount_5_31E28E124BF695AFBB001A87164F9121, clear = clear }
+djig.CLIENT_AddNewItem = function(_, it, content, comp, pend)
+  told[#told + 1] = { uid = it[F_USID].A, n = #content, inner = content[1] and content[1][F_USID].A, comp = comp, pend = pend.A }
 end
+djig.CLIENT_NewItemAdded = function() error("not used any more") end
 guest.BP_JigMultiplayer = djig
 hooks[JIG .. "SERVER_RequestConsumeItem"](C(djig), P(djig), P(G(9)), P(1), P(""))
-handlers.IGAIN({ rifle.__path, "1" }, pc)
-assert(#gens == 1 and gens[1].sub == 71 and gens[1].id.__name == "DA_Mag" and gens[1].n == 1, "attachment not added to sub-container 1")
-assert(#told == 1 and told[1].uid == 700 and told[1].to == 71 and told[1].cnt == 1 and told[1].clear == false, "client not told")
-assert(has_log("default attachments of Rifle for guest: Mag x1"), "attachment log")
+handlers.IGAIN({ rifle.__path, "1", "c", "5:0:0:0", "2" }, pc)
+assert(#gens == 2 and gens[1].grid == 5 and gens[1].id == rifle, "rifle not added to the client's grid")
+assert(gens[2].grid == 71 and gens[2].id.__name == "DA_Mag" and gens[2].n == 1, "attachment not added to sub-container 1")
+assert(#told == 1 and told[1].uid == 701 and told[1].n == 1 and told[1].inner == 702 and told[1].comp == djig and told[1].pend == 0,
+  "client not told (once, with the magazine inside)")
+assert(has_log("attachments: Mag x1") and has_log("the client was told (CLIENT_AddNewItem, 1 inside)"), "attachment log")
 print("host: loot-box weapon gets its default attachments")
 for _, l in ipairs(logs) do if l:find("^err") and (l:find("consume:", 1, true) or l:find("stations:", 1, true)) then error("error logged: " .. l) end end
 print("ALL OK")

@@ -30,11 +30,14 @@
 --   * New Game sets EMS's current save name to ""; the previous name is put
 --     back right after (the menu's Continue and the client save redirect use it).
 -- In the host's world:
---   client: CHAR (the stored character) as soon as its controller is there,
---     CHARNONE without one; the look goes onto its own character the game's
---     way (Save_Player fields swapped in, SetSexMesh, old values back).
---   host: a player's first character waits a few seconds for CHAR /
---     CHARNONE; sdc_players.spawn_character swaps the choice into the host's
+--   client: CHAR (the stored character) as soon as its controller of the
+--     host's world is there (AutonomousProxy), again until the host's
+--     CHARACK; CHARNONE without one; the look goes onto its own character the
+--     game's way (Save_Player fields swapped in, SetSexMesh, old values back);
+--     sdc_appearance publishes its look (MYLOOK) only after that
+--     (M.own_look_pending).
+--   host: a player's first character waits for CHAR / CHARNONE (join_gate:
+--     up to JOIN_WAIT_S); sdc_players.spawn_character swaps the choice into the host's
 --     Save_Player around FinishSpawningActor (the construction script's
 --     SetSexMesh builds it) and restores the host's values. A CHAR for a
 --     living character changes its look the same way.
@@ -44,7 +47,7 @@
 --   client -> host  CHAR|1|sex|skin|hair|haircolor|brows|beard|beardcolor|mouth|acc1|acc2|acc3|forename|surname|age|occupation
 --                   (asset paths relative to /Game/PlayerModel/, "" = none)
 --   client -> host  CHARNONE|reason    no own character: spawn the default one now
---   host -> client  CHARACK|spawn|look|ok|direct|busy|failed
+--   host -> client  CHARACK|spawn|look|ok|direct|busy|failed   CHARACK|got|spawn (received, no character yet)
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -59,6 +62,7 @@ local CREATOR_CLASS = "/Game/UI/Menus/Menu/CharacterCreatorMenu.CharacterCreator
 local DIFF_PAGE_CLASS = "/Game/UI/Menus/Pages/NewGameDifficultySelectionPage.NewGameDifficultySelectionPage_C"
 local MENU_CLASS = "/Game/UI/Menus/Menu/MenuWidget.MenuWidget_C"
 local SAVE_CLASS = "/Game/Blueprints/Saves/Save_Player.Save_Player_C"
+local SETTINGS_CLASS = "/Game/Blueprints/BP_NewGameSettings.BP_NewGameSettings_C"
 local EMS_LIB = "/Script/EasyMultiSave.Default__EMSFunctionLibrary"
 local ASSET_ROOT = "/Game/PlayerModel/"
 
@@ -67,7 +71,7 @@ local FN_CONTINUE = CREATOR_CLASS .. ":BndEvt__CharacterCreatorMenu_ContinueButt
 local FN_BACK = CREATOR_CLASS .. ":BndEvt__BackButton_K2Node_ComponentBoundEvent_13_OnButtonClickedEvent__DelegateSignature"
 local FN_ESCAPE = CREATOR_CLASS .. ":InpActEvt_Escape_K2Node_InputKeyEvent_0"
 
-local NO_REPLY_S = 8        -- host: a player that says nothing (older mod) gets the default character
+local NO_REPLY_S = 8        -- host: a player that says nothing this long after its HI (older mod) gets the default character
 local LOOK_COOLDOWN_S = 3   -- host: look changes per player
 local MENU_WAIT_S = 120     -- main menu: how long a held join waits for the main menu to show up
 
@@ -508,15 +512,30 @@ end
 
 -- sdc_players.host_player_tick: may this player's FIRST character spawn now?
 -- A client of this version sends CHAR / CHARNONE as soon as its controller
--- is there; an older one says nothing and gets the default character.
+-- in this world is there; an older one says nothing and gets the default
+-- character. A joining game loads the map before its controller in this
+-- world can send anything (13.11: ~15 s; the host gave up after 8 s while the
+-- client was still loading, spawned the default character, then changed its
+-- look): the wait is JOIN_WAIT_S from the connection - as long as sdc_persist
+-- waits for the player's id, which the client sends at the same moment as
+-- CHAR - or NO_REPLY_S from its first HI (r.hello, sdc_session) when that
+-- comes first.
+local JOIN_WAIT_S = 25
 function M.join_gate(r, now)
     if cfg.get("char_create") == false then return true end
     local h = host_rec(r.key)
     h.last_seen = now
     h.first_gate = h.first_gate or now
     if h.state == "char" or h.state == "default" then return true end
-    if now - h.first_gate < NO_REPLY_S then return false end
-    once(h, "silent", "charcreate: host: no character message from %s in %d s (older mod?), default character", r.name, NO_REPLY_S)
+    if r.hello and not h.heard_at then h.heard_at = now end
+    if h.heard_at and now - h.heard_at >= NO_REPLY_S then
+        once(h, "silent", "charcreate: host: no character message from %s in %d s after its HI (older mod?), default character",
+            r.name, NO_REPLY_S)
+        return true
+    end
+    if now - h.first_gate < JOIN_WAIT_S then return false end
+    once(h, "silent", "charcreate: host: no character message from %s in %d s since it connected (older mod?), default character",
+        r.name, JOIN_WAIT_S)
     return true
 end
 
@@ -567,10 +586,13 @@ local function host_on_char(f, pc)
         if h.state ~= "char" then h.state = "default" end
         return
     end
+    local again = h.state == "char"
     h.sel, h.state = sel, "char"
     local pawn = ue.pawn_of(pc)
     if not pawn then
-        log.info("charcreate: host: character of %s received (%s), spawning it", name, describe_sel(sel))
+        -- received (the client sends it again until a CHARACK)
+        net.send_to(pc, "CHARACK", "got", "spawn")
+        if not again then log.info("charcreate: host: character of %s received (%s), spawning it", name, describe_sel(sel)) end
         return
     end
     -- the character was there first (default spawn): change its look
@@ -636,12 +658,40 @@ local function ensure_applied(pc, pawn, now)
         rec.tries, how and "" or (" " .. tostring(why)))
 end
 
-local function announce(pc)
-    cl.announced = true
+-- sdc_appearance (client, MYLOOK): is the stored co-op look still to be put
+-- on this own character? Its look is not published before (13.11: MYLOOK
+-- with the default look went out 0.7 s before "look applied ... try 1" and
+-- the host put that look back on the character it had just given the right
+-- one). Not longer than LOOK_HOLD_S after the character appeared.
+local LOOK_HOLD_S = 10
+function M.own_look_pending(pawn)
+    if not cl or not M.stored or cfg.get("char_create") == false or not S or S.role ~= "client" then return false end
+    if not ue.valid(pawn) then return false end
+    local key = ue.name(pawn)
+    local rec = cl.applied[key]
+    if rec and rec.tries > 0 then return false end
+    cl.hold = cl.hold or {}
+    local since = cl.hold[key] or now_s()
+    cl.hold[key] = since
+    return now_s() - since < LOOK_HOLD_S
+end
+
+-- CHAR goes out only from a controller of the host's world: one that came
+-- from the host (Role AutonomousProxy, as sdc_persist's early id); the menu
+-- world's own (Authority), still there when the session turns "client",
+-- never reaches the host (13.11: CHAR sent at 16:59:46 from it was lost, the
+-- host got it only from the second controller 16 s later). Then again every
+-- CHAR_RESEND_S until the host's CHARACK, at most CHAR_TRIES times.
+local CHAR_RESEND_S = 4
+local CHAR_TRIES = 5
+
+local function announce(pc, now)
+    cl.announced, cl.sent_at, cl.tries = true, now, 1
     if cfg.get("char_create") == false then
         net.send_to_host("CHARNONE", "off")
         log.info("charcreate: client: own character off (config char_create)")
     elseif M.stored then
+        cl.char_sent = true
         send_char(M.stored)
         pcall(set_controller_info, pc, M.stored)
         log.info("charcreate: client: character sent to the host (%s)", describe_sel(M.stored))
@@ -651,16 +701,34 @@ local function announce(pc)
     end
 end
 
+local function resend(now)
+    if not cl.char_sent or cl.acked or cl.tries >= CHAR_TRIES or now - cl.sent_at < CHAR_RESEND_S then return end
+    if not M.stored or cfg.get("char_create") == false then return end
+    cl.sent_at, cl.tries = now, cl.tries + 1
+    send_char(M.stored)
+    log.info("charcreate: client: no answer from the host yet: character sent again (try %d of %d)", cl.tries, CHAR_TRIES)
+end
+
 local function client_tick(now)
     local pc = ue.local_pc()
     if not pc then return end
     local key = ue.name(pc)
     if not cl or cl.pc_key ~= key then
-        cl = { pc_key = key, announced = false, applied = {} }
+        cl = { pc_key = key, announced = false, applied = {}, tries = 0 }
     end
     if not ue.valid(ue.prop(pc, "PlayerState")) then return end
-    if not cl.announced then announce(pc) end
     local pawn = ue.pawn_of(pc)
+    -- (an own player character: in the host's world whatever the role reads)
+    local own_char = pawn ~= nil and ue.class_name(pawn):find("PlayerCharacter", 1, true) ~= nil
+    if not own_char and ue.role(pc) ~= ue.ROLE_AUTONOMOUS then
+        if not cl.menu_logged then
+            cl.menu_logged = true
+            log.info("charcreate: client: controller %s is not the host's yet (role %s): the character goes out from the host's world",
+                ue.short(pc), tostring(ue.role(pc)))
+        end
+        return
+    end
+    if not cl.announced then announce(pc, now) else resend(now) end
     if pawn and M.stored and cfg.get("char_create") ~= false then ensure_applied(pc, pawn, now) end
 end
 
@@ -668,11 +736,27 @@ end
 -- Main menu: the game's New Game creator, before joining
 -- ===========================================================================
 
+-- The MainMenu level's BP_NewGameSettings, found the creator's own way
+-- (GameplayStatics.GetActorOfClass, pseudo 1586), not read from the
+-- creator's NewGameSettings variable: CharacterCreatorMenu_C exists only in
+-- the main menu and is reloaded with it, and a by-name read of a reloaded
+-- widget Blueprint's variable can crash UE4SS 3.0.1 (see W.child in
+-- sdc_widgets). BP_NewGameSettings_C itself stays loaded (GameFunctionLibrary
+-- refers to it), so its fields are read by name as before.
+local function settings_actor(w)
+    local gps, cls = ue.gameplay_statics(), class_obj(SETTINGS_CLASS)
+    local wc = (ue.valid(w) and w) or ue.local_pc() or ue.game_instance()
+    if gps and cls and wc then
+        local ok, a = pcall(function() return gps:GetActorOfClass(wc, cls) end)
+        if ok and ue.valid(a) then return a end
+    end
+    return actors_of("BP_NewGameSettings_C")[1]
+end
+
 -- The choice, read in the Continue hook (widget alive) or by the poll
 -- fallback (w = nil: only the BP_NewGameSettings actor).
 local function read_selection(w)
-    local settings = w and ue.prop(w, "NewGameSettings")
-    if not ue.valid(settings) then settings = actors_of("BP_NewGameSettings_C")[1] end
+    local settings = settings_actor(w)
     if not ue.valid(settings) then return nil end
     local sel = { labels = {} }
     sel.sex = (ue.str(ue.prop(settings, "Sex")) == "Female") and "Female" or "Male"
@@ -717,14 +801,6 @@ local function prefill(w, sel)
         local box = ue.valid(w) and W.child(w, t[1]) or nil
         if v and v ~= "" and ue.valid(box) then pcall(function() box:SetText(FText(v)) end) end
     end
-end
-
-local function ems_name()
-    local lib, wc = ue.find_object(EMS_LIB), ue.local_pc() or ue.game_instance()
-    if not lib or not wc then return nil end
-    local ok, cur = pcall(function() return lib:GetCurrentSaveGameName(wc) end)
-    if ok then return ue.str(cur) end
-    return nil
 end
 
 -- New Game cleared EMS's current save name (MenuWidget 3984); ours goes back.
@@ -857,7 +933,7 @@ end
 local function start_creator(f, menu)
     if not load_class(CREATOR_CLASS) then return fail_flow("creator class not found") end
     install_hooks()
-    f.prev_save = ems_name()
+    f.prev_save = ue.ems_current_slot()
     local ok, err = pcall(function() menu[FN_NEW_GAME](menu) end)
     -- New Game cleared it; the main menu's Continue and our join need it
     restore_ems(f)
@@ -1003,7 +1079,14 @@ end
 -- Co-op panel / console in the main menu: the creator without a join.
 function M.open_from_menu(source)
     if flow then return "already open" end
-    if not S or S.role == "client" or not ue.in_main_menu() then
+    -- the real main menu: ue.in_main_menu() is also true while dead in a world
+    local sess = package.loaded["sdc_session"]
+    local in_menu = ue.in_main_menu()
+    if type(sess) == "table" and type(sess.in_real_menu) == "function" then
+        local okm, real = pcall(sess.in_real_menu)
+        if okm then in_menu = real == true end
+    end
+    if not S or S.role == "client" or not in_menu then
         toast("Персонажа для кооператива можно изменить только в главном меню.", "warn", 6,
             "creator requested outside the main menu")
         return "only in the main menu"
@@ -1011,7 +1094,6 @@ function M.open_from_menu(source)
     start_flow(nil, source or "request")
     return "opening"
 end
-M.request_open = M.open_from_menu   -- older wiring
 
 function M.reset_stored()
     M.stored = nil
@@ -1045,7 +1127,12 @@ function M.register_handlers()
         log.info("charcreate: host: %s takes the default character (%s)", host_name(ue.name(pc)), tostring(f[1]))
     end)
     net.on("CHARACK", function(f)
-        log.info("charcreate: client: host applied the character (%s: %s)", tostring(f[1]), tostring(f[2]))
+        if cl then cl.acked = true end
+        if f[1] == "got" then
+            log.info("charcreate: client: the host has the character (its character spawns with it)")
+        else
+            log.info("charcreate: client: host applied the character (%s: %s)", tostring(f[1]), tostring(f[2]))
+        end
     end)
 end
 

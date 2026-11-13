@@ -34,11 +34,16 @@ local hooks = {}
 function ue.hook_native(path, key, fn) hooks[path .. "#" .. key] = fn; return true end
 package.loaded["sdc_log"] = log
 package.loaded["sdc_ue"] = ue
-package.loaded["sdc_config"] = { get = function() return nil end }
+-- the quest_* / trade_* switches as SCHEMA has them (on); everything else nil
+package.loaded["sdc_config"] = { get = function(k)
+  if k:match("^quest_") or k:match("^trade_") then return true end
+  return nil
+end }
 local handlers = {}
 package.loaded["sdc_net"] = { send_to = function() return true end, send_to_host = function() return true end,
   on = function(k, h) assert(not handlers[k], "second handler for " .. k); handlers[k] = h end }
-package.loaded["sdc_ctx"] = { player_for = function() return nil end, classify = function() return "?" end }
+package.loaded["sdc_ctx"] = { player_for = function() return nil end, classify = function() return "?" end,
+  addr = function() return nil end }
 RegisterHook = function(path, pre, post)
   assert(not hooks[path], "second RegisterHook on " .. path)
   hooks[path] = { pre = pre, post = post }
@@ -89,11 +94,12 @@ call_all()
 quests.persist_bind(nil, "s", "k", true); quests.persist_save(nil); quests.persist_delete("s", "k")
 dlg.reset("role standalone"); quests.reset("test")
 local lines = {}
-dlg.status_lines(lines); quests.status_lines(lines)
+quests.status_lines(lines)
 local n = 0
 for path in pairs(hooks) do if not path:find("#", 1, true) then n = n + 1 end end
--- sdc_dialogue: 4 native + 5 Blueprint; sdc_quests: 4 native + 6 Blueprint
-assert(n == 19, "19 engine hooks, got " .. n)
+-- sdc_dialogue: 4 native + 5 Blueprint; sdc_quests: 3 native (CompleteNarrativeDataTask:
+-- client hook removed, it never fires there) + 6 Blueprint
+assert(n == 18, "18 engine hooks, got " .. n)
 assert(hooks["/Script/Engine.GameplayStatics:BeginDeferredActorSpawnFromClass#dlg.trader-spawn"], "spawn subscriber")
 local bad = 0
 for _, l in ipairs(logs) do if l:find("^err") then print(l); bad = bad + 1 end end
