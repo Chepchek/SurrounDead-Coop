@@ -1421,10 +1421,24 @@ CHAT.open, a_pc.keys.F = false, false
 handlers.DOWN({ "258", "0", "dead", "" })
 tick(1)
 frame()
--- DOWNCAP now and then (the host's record may be a new one)
+-- No DOWNCAP now and then: the host's ROSTER says what it knows of this client
+-- (S.client.roster_cap: 0 nothing, 1 DOWNCAP, 2 DOWNCAP + ready)
 local caps = host_got("DOWNCAP")
+S.client.roster_cap = 2   -- the host's list says it knows everything: an idle client
+tick(4 * 300)
+io.write(string.format("NETQ DOWNCAP idle msgs/min=%.1f", (host_got("DOWNCAP") - caps) / 5), string.char(10))
+caps = host_got("DOWNCAP")
+tick(4 * 120)
+check(host_got("DOWNCAP") == caps, "no DOWNCAP again while the host's list says it knows everything")
 tick(4 * 31)
-check(host_got("DOWNCAP") == caps + 1, "DOWNCAP|1|ready again after 30 s")
+check(host_got("DOWNCAP") == caps, "the host's list: it knows DOWNCAP + ready: nothing sent")
+S.client.roster_cap = 0
+tick(4 * 5)
+check(host_got("DOWNCAP") == caps + 1, "the host's list: it knows nothing of this client: DOWNCAP|1|ready again")
+S.client.roster_cap = 1
+tick(4 * 11)
+check(host_got("DOWNCAP") == caps + 2, "the host's list: it has DOWNCAP but not ready: sent again")
+S.client.roster_cap = 2
 -- the interact key remapped (E): UE4SS returns QueryKeysMappedToAction's
 -- array as a plain Lua table of element params (no ForEach on it)
 do
@@ -1639,7 +1653,7 @@ check(vh:find("function SEATK.out_cold", 1, true) and vh:find("function M.force_
 check(src("sdc_savecheck.lua"):find("M.someone_down()", 1, true), "sdc_savecheck: saves wait")
 local ps = src("sdc_persist.lua")
 check(ps:find("v.down_left, v.down_h0", 1, true) and ps:find("dn.restore_later, r.key", 1, true), "sdc_persist: record and restore")
-check(src("sdc_session.lua"):find('state = "down"', 1, true) and src("sdc_session.lua"):find("dn.downcap(key)", 1, true),
+check(src("sdc_session.lua"):find('state = "down"', 1, true) and src("sdc_session.lua"):find("dn.downcap_level(key)", 1, true),
     "sdc_session: F7 down, game for older clients")
 check(keybinds == 0 and not src("sdc_down.lua"):find("RegisterKeyBind", 1, true) and not src("sdc_down_pose.lua"):find("RegisterKeyBind", 1, true),
     "no RegisterKeyBind (keys read on the game thread)")

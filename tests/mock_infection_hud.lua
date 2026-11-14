@@ -269,7 +269,7 @@ check(logged("infui: installed %(client_infection_hud=true%)") ~= nil, "logged: 
 ticks(HW, H, 12)
 check(#infui_msgs(HW) == 0, "no infection: no INFUI")
 
-say("== H1. a zombie bite infects the client's character on the host -> INFUI on, again after 2 s, then every 10 s")
+say("== H1. a zombie bite infects the client's character on the host -> INFUI on, again after 2 s, then every 30 s")
 local h1 = #LOG + 1
 medR._p["Infection?"] = true          -- ApplyBiteInfection + OnRep_Infection? (no HUD on this copy)
 medR._p.InfectionAmount = 0.0
@@ -287,10 +287,49 @@ local m2 = infui_msgs(HW)
 check(#m2 == 2 and m2[2] == "SDC1|INFUI|1|0.01", "2 s after: on again with the timer's amount")
 ticks(HW, H, 32)                      -- 8 s
 check(#infui_msgs(HW) == 2, "no more within 10 s")
+ticks(HW, H, 80)                      -- 20 s more
+check(#infui_msgs(HW) == 2, "no more within 30 s (the verify is rare)")
 medR._p.InfectionAmount = 0.12
 ticks(HW, H, 9)
 local m3 = infui_msgs(HW)
-check(#m3 == 3 and m3[3] == "SDC1|INFUI|1|0.12", "10 s while on: kept with the amount")
+check(#m3 == 3 and m3[3] == "SDC1|INFUI|1|0.12", "30 s while on: kept with the amount")
+do   -- traffic while infected and nothing changes: NETQ line for the net-quiet report
+    local keep_n = #HW.to_client   -- what the checks below expect; the idle minutes are cut off again
+    local before = infui_msgs(HW)
+    local n0, b0 = #before, 0
+    for _, m in ipairs(before) do b0 = b0 + #m end
+    ticks(HW, H, 4 * 300)   -- 5 minutes
+    local after, b1 = infui_msgs(HW), 0
+    for _, m in ipairs(after) do b1 = b1 + #m end
+    io.write(string.format("NETQ INFUI infected idle msgs/min=%.1f bytes/min=%.0f", (#after - n0) / 5, (b1 - b0) / 5), string.char(10))
+    for i = #HW.to_client, keep_n + 1, -1 do table.remove(HW.to_client, i) end
+end
+
+do   -- another character of the same client (still infected): it knows nothing of it - "on" goes at once, not at the next verify
+    local keep_n = #HW.to_client
+    local before = #infui_msgs(HW)
+    local R2, medR2 = character(HW, "BP_PlayerCharacter_C_R2", false, false)
+    medR2._p["Infection?"] = true
+    medR2._p.InfectionAmount = 5.0
+    rpc._p.Pawn = R2
+    ticks(HW, H, 8)   -- 2 s
+    check(#infui_msgs(HW) == before + 1, "host: a new character of an infected client: INFUI on at once (" .. (#infui_msgs(HW) - before) .. ")")
+    rpc._p.Pawn = R
+    ticks(HW, H, 8)
+    -- cured: "off" goes, and again every 120 s (a lost "off" must not leave the bar on for good)
+    medR._p["Infection?"] = false
+    ticks(HW, H, 8)
+    local function offs() local k = 0; for _, m in ipairs(infui_msgs(HW)) do if m:find("^SDC1|INFUI|0|") then k = k + 1 end end return k end
+    local o1 = offs()
+    check(o1 >= 1, "host: cured: INFUI off sent")
+    ticks(HW, H, 4 * 100)
+    check(offs() == o1, "host: no second off within 100 s")
+    ticks(HW, H, 4 * 30)
+    check(offs() == o1 + 1, "host: the off again after 120 s (the verify)")
+    medR._p["Infection?"] = true
+    ticks(HW, H, 16)   -- "on", and its repeat 2 s later
+    for i = #HW.to_client, keep_n + 1, -1 do table.remove(HW.to_client, i) end
+end
 
 say("== H2. the host's own infection: nothing sent, its HUD untouched by the mod")
 local own0 = #HW.to_client
@@ -340,7 +379,7 @@ local c2 = #LOG + 1
 game_call(HUD, "UpdateInfection", 0.5)          -- the game's 1 s updates on this machine
 WORLD = HW
 medR._p.InfectionAmount = 0.6
-ticks(HW, H, 40)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 local ok2 = C.inf.stats.bar_ok
 ticks(CW, C, 2)
@@ -348,7 +387,7 @@ check(mod_calls(HUD, "Update") == 0 and C.inf.stats.bar_ok == ok2 + 1, "bar 0.5 
 check(count_logged("infui: own infection bar already at", c2) == 0, "\"already at\" logged once per HUD (it was in C1)")
 WORLD = HW
 medR._p.InfectionAmount = 100.0                 -- InfectionDamage stage: the game sends nothing any more
-ticks(HW, H, 40)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 check(mod_calls(HUD, "Update") == 1 and last_mod_value(HUD, "Update") == 100.0 and HUD._bar._p.CurrentPercent == 1.0,
@@ -358,28 +397,28 @@ check(logged("infui: own infection bar 0%.50%% %-> 100%.00%% %(UpdateInfection w
 say("== C2b. the host's percent once in the bar: the next keep messages push nothing (0.8.1: every 10 s)")
 local ok2b = C.inf.stats.bar_ok
 WORLD = HW
-ticks(HW, H, 44)                                -- 11 s: the host's keep, still 100
+ticks(HW, H, 124)                                -- 31 s: the host's keep, still 100
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 check(mod_calls(HUD, "Update") == 1 and C.inf.stats.bar_ok == ok2b + 1, "keep at 100 vs bar 100: not pushed again")
 WORLD = HW
 medR._p.InfectionAmount = 37.0                  -- (a value the game would not send here: the bar must follow it)
-ticks(HW, H, 44)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 check(mod_calls(HUD, "Update") == 2 and last_mod_value(HUD, "Update") == 37.0, "host 37 vs bar 100: pushed once")
 WORLD = HW
-ticks(HW, H, 44)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 WORLD = HW
-ticks(HW, H, 44)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 check(mod_calls(HUD, "Update") == 2 and C.inf.stats.bar_ok == ok2b + 3, "two more keeps at 37 vs bar 37: nothing pushed")
 WORLD = HW
 medR._p.InfectionAmount = 100.0
-ticks(HW, H, 44)
+ticks(HW, H, 124)
 deliver(HW, CW, C)
 ticks(CW, C, 2)
 check(mod_calls(HUD, "Update") == 3 and HUD._bar._p.CurrentPercent == 1.0, "(back at 100 for the next steps)")
@@ -450,6 +489,9 @@ say("== C8. respawn: the old character's infection dropped; the host turns it of
 local c8 = #LOG + 1
 A._p["PlayerDead?"] = true
 ticks(CW, C, 2)
+CW.pc._p.Pawn = nil                              -- the character is missing for a moment (death screen)
+ticks(CW, C, 4)
+check(logged("infui: own character replaced", c8) == nil, "pawn briefly missing: the infection state is not dropped")
 local B = character(CW, "BP_PlayerCharacter_C_B", true, false)
 B._p.InGameUI = HUD2                             -- the same HUD object kept (worst case: the plate must go)
 CW.pc._p.Pawn = B
@@ -553,7 +595,7 @@ B._p = setmetatable({}, { __index = function(_, k)
 end, __newindex = rawB })
 WORLD = HW
 medR._p.InfectionAmount = 7.0
-ticks(HW, H, 44)                                -- 11 s: the host's keep
+ticks(HW, H, 124)                                -- 31 s: the host's keep
 local k12 = infui_msgs(HW)
 check(#k12 >= 1 and k12[#k12] == "SDC1|INFUI|1|7.00", "host (on) keeps sending 7.00")
 deliver(HW, CW, C)

@@ -120,7 +120,7 @@ items.host_tick({ pc })
 handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "1000", "2000", "50" }, pc)
 assert(#adds == 1 and adds[1].da == scrap and adds[1].n == 2, "output not added")
 assert(#consumed == 1 and consumed[1].t == scomp and consumed[1].a == 1 and consumed[1].n == 1, "input not consumed")
-assert(has_log("guest disassembled at Buildable_DisassemblyWorkbench_C_3: Pistol x1 -> Scrap x2; skipped Can (cannot be disassembled)"),
+assert(has_log("guest disassembled at Buildable_DisassemblyWorkbench_C_3: Pistol x1 -> Scrap x2 (1 hit(s), 1 add(s)); skipped Can (cannot be disassembled)"),
   "disassembly log: " .. tostring(logs[#logs]))
 -- full station: the output drops at the player
 full = true
@@ -131,7 +131,7 @@ end
 local t0 = os.clock(); while os.clock() - t0 < 0.55 do end
 handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "1000", "2000", "50" }, pc)
 assert(dropped and dropped[F_ITEMID] == scrap and dropped.count == 2, "full station: not dropped at the player")
-assert(has_log("Scrap x2 dropped at the player"), "drop log")
+assert(has_log("Scrap x2 (1 hit(s), 1 add(s)) dropped at the player"), "drop log")
 -- refused: too soon, wrong class, out of reach
 handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "1000", "2000", "50" }, pc)
 assert(has_log("refused (too soon)", "warn"), "rate limit")

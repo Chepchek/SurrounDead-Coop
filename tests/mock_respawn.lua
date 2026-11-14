@@ -234,6 +234,21 @@ goh.pre(param(comp), param(1930), param(630))
 check(#sent == 0, "host's own use: no message")
 bed._p.CurrentActor = nil
 check(ctx.scope_resolver(comp) == nil, "no CurrentActor: no opinion")
+-- sdc_ctx's idle check (the host's fast exit): bed routing is on for the
+-- whole game, yet only a BedComponent is busy; any other object whose class
+-- the resolver has read is idle (it was never idle with bed routing on)
+do
+    local ca, sa = ctx.addr(comp), ctx.addr(host_pawn)
+    check(respawn.resolver_idle(sa) == false and ctx.busy["respawn:a scope is open"], "idle check: an open scope keeps everything busy")
+    T = T + 10   -- the scopes run out; the next slow call prunes them
+    ctx.scope_resolver(host_pawn)
+    check(respawn.resolver_idle(ca) == false, "idle check: a bed component is busy")
+    check(respawn.resolver_idle(ctx.addr(body)) == false, "idle check: an object not seen yet is busy (class unknown)")
+    check(ctx.scope_resolver(host_pawn) == nil, "a non-bed object: no opinion")
+    check(respawn.resolver_idle(sa) == true, "idle check: ... idle once its class is known (bed routing on) ")
+    check(respawn.resolver_idle(ca) == false, "idle check: the bed component stays busy")
+    check(ctx.busy["respawn:a bed"] and ctx.busy["respawn:class of the object not read yet"], "busy reasons counted")
+end
 
 -- SLEEP from the client
 print("sleep")

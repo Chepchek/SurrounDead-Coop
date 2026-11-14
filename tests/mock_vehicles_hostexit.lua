@@ -172,7 +172,8 @@ local function deliver(kind, args, from_pc)
 end
 
 local gi = new_obj("SD_GameInstance_C", "SD_GameInstance_C_0", {}, {})
-ctx.scope_resolver = function(wco) if wco == gi then return nil end return nil end
+local fake_prev = function(wco) if wco == gi then return nil end return nil end
+ctx.scope_resolver = fake_prev
 
 local V = require("sdc_vehicles")
 local S = { role = "host", remote = {}, remote_pcs = {}, client = nil }
@@ -489,6 +490,24 @@ T = T + 0.1
 run_delayed()
 check(truck._vi_by == cl_ch and cl_ch._p["InVehicle?"] == true, "H3: the client's get-in step went to the client")
 check(host_free(), "H3: the host standing at the car keeps its control")
+-- sdc_ctx's idle check while the client drives (the vehicle is watched): the
+-- host's fast exit works for objects that are no part of a watched vehicle
+do
+    ctx.set_idle_check(fake_prev, function() return true end)
+    local probe = new_obj("StaminaComponent_C", "IdleProbe", {}, {})
+    local part = new_obj("VehicleMovementComponent_C", "IdlePart", {}, {})
+    part._outer = truck
+    local pa, ta = ctx.addr(probe), ctx.addr(part)
+    local rs = ctx.scope_resolver
+    check(ctx.resolver_idle(rs, ctx.addr(truck)) == false, "H3 idle: the watched vehicle itself is busy")
+    check(ctx.resolver_idle(rs, pa) == false, "H3 idle: an object not seen yet is busy (its outer is unknown)")
+    rs(probe, pa); rs(part, ta)
+    check(ctx.resolver_idle(rs, pa) == true, "H3 idle: ... idle once its outer is known not to be a vehicle")
+    check(ctx.resolver_idle(rs, ta) == false, "H3 idle: a part of the watched vehicle stays busy")
+    check(ctx.busy["vehicles:a watched vehicle"] and ctx.busy["vehicles:part of a watched vehicle"]
+        and ctx.busy["vehicles:outer of the object not read yet"], "H3 idle: reasons counted")
+    ctx.set_idle_check(fake_prev, nil)
+end
 T = T + 3
 V.tick()
 deliver("VEXIT", with(vstr(truck), "d", "3.0", "driver"), cl_pc)

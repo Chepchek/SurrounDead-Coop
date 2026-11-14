@@ -71,7 +71,8 @@ local M = {
 local MSG = "INFUI"
 local POLL_S = 1.0          -- s: host: remote players' infection read this often
 local FIRST_KEEP_S = 2      -- s: host: "on" once more this soon after it turned on
-local KEEP_S = 10           -- s: host: "on" again this often while on
+local KEEP_S = 30           -- s: host: "on" again this often while on (the verify; the game's own bar update keeps the percent current)
+local OFF_KEEP_S = 120      -- s: host: "off" again this often to a client that was ever told "on" (a lost "off" must not leave the bar on)
 local GRACE_S = 1.0         -- s: client: a wrong plate state must last this long before it is fixed
 local MAX_TRIES = 3         -- client: animation calls per wanted state and HUD before giving up
 local SHOWN_AT = 0.5        -- RenderOpacity from which the plate counts as shown
@@ -168,6 +169,7 @@ local function send(pc, r, on, amount, now, why)
     local v = (on and type(amount) == "number") and string.format("%.2f", amount) or ""
     if not net.send_to(pc, MSG, on and "1" or "0", v) then return false end
     r.sent = on
+    if on then r.ever = true else r.off_at = now + OFF_KEEP_S end
     r.next_at = now + (why == "on" and FIRST_KEEP_S or KEEP_S)
     local s = M.stats
     if why == "on" then
@@ -196,6 +198,12 @@ local function host_tick(now)
                 st.recs[a] = r
             end
             local pawn = ue.pawn_of(pc)
+            -- another character: its client knows nothing of it - "on" goes now, not at the next verify
+            local pa = pawn and addr(pawn) or nil
+            if pa ~= r.pawn_a then
+                r.pawn_a = pa
+                if r.sent == true then r.next_at = 0 end
+            end
             local on, med = nil, nil
             if pawn then on, med = infection_of(pawn) end
             if on == true and not en then on = false end   -- switched off here: a plate told "on" goes away
@@ -215,6 +223,8 @@ local function host_tick(now)
                     log.info("infui: %s no longer infected on the host (%s) -> INFUI off to its screen", who(pawn, pc),
                         en and "Infection? false: cured, or a new character" or "client_infection_hud off here")
                 end
+            elseif on == false and r.ever and now >= (r.off_at or 0) then
+                send(pc, r, false, nil, now, "off_keep")
             end
         end
     end
@@ -382,7 +392,8 @@ end
 local function client_tick(now)
     local me = own_pawn()
     local pa = me and addr(me) or nil
-    if pa ~= st.pawn then
+    if pa ~= nil and pa ~= st.pawn then
+        -- (pa == nil: the character is only missing for a moment, e.g. at death: nothing is forgotten)
         -- the own character went away (death, respawn): its infection with
         -- it. (No reset when the new one appears: an INFUI for it may already
         -- be here.) The plate state stays with its HUD.

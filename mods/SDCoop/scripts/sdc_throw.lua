@@ -205,7 +205,7 @@ local PROJ_NO_ACK_S = 1.5       -- s without THRACK: the own projectile is the g
 local PROJ_MAX_SPEED = 20000    -- cm/s (InitialSpeed 3000..10000)
 local PROJ_MAX_DMG = 100000
 local STOP_MATCH_CM = 300       -- bolt -> SERVER_DamageEvent impact point
-local CAP_RESEND_S = 60         -- host: PRJCAP again this often
+local CAP_RESEND_S = 300        -- host: PRJCAP again this often (the verify; a change or a new character goes at once)
 
 local st = {
     hooks = {},                 -- [key] = true once registered (or failed: never retried)

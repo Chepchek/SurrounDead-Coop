@@ -400,7 +400,7 @@ end
 
 -- One grid of a component's server data: { [uid] = count }, and its free
 -- slots (nil when unknown).
-local function grid_items(comp, cuid)
+local function grid_items(comp, cuid, want_free)
     local items, rc = {}, nil
     pcall(function()
         comp.MainJigContainers:ForEach(function(_, c)
@@ -415,6 +415,7 @@ local function grid_items(comp, cuid)
             items[guid_str(item[F_USID])] = math.floor(tonumber(item[F_INFO][F_COUNT]) or 0)
         end)
     end)
+    if not want_free then return items, nil end
     local free = 0
     local ok = pcall(function()
         rc[F_SLOTS]:ForEach(function(_, sl)
@@ -424,13 +425,38 @@ local function grid_items(comp, cuid)
     return items, ok and free or nil
 end
 
+local run_fallbacks = 0   -- adds of this disassembly that went the old way
+
+-- A stack of this item in the grid with room left: its uid and the room
+-- (MaxStack - count), or nil.
+local function partial_stack(comp, cuid, da)
+    local max = math.floor(tonumber(ue.prop(da, "MaxStack")) or 0)
+    local dk = addr(da)
+    if max < 2 or not dk then return nil end
+    local uid, room = nil, 0
+    pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            local x = c:get()
+            if uid or guid_str(x[F_CONT_UID]) ~= cuid then return end
+            x[F_ITEMS]:ForEach(function(_, it)
+                if uid then return end
+                local item = it:get()
+                local n = math.floor(tonumber(item[F_INFO][F_COUNT]) or 0)
+                if n < max and addr(item[F_INFO][F_ITEMID]) == dk then uid, room = guid_str(item[F_USID]), max - n end
+            end)
+        end)
+    end)
+    return uid, room
+end
+
 -- One output into the output grid (single player's place for it). Returns
--- how it went: "" (added), " (stacked)", " dropped at the player (output grid
+-- how it went (and, when nil, how much of n is still to add the old way): "" (added), " (stacked)", " dropped at the player (output grid
 -- full)", " to the first grid with room (fallback)", or a failure.
-local function add_to_grid(comp, pawn, da, n, grid)
+local add_to_grid
+function add_to_grid(comp, pawn, da, n, grid)
     local before = grid_items(comp, grid.uid)
     local ok, err = pcall(function() comp:AddItemToContainerByName(FName(grid.name), da, n, false, nil, 0) end)
-    local after, free = grid_items(comp, grid.uid)
+    local after = grid_items(comp, grid.uid)
     local got, new, cnt = 0, {}, {}
     for u, c in pairs(after) do
         local b = before[u]
@@ -453,12 +479,28 @@ local function add_to_grid(comp, pawn, da, n, grid)
         M.stats.disasm_to_grid = M.stats.disasm_to_grid + 1
         return #new == 0 and " (stacked)" or ""
     end
+    -- (the free slots are counted only now: a walk of every slot per output was most of a run's cost)
+    local _, free = grid_items(comp, grid.uid, true)
     if free == 0 then
+        -- the grid is full, but a partial stack of this item can take part of it (the game's
+        -- stacking: AddItemToContainerByName tops up only when the whole n fits): fill its room, then the rest
+        local pu, room = partial_stack(comp, grid.uid, da)
+        if pu and room > 0 and room < n then
+            local how = add_to_grid(comp, pawn, da, room, grid)
+            if how then
+                local how2, rest = add_to_grid(comp, pawn, da, n - room, grid)
+                if how2 then return how2 end
+                return nil, rest or (n - room)
+            end
+        end
         if drop_at(pawn, da, n) then return " dropped at the player (output grid full)" end
         return " LOST (output grid full, no drop)"
     end
-    log.warn("stations: %s x%d did not go into grid %d '%s' (%s, %s free slot(s)): added the old way", item_name(da), n,
-        grid.idx, grid.name, ok and "nothing added" or ("FAILED: " .. tostring(err)), tostring(free))
+    -- one warning per run (a 1000-stack went through here once per output: 3500 lines); the count is in the run's summary line
+    run_fallbacks = run_fallbacks + 1
+    local line = string.format("stations: %s x%d did not go into grid %d '%s' (%s, %s free slot(s)): added the old way",
+        item_name(da), n, grid.idx, grid.name, ok and "nothing added" or ("FAILED: " .. tostring(err)), tostring(free))
+    if run_fallbacks == 1 then log.warn("%s", line) end
     return nil
 end
 
@@ -468,7 +510,8 @@ end
 local function add_output(comp, pawn, da, n, grid)
     local named = grid and grid.name and grid.name ~= ""
     if named then
-        local how = add_to_grid(comp, pawn, da, n, grid)
+        local how, rest = add_to_grid(comp, pawn, da, n, grid)
+        if rest then n = rest end
         if how then
             if how:find("dropped", 1, true) then return how, "dropped" end
             return how, how:find("LOST", 1, true) and "other" or "grid"
@@ -505,6 +548,7 @@ local function disassemble(station, pawn)
         end)
     end)
     M.stats.disasm_runs = M.stats.disasm_runs + 1
+    run_fallbacks = 0
     -- where the results go: the output grid, as the station's window adds them
     local grid = M.output_grid(comp)
     local placed = { grid = 0, dropped = 0, other = 0 }
@@ -528,16 +572,41 @@ local function disassemble(station, pawn)
                     local chance = tonumber(p[R_CHANCE]) or 0
                     local lo, hi = math.floor(tonumber(p[R_MIN]) or 1), math.floor(tonumber(p[R_MAX]) or 1)
                     if hi < lo then hi = lo end
-                    for _ = 1, e.n do
-                        if ue.valid(out_da) and math.random() * 100 <= chance then
-                            local cnt = math.random(lo, hi)
-                            if cnt > 0 then
-                                local how, went = add_output(comp, pawn, out_da, cnt, grid)
-                                M.stats.disasm_outputs = M.stats.disasm_outputs + 1
-                                placed[went] = placed[went] + 1
-                                got[#got + 1] = string.format("%s x%d%s", item_name(out_da), cnt, how)
+                    -- the rolls are the game's (once per unit); the hits of one output item are
+                    -- added together, as stacks of at most its MaxStack (up to 0.12.0 every hit was
+                    -- an add of its own: a stack of 1000 = ~3500 adds, each with two grid walks, a
+                    -- reliable message per viewer and a log line)
+                    local total, hits, hitlist = 0, 0, {}
+                    if ue.valid(out_da) then
+                        for _ = 1, e.n do
+                            if math.random() * 100 <= chance then
+                                local cnt = math.random(lo, hi)
+                                if cnt > 0 then
+                                    total = total + cnt
+                                    hits = hits + 1
+                                    hitlist[hits] = cnt
+                                end
                             end
                         end
+                    end
+                    if total > 0 then
+                        local max = math.floor(tonumber(ue.prop(out_da, "MaxStack")) or 0)
+                        -- (MaxStack unreadable: every hit is an add of its own, as before)
+                        local pieces = hitlist
+                        if max >= 1 then
+                            pieces = {}
+                            for left = total, 1, -max do pieces[#pieces + 1] = math.min(left, max) end
+                        end
+                        local how_n, hows = 0, {}
+                        for _, cnt in ipairs(pieces) do
+                            local how, went = add_output(comp, pawn, out_da, cnt, grid)
+                            M.stats.disasm_outputs = M.stats.disasm_outputs + 1
+                            placed[went] = placed[went] + 1
+                            how_n = how_n + 1
+                            if how ~= "" and not hows[how] then hows[how] = true; hows[#hows + 1] = how end
+                        end
+                        got[#got + 1] = string.format("%s x%d (%d hit(s), %d add(s))%s", item_name(out_da), total, hits,
+                            how_n, table.concat(hows))
                     end
                 end
                 local ok, err = pcall(function() comp:SERVER_RequestConsumeItem(comp, e.uid, e.n, "") end)
@@ -549,6 +618,7 @@ local function disassemble(station, pawn)
     end
     local where = grid and string.format("output grid %d of %d '%s'", grid.idx, grid.n, tostring(grid.name))
         or "no output grid found: the first grid with room"
+    if run_fallbacks > 1 then where = where .. string.format(" [%d adds went the old way]", run_fallbacks) end
     log.info("stations: %s disassembled at %s: %s%s; disassembly results -> %s (%d there, %d dropped at the player, %d elsewhere)",
         ue.short(pawn), ue.short(station), #done > 0 and table.concat(done, "; ") or "nothing to disassemble",
         #skipped > 0 and ("; skipped " .. table.concat(skipped, ", ")) or "", where, placed.grid, placed.dropped,

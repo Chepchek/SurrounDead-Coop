@@ -450,6 +450,17 @@ local function chain_idle(a)
     return M.resolver_idle(M.scope_resolver, a) and M.resolver_idle(M.stand_in, a)
 end
 
+-- Why the fast exit did not fire ([PERF] "slow path:"). An idle check that
+-- answers false names its reason here (M.note_busy("module:why"), a string
+-- constant: no allocation); the hook counts its own reasons (cache miss, a
+-- remote player's entry, observer, a check that threw). The 1st false link of
+-- the chain is the one counted: the rest is not asked.
+local BUSY = {}
+M.busy = BUSY
+function M.note_busy(reason)
+    BUSY[reason] = (BUSY[reason] or 0) + 1
+end
+
 local function controller_of(obj)
     local o = obj
     for _ = 1, 4 do
@@ -696,13 +707,23 @@ local function make_hook(path)
                     if M.client_mode then
                         -- client: an object already known as not another player's
                         if client_cache[a] == false then return end
-                    elseif cache[a] == false then
-                        local oki, idle = pcall(chain_idle, a)
-                        if oki and idle then
-                            PS.idle = PS.idle + 1
-                            return
+                    else
+                        local c = cache[a]
+                        if c == false then
+                            local oki, idle = pcall(chain_idle, a)
+                            if oki and idle then
+                                PS.idle = PS.idle + 1
+                                return
+                            end
+                            if not oki then M.note_busy("ctx:idle check threw") end
+                        elseif c == nil then
+                            M.note_busy("ctx:first call of the object this second")
+                        else
+                            M.note_busy("ctx:remote player's object")
                         end
                     end
+                else
+                    M.note_busy("ctx:debug observer (gap_trace)")
                 end
             end
         end
@@ -852,6 +873,7 @@ end
 -- [PERF] "ctx:" for the window since the last call (sdc_perf.report), or nil
 -- when the hooks did nothing. `dt` = the window in seconds.
 local pwin = {}
+local bwin = {}
 function M.perf_text(dt)
     local d = {}
     for k, v in pairs(PS) do
@@ -861,15 +883,28 @@ function M.perf_text(dt)
     dt = math.max(0.001, tonumber(dt) or 1)
     if d.calls <= 0 and d.miss <= 0 then return nil end
     -- a client's own lookups (client mode): misses = full walks
+    local why = ""
+    do
+        local rows = {}
+        for k, v in pairs(BUSY) do
+            local dv = v - (bwin[k] or 0)
+            bwin[k] = v
+            if dv > 0 then rows[#rows + 1] = { k = k, n = dv } end
+        end
+        table.sort(rows, function(x, y) return x.n > y.n end)
+        local parts = {}
+        for i = 1, math.min(#rows, 6) do parts[i] = string.format("%s %.1f/s", rows[i].k, rows[i].n / dt) end
+        if #parts > 0 then why = "; slow path because: " .. table.concat(parts, ", ") end
+    end
     local client = ""
     if M.client_mode or d.cmiss > 0 then
         client = string.format(", client misses %.1f/s %.1fms/s", d.cmiss / dt, d.cmiss_ms / dt)
     end
     return string.format("%.0f calls/s (idle shortcut %.0f/s, index not 0 %.0f/s), player_for misses %.1f/s"
         .. " %.1fms/s, resolver answers %.1f/s, redirected %.1f/s %.1fms/s, weapon quiet %.1f/s, context read"
-        .. " ~%s us/call%s", d.calls / dt, d.idle / dt, d.idx / dt, d.miss / dt, d.miss_ms / dt, d.answered / dt,
+        .. " ~%s us/call%s%s", d.calls / dt, d.idle / dt, d.idx / dt, d.miss / dt, d.miss_ms / dt, d.answered / dt,
         d.redirect / dt, d.redirect_ms / dt, d.quiet / dt,
-        d.arg_n > 0 and string.format("%.1f", d.arg_ms * 1000 / d.arg_n) or "?", client)
+        d.arg_n > 0 and string.format("%.1f", d.arg_ms * 1000 / d.arg_n) or "?", client, why)
 end
 
 return M

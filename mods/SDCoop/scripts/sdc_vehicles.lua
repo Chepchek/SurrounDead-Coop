@@ -1219,11 +1219,32 @@ end
 
 -- sdc_ctx's idle check: true exactly when my_resolver would answer nil for
 -- this address now without side effects (its fast branch + the chain behind).
+-- While a vehicle is watched (a client drives, a window is open) only an
+-- object that belongs to one can get an answer (vehicle_context: the
+-- vehicle itself or an object whose outer it is): an address whose outer
+-- is already known (outer_cache, filled by resolve on its first slow call)
+-- and is no watched vehicle is idle too.
 local function resolver_idle(a)
-    if watch_n == 0 or not S or S.role ~= "host" then
-        return ctx.resolver_idle ~= nil and ctx.resolver_idle(prev_resolver, a)
+    if watch_n ~= 0 and S and S.role == "host" then
+        local st = vs[a]
+        if st and st.watch then
+            ctx.note_busy("vehicles:a watched vehicle")
+            return false
+        end
+        local c = outer_cache[a]
+        if c == nil then
+            ctx.note_busy("vehicles:outer of the object not read yet")
+            return false
+        end
+        if c then
+            local st2 = vs[c]
+            if st2 and st2.watch then
+                ctx.note_busy("vehicles:part of a watched vehicle")
+                return false
+            end
+        end
     end
-    return false
+    return ctx.resolver_idle ~= nil and ctx.resolver_idle(prev_resolver, a)
 end
 
 local function ensure_resolver()
@@ -2696,6 +2717,10 @@ local function on_vbuy(f, pc)
         return no("money", have, price, string.format("%s money in its inventory here, price %d (%s)", tostring(have), price, src))
     end
     local took = ue.try(function() return jig:TakeMoney(price, da, {}) end)
+    do   -- (sdc_consume's walk of that inventory is due)
+        local cm = package.loaded["sdc_consume"]
+        if type(cm) == "table" and cm.touch then cm.touch(jig) end
+    end
     if took ~= true then
         return no("take", have, price, string.format("TakeMoney(%d) failed (%s money here)", price, tostring(have)))
     end

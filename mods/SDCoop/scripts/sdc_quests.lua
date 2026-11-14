@@ -145,7 +145,7 @@ local Q = {
 local QC_STARTED = 1          -- EQuestCompletion::QC_Started
 local MAX_QUESTS = 8
 local TEXT_MAX = 80           -- characters per quest / task text in QS
-local QS_RESEND_S = 30
+local QS_RESEND_S = 120   -- the verify (a change of the list goes at once)
 local CRATE_MATCH = 400       -- uu between the client's crate and the host's
 local CRATE_PAWN = 1200       -- uu between the crate and the client's character
 

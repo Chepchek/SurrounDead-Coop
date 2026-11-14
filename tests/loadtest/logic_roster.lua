@@ -25,7 +25,7 @@ local function stub()
         return f
     end })
 end
-local REAL = { sdc_session = true, sdc_log = true, sdc_config = true }
+local REAL = { sdc_session = true, sdc_log = true, sdc_config = true, sdc_netsync = true }
 table.insert(package.searchers, 2, function(name)
     if REAL[name] or not name:match("^sdc_") then return nil end
     return function() return stub() end
@@ -41,7 +41,8 @@ local sent = {}           -- { pc = key, kind = , fields = {} }
 local handlers = {}
 local net = stub()
 net.on = function(kind, fn) handlers[kind] = fn end
-net.send_to = function(pc, kind, ...) sent[#sent + 1] = { pc = pc.key, kind = kind, fields = { ... } } return true end
+local FAIL_SEND = false
+net.send_to = function(pc, kind, ...) if FAIL_SEND then return false end sent[#sent + 1] = { pc = pc.key, kind = kind, fields = { ... } } return true end
 net.broadcast = function() end
 net.send_to_host = function() return true end
 package.loaded["sdc_net"] = net
@@ -77,6 +78,8 @@ local st = session.state
 local real_time = os.time
 local fake_now = 5000
 os.time = function() return fake_now end
+local fake_clock = 1000
+os.clock = function() return fake_clock end   -- sdc_netsync's verify clock
 
 ok(type(session.roster) == "function", "sdc_session.roster exists")
 ok(handlers.ROSTER ~= nil, "ROSTER handler registered")
@@ -116,25 +119,107 @@ local f = rosters.bobpc or {}
 ok(#f == 12 and f[1] == "Hosty" and f[2] == "host" and f[4] == "0" and f[5] == "Bob" and f[6] == "game"
     and f[7] == "40" and f[8] == "1" and f[9] == "Gleb" and f[12] == "0", "ROSTER fields for Bob: " .. table.concat(f, "|"))
 ok((rosters.glebpc or {})[12] == "1" and (rosters.glebpc or {})[8] == "0", "Gleb's copy marks Gleb")
--- unchanged next second: nothing; after 5 s: again; on a change: at once
+-- unchanged: nothing (not even after 5 s, pings wobbling by a few ms); the verify
+-- after 30 s; on a change: at once; a ping that moved a lot: at once
+local function count_rosters()
+    local k = 0
+    for _, m in ipairs(sent) do if m.kind == "ROSTER" then k = k + 1 end end
+    return k
+end
+local function step(dt)
+    fake_now = fake_now + dt
+    fake_clock = fake_clock + dt
+    session.tick()
+end
 sent = {}
-fake_now = fake_now + 1
-session.tick()
-local n = 0
-for _, m in ipairs(sent) do if m.kind == "ROSTER" then n = n + 1 end end
-ok(n == 0, "no ROSTER when nothing changed")
-fake_now = fake_now + 5
-session.tick()
-n = 0
-for _, m in ipairs(sent) do if m.kind == "ROSTER" then n = n + 1 end end
-ok(n == 2, "ROSTER again after 5 s (pings)")
+step(1)
+ok(count_rosters() == 0, "no ROSTER when nothing changed")
+bob.ping = 52          -- +12 ms: not worth a list
+step(5)
+ok(count_rosters() == 0, "no ROSTER after 5 s: a ping wobble of 12 ms is not told")
 sent = {}
-fake_now = fake_now + 1
+bob.ping = 90          -- +50 ms from what was told
+step(1)
+ok(count_rosters() == 2, "a ping that moved by 50 ms goes at once")
+local hf0
+for _, m in ipairs(sent) do if m.kind == "ROSTER" and m.pc == "glebpc" then hf0 = m.fields end end
+ok(hf0 and hf0[7] == "90", "... with the new ping")
+sent = {}
+step(20)
+ok(count_rosters() == 0, "20 s later: still nothing")
+step(11)
+ok(count_rosters() == 2, "the verify: the list again after 30 s")
+sent = {}
+step(1)
 gleb.pawn = { key = "glebpawn" }
-session.tick()
-n = 0
-for _, m in ipairs(sent) do if m.kind == "ROSTER" then n = n + 1 end end
-ok(n == 2, "ROSTER at once when a state changes")
+step(1)
+ok(count_rosters() == 2, "ROSTER at once when a state changes")
+-- what the host knows of a client's knockdown cap goes into its own "me" field
+package.loaded["sdc_down"] = { downcap_level = function(key) return key == "bobpc" and 2 or 0 end,
+                               downcap = function(key) return key == "bobpc" end, state_of = function() return nil end }
+sent = {}
+step(1)
+local bobf, glebf
+for _, m in ipairs(sent) do
+    if m.kind == "ROSTER" and m.pc == "bobpc" then bobf = m.fields end
+    if m.kind == "ROSTER" and m.pc == "glebpc" then glebf = m.fields end
+end
+ok(bobf and bobf[8] == "3" and bobf[4] == "0", "Bob's me field says 3: the host knows DOWNCAP + ready")
+ok(glebf == nil, "Gleb's list did not change: not sent")
+package.loaded["sdc_down"] = nil
+sent = {}
+step(1)
+ok(count_rosters() >= 1, "the cap forgotten again: the list goes again")
+-- a client that says HI again knows nothing: its list goes at once
+sent = {}
+step(1)
+ok(count_rosters() == 0, "quiet again")
+handlers.HI({ "0.1", "Bob" }, bob)
+sent = {}
+step(1)
+local after_hi = false
+for _, m in ipairs(sent) do if m.kind == "ROSTER" and m.pc == "bobpc" then after_hi = true end end
+ok(after_hi, "after a client's HI its list goes at once")
+
+-- a send that failed is not counted as told: the next check sends it again
+FAIL_SEND = true
+bob.ping = 150
+sent = {}
+step(1)
+ok(count_rosters() == 0, "failed sends: nothing went out")
+FAIL_SEND = false
+step(1)
+ok(count_rosters() == 2, "the failed list goes with the next check")
+-- a client that is gone is forgotten (prune); back again it gets its list although the text is the same
+local netsync = require("sdc_netsync")
+PCS = { bob }
+step(1)
+ok(netsync.known("bobpc", "ROSTER") and not netsync.known("glebpc", "ROSTER"), "prune: the client that left is forgotten, the other not")
+PCS = { bob, gleb }
+sent = {}
+step(1)
+local gleb_back = false
+for _, m in ipairs(sent) do if m.kind == "ROSTER" and m.pc == "glebpc" then gleb_back = true end end
+ok(gleb_back, "back again: its list goes at once")
+
+-- traffic of an idle host with two clients, 6 minutes, the pings wobbling by a few ms:
+-- NETQ line for the net-quiet report
+do
+    sent = {}
+    for i = 1, 360 do
+        bob.ping = 90 + (i % 3) * 5
+        step(1)
+    end
+    local n, bytes = 0, 0
+    for _, m in ipairs(sent) do
+        if m.kind == "ROSTER" then
+            n = n + 1
+            bytes = bytes + 12
+            for _, v in ipairs(m.fields) do bytes = bytes + #tostring(v) + 1 end
+        end
+    end
+    io.write(string.format("NETQ ROSTER idle (2 clients) msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+end
 
 -- 0.7.3 wave: "lag" (nothing received for 4 s), "menu" (AWAY), the host's own state
 local function state_of(name)
@@ -203,6 +288,13 @@ st.client = nil
 ok(#session.roster() == 0, "no client state: empty list")
 st.role = "standalone"
 ok(#session.roster() == 0, "standalone: empty list")
+
+-- a new world: everybody is told again
+st.role = "host"
+step(1)
+ok(netsync.known("bobpc", "ROSTER"), "(a record exists before the reset)")
+session.reset_world("test")
+ok(not netsync.known("bobpc", "ROSTER") and not netsync.known("glebpc", "ROSTER"), "reset_world: nobody has a record")
 
 os.time = real_time
 print = real_print

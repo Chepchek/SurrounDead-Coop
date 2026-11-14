@@ -35,7 +35,7 @@
 --   sdc_chat     text chat between the players (Enter opens a line bottom left; host relays, names are the host's)
 --   sdc_persist other players' characters saved with the host's world (installed by sdc_progress via sdc_respawn)
 
-local VERSION = "0.12.0"
+local VERSION = "0.12.1"
 
 local log = require("sdc_log")
 local perf = require("sdc_perf")         -- [PERF] cost of every mod hook and task; wraps RegisterHook first

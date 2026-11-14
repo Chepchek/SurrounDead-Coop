@@ -675,11 +675,14 @@ end
 -- host_player; entries { uid, id = item name, cuid = its grid, sub = its
 -- first grid }): an item in a grid whose window refuses its kind (or kind /
 -- window / grid not learned yet) -> M.rescue reads the data and decides.
-function M.scan(pawn, jig, inv)
+-- The walk is only renewed when the inventory changed (sdc_consume); `again`
+-- (the 1 s tick): the same snapshot is looked at again, as the retry of a
+-- drop that failed (AGAIN_S) and the time the rescue waits (SCAN_EVERY) need.
+function M.scan(pawn, jig, inv, again)
     -- (a walk with a read error still lists what it read; M.rescue reads again)
     if not S or S.role ~= "host" or type(inv) ~= "table" or cfg.get("refused_items_to_feet") == false then return end
     local k = addr(jig)
-    if not k or R.scanned[k] == inv then return end
+    if not k or (R.scanned[k] == inv and not again) then return end
     R.scanned[k], R.seen_at[k] = inv, clock()
     local now = clock()
     local want = false

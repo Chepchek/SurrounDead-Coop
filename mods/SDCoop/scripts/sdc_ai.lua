@@ -512,11 +512,13 @@ function M.stand_in(wco)
     return f.mod.stand_in(wco)
 end
 -- sdc_ctx's idle check: M.stand_in answers nil without side effects
-M.stand_in_idle = function()
+M.stand_in_idle = function(a)
     local f = FEAT.kills
     if not f.on or not f.mod then return true end
     local idle = f.mod.stand_in_idle
-    return idle ~= nil and idle() == true
+    if idle ~= nil and idle(a) == true then return true end
+    ctx.note_busy("ai:an AI is dying (this object)")
+    return false
 end
 if ctx.set_idle_check then ctx.set_idle_check(M.stand_in, M.stand_in_idle) end
 

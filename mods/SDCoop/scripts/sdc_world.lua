@@ -955,6 +955,7 @@ M.resolver_idle = function(a)
     if S == nil or S.role ~= "host" or cls_cache[a] == false then
         return ctx.resolver_idle ~= nil and ctx.resolver_idle(prev_resolver, a)
     end
+    ctx.note_busy(cls_cache[a] == nil and "world:class of the object not read yet" or "world:a world object (container, door, ...)")
     return false
 end
 
@@ -3558,6 +3559,10 @@ function HV.place(pc, comp, da, n)
     for _, it in ipairs(items) do before[it.uid] = true end
     local res = {}
     local ok, err = pcall(function() comp:Generate_AddNewItemToContainer(g, da, n, {}, res) end)
+    do   -- (sdc_consume's walk of that inventory is due: no JigTryAddItemSomewhere ran for this add)
+        local cm = package.loaded["sdc_consume"]
+        if type(cm) == "table" and cm.touch then cm.touch(comp) end
+    end
     local new
     for _, it in ipairs(HV.walk(comp)) do
         if not before[it.uid] and it.grid == grid and it.name == name then new = it break end

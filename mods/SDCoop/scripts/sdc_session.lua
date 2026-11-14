@@ -13,6 +13,7 @@ local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
 local sync = require("sdc_sync")
+local netsync = require("sdc_netsync")
 local ctx = require("sdc_ctx")
 local players = require("sdc_players")
 local items = require("sdc_items")
@@ -728,8 +729,10 @@ end
 -- Host -> clients: ROSTER|<name>|<state>|<ping>|<me>|<name>|... (4 fields a
 -- player, the host first - a client takes the first entry as the host's
 -- whatever its state; me = 1 on the receiving client's own entry), on a
--- change and every ROSTER_EVERY_S. A client keeps the last list.
-local ROSTER_EVERY_S = 5
+-- change (a ping: by ROSTER_PING_STEP ms) and as a verify every ROSTER_EVERY_S
+-- (sdc_netsync). A client keeps the last list; me = 0 / 1, 2, 3 (see send_roster).
+local ROSTER_EVERY_S = 30     -- the verify: the list again when nothing changed
+local ROSTER_PING_STEP = 25   -- ms: a ping change smaller than this is not worth a list
 local LAG_S = 4
 
 -- Host, 1 s (host_tick): when anything last came from remote player r (the
@@ -835,36 +838,55 @@ function M.roster()
     return out
 end
 
+-- The list goes to a client when its text changes (a name, a state, a ping
+-- that moved by ROSTER_PING_STEP or more, what the host knows of this client's
+-- own knockdown cap), and again every ROSTER_EVERY_S as the verify (sdc_netsync:
+-- a lost list / a client's new world heals by itself). Checked every second
+-- here, nothing is sent while the text is the same.
 local function send_roster(now)
     local pcs = st.remote_pcs or {}
     if #pcs == 0 then
-        st.roster_sig = nil
+        st.roster_ping = nil
+        netsync.reset()
         return
     end
     local list = host_roster()
-    local sig = {}
-    for _, e in ipairs(list) do sig[#sig + 1] = e.name .. "/" .. e.state end
-    sig = table.concat(sig, ";")
-    if sig == st.roster_sig and now - (st.roster_at or 0) < ROSTER_EVERY_S then return end
-    st.roster_sig, st.roster_at = sig, now
+    -- a ping reported once stays until it moves by ROSTER_PING_STEP (it
+    -- wobbles by a few ms all the time: no reason to tell anybody)
+    local shown = st.roster_ping or {}
+    st.roster_ping = shown
+    for _, e in ipairs(list) do
+        if e.ping then
+            local last = shown[e.name]
+            if last == nil or math.abs(e.ping - last) >= ROSTER_PING_STEP then shown[e.name] = e.ping end
+            e.ping = shown[e.name]
+        end
+    end
+    local live = {}
     for _, pc in ipairs(pcs) do
         local key = ue.name(pc)
+        live[key] = true
         local fields = {}
+        local dn = package.loaded["sdc_down"]
+        local level = (type(dn) == "table" and type(dn.downcap_level) == "function") and dn.downcap_level(key) or 0
         for _, e in ipairs(list) do
             fields[#fields + 1] = e.name
             -- "down" only for a client that knows it (sdc_down's DOWNCAP): an
             -- older one would show the word as it is
             local state = e.state
-            if state == "down" then
-                local dn = package.loaded["sdc_down"]
-                if not (type(dn) == "table" and type(dn.downcap) == "function" and dn.downcap(key)) then state = "game" end
-            end
+            if state == "down" and level == 0 then state = "game" end
             fields[#fields + 1] = state
             fields[#fields + 1] = e.ping and tostring(e.ping) or ""
-            fields[#fields + 1] = (e.key == key) and "1" or "0"
+            -- "me": 0 no, 1 yes; 2 / 3: yes, and the host knows this client's
+            -- DOWNCAP / its "ready" (the client sends them again when it sees less)
+            fields[#fields + 1] = (e.key == key) and tostring(1 + level) or "0"
         end
-        net.send_to(pc, "ROSTER", table.unpack(fields))
+        local text = table.concat(fields, "|")
+        if netsync.due(key, "ROSTER", text, ROSTER_EVERY_S) and net.send_to(pc, "ROSTER", table.unpack(fields)) then
+            netsync.mark(key, "ROSTER", text)   -- only a list that went out counts as told
+        end
     end
+    netsync.prune(live)
 end
 
 -- Every part of the 1 s ticks is timed ([PERF] "parts", sdc_ue.sub_time:
@@ -1105,6 +1127,11 @@ local function send_away(cs)
     if away == cs.away_sent then return end
     cs.away_sent = away
     net.send_to_host("AWAY", away and "1" or "0")
+    if away then
+        -- the way out to the main menu: the progression the host has not got yet goes now (sdc_persist)
+        local ps = package.loaded["sdc_persist"]
+        if type(ps) == "table" and type(ps.prog_final) == "function" then pcall(ps.prog_final) end
+    end
 end
 
 -- Client phase B (half a second after phase A): items, gear, damage, AI,
@@ -1449,6 +1476,7 @@ function M.reset_world(why, pc_key)
         st.client.host_world = true
     end
     ctx.reset()
+    netsync.reset()   -- every peer must be told again (a world is new there too)
     items.reset()
     appearance.reset()
     pawnstate.reset()
@@ -1601,6 +1629,7 @@ function M.register_handlers()
     net.on("HI", function(f, pc)
         local r = remote_record(pc)
         local first = not r.hello
+        netsync.drop(ue.name(pc))   -- it says HI: it knows nothing yet
         r.hello, r.version = true, f[1]
         if f[2] and f[2] ~= "" then r.name = f[2] end
         net.send_to(pc, "HELLO", M.VERSION, cfg.player_name(), "ack", paks.mine())
@@ -1682,7 +1711,8 @@ function M.register_handlers()
         for i = 1, #f - 3, 4 do
             -- the host is always the first entry (its state may be "dead" / "menu")
             list[#list + 1] = { name = f[i], state = f[i + 1], ping = tonumber(f[i + 2]),
-                                me = f[i + 3] == "1", host = i == 1 or f[i + 1] == "host" }
+                                me = f[i + 3] ~= "0" and f[i + 3] ~= "", host = i == 1 or f[i + 1] == "host" }
+            if list[#list].me then cs.roster_cap = (tonumber(f[i + 3]) or 1) - 1 end
         end
         cs.roster, cs.roster_at = list, os.time()
     end)

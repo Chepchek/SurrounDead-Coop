@@ -438,12 +438,61 @@ check(not timers[gen].GetObjects, "client: OnRep_TurnedOn? restarted it: stopped
 
 -- ------------------------------------------------------------ 8. periodic, expiry, config off
 on("host")
+take()
+-- traffic of an idle minute (nothing opens, one client): NETQ line for the net-quiet report
+do
+    local n, bytes = 0, 0
+    for _ = 1, 720 do   -- 360 s of the 500 ms tick
+        T = T + 0.5
+        tick("host", host_mod)
+    end
+    for _, m in ipairs(take("WBDOOR")) do n = n + 1; bytes = bytes + #m.msg end
+    io.write(string.format("NETQ WBDOOR idle msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+end
 T = T + 21
 tick("host", host_mod)
-check(#take("WBDOOR") >= 1, "host: every 20 s the doors go to every client")
-T = T + 50
+take()
+host_use(hwood, host_pawn)   -- a door the hook sees: WBDOOR|c to the clients now ...
+check(#take("WBDOOR") == 1, "host: a toggled door goes out as one WBDOOR|c")
+T = T + 21
+tick("host", host_mod)
+check(#take("WBDOOR") == 0, "host: ... and the next check does not repeat it inside a snapshot")
+-- door A changes without its hook, door B is used: B's change must not hide A's from the next check
+hgar._p["PoweredOn?"] = not hgar._p["PoweredOn?"]
+host_use(hwood, host_pawn); take()
+T = T + 21
+tick("host", host_mod)
+do
+    local m = take("WBDOOR")
+    check(#m >= 1 and m[1].msg:find("GarageDoor", 1, true) and not m[1].msg:find("WoodenDoor_C", 1, true),
+        "host: door A's silent change goes with the next check (only A: it is B's own record that was marked)")
+end
+host_use(hwood, host_pawn)   -- back
+take()
+T = T + 21
+tick("host", host_mod)
+take()
+T = T + 21
+tick("host", host_mod)
+check(#take("WBDOOR") == 0, "host: unchanged doors are not sent again after 20 s")
+hgar._p["PoweredOn?"] = not hgar._p["PoweredOn?"]   -- a change no hook told the clients about
+T = T + 21
+tick("host", host_mod)
+check(#take("WBDOOR") >= 1, "host: a door that differs from what the client was told goes within one check")
+T = T + 21
+tick("host", host_mod)
+check(#take("WBDOOR") == 0, "host: and is not repeated")
+T = T + 181
+tick("host", host_mod)
+check(#take("WBDOOR") >= 1, "host: the verify: all doors again after 180 s")
+on("client")
+net.handlers.WBDOOR({ "s", "Buildable_WoodenDoor_C 160579,129273,1735 0 - -" }, client_pc)
+T = T + 300
 tick("client", fresh)
-check(fresh.status_line():find("known=0", 1, true) ~= nil, "client: states not refreshed for 45 s are forgotten")
+check(fresh.status_line():find("known=0", 1, true) == nil, "client: a host state is still kept some minutes without a refresh (400 s)")
+T = T + 450
+tick("client", fresh)
+check(fresh.status_line():find("known=0", 1, true) ~= nil, "client: states not refreshed for 400 s are forgotten")
 cfg.set("world_build_doors", false)
 host_use(hwood, host_pawn)
 check(#take() == 0, "doors off: the host sends nothing on a toggle")

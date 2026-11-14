@@ -600,6 +600,32 @@ local sk_after, prog2 = 0, last("PSPROG")
 for _, m in ipairs(sent) do if m.kind == "SKTREE" then sk_after = sk_after + 1 end end
 check(sk_after == sk_before and prog2 and prog2.args[3] == "Skill_HealthRegen,Skill_Parkour",
   "a new skill goes in PSPROG only (no SKTREE): " .. tostring(prog2 and prog2.args[3]))
+-- traffic of a client that runs around for 5 minutes (the fitness XP trickles up every
+-- few seconds, nothing else changes): NETQ line for the net-quiet report
+do
+    local n, bytes = 0, 0
+    local ps = cpc._p.PassiveSkillsComponent._p
+    sent = {}
+    for i = 1, 100 do   -- 100 x 3 s
+        ps.CurrentFitnessXP = ps.CurrentFitnessXP + 0.5
+        advance(3)
+        loops.progress(); loops.persist()
+    end
+    for _, m in ipairs(sent) do
+        if m.kind == "PSPROG" then n = n + 1; for _, a in ipairs(m.args) do bytes = bytes + #tostring(a) + 1 end end
+    end
+    check(n >= 4 and n <= 7, "PSPROG: the small XP goes about once a minute, not every 20 s and not never (" .. n .. " in 5 minutes)")
+    -- the pause menu opens (the way out): what has not gone yet goes now
+    sent = {}
+    ps.CurrentFitnessXP = ps.CurrentFitnessXP + 0.5
+    advance(5); loops.progress(); loops.persist()
+    check(last("PSPROG") == nil, "PSPROG: 5 s after the last one a small XP change waits")
+    ps.CurrentFitnessXP = ps.CurrentFitnessXP + 0.5
+    persist.prog_final()
+    advance(2); loops.progress(); loops.persist()
+    check(last("PSPROG") ~= nil, "PSPROG: prog_final (the pause menu opened): the change goes at once")
+    io.write(string.format("NETQ PSPROG trickle msgs/min=%.1f bytes/min=%.0f", n / 5, bytes / 5), string.char(10))
+end
 S.role = "host"; S.client = nil
 registry["PlayerController"] = { host_pc, bob2.pc }
 ue.forget_world()

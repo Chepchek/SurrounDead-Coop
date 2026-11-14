@@ -220,7 +220,7 @@ handlers.MYNVG({ "1" }, p1.pc)
 sent = {}
 T = T + 1
 items.host_tick({ p1.pc })
-check(p1.walks() == 2, "still one walk per tick")
+check(p1.walks() == 1, "an unchanged inventory is not walked again (the drain is written into the snapshot)")
 pt = msgs("PC1", "PTOOLS")
 it = msgs("PC1", "ITEMS")
 check(#pt == 1 and pt[1].args[2] == "39.85", "PTOOLS after the drain: " .. tostring(pt[1] and pt[1].args[2]))
@@ -240,10 +240,10 @@ sent = {}
 T = T + 1
 local w1, w2 = p1.walks(), p2.walks()
 items.host_tick({ p1.pc, p2.pc })
-check(p1.walks() == w1 + 1 and p2.walks() == w2, "the first player's walk now, the second's not in this frame")
+check(p1.walks() == w1 and p2.walks() == w2, "nothing changed for the first player: no walk; the second's part is not in this frame")
 check(#msgs("PC2", "ITEMS") == 0, "nothing for the second player yet")
 local n = run_delayed("items-player")
-check(n == 1 and p2.walks() == w2 + 1, "the second player's part in a frame of its own")
+check(n == 1 and p2.walks() == w2 + 1, "the second player's part in a frame of its own (its first walk)")
 check(#msgs("PC2", "ITEMS") == 1 and #msgs("PC2", "UIDS") == 1 and #msgs("PC2", "PTOOLS") == 1, "UIDS / ITEMS / PTOOLS for the second player")
 -- a delayed part after a reset, or of a controller gone: nothing
 T = T + 1

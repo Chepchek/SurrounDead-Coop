@@ -2,7 +2,9 @@
 -- Driven by sdc_items (init / host_tick / host_player / client_tick / reset);
 -- its inventory walk (inventory / equipment_of) is shared with sdc_tools and
 -- sdc_items in the host tick (a big inventory: walked in slices over several
--- frames, walk_of). Also the client's check of its inventory against the
+-- frames, walk_of; renewed only after a change signal of that player's
+-- inventory and checked by a fingerprint every 10 s: see "Host: the tick's walk").
+-- Also the client's check of its inventory against the
 -- host's item list: items only the client shows are asked about (GHOSTQ) and
 -- ended by the host.
 --
@@ -88,7 +90,8 @@ local place = require("sdc_place")
 -- slices started over because the inventory changed under them)
 local M = {
     stats = { crafts_sent = 0, crafts_answered = 0, host_crafts = 0, uses = 0, desync_reports = 0,
-              ghosts_asked = 0, ghosts_ended = 0, walks_sliced = 0, walk_slices = 0, walk_restarts = 0 },
+              ghosts_asked = 0, ghosts_ended = 0, walks_sliced = 0, walk_slices = 0, walk_restarts = 0,
+              walks_full = 0, verifies = 0, verify_diffs = 0, signals = 0, dur_patched = 0, dur_unread = 0 },
 }
 local S
 function M.init(state)
@@ -284,6 +287,93 @@ end
 
 local W = nil   -- the walk being filled (module-level callbacks: no closures per item)
 
+-- The host's walks of remote players' inventories (see "Host: the tick's walk"
+-- below): constants, the per-player state and the fingerprint.
+-- by: [JigComponent address] = { pk = character address, inv = last finished
+-- full walk (inv.fp: its fingerprint), ms = its engine time, vms = a
+-- verify's, job = the walk / verify in slices, sig = change signals seen,
+-- snap = the signals the last full walk began after, verified = os.clock()
+-- of the last walk or verify }.
+-- A walk is only started when `sig ~= snap` (a change signal came: touch) or
+-- the last walk / verify is older than VERIFY_S (then only the fingerprint is
+-- read, and a full walk follows only if it differs); `events = false` (config
+-- inventory_walk_events) is the old continuous walk, one every tick.
+-- gen: bumped by reset() (slices of an older session do nothing); J: the job
+-- being stepped; MAX_RESTARTS: see rd_slice.
+-- Fingerprint: sums over every item that do not depend on the order they were
+-- read in - nc containers, ni items, uid (sum of a hash of each UID's first
+-- two words: GUIDs are random), cnt
+-- (sum of counts), nh (sum of count x hash of UID), pos (sum of hash(UID) x (container ordinal, slot index)),
+-- dur (sum of durabilities x 100, rounded) -: a count, an item, a stack, a
+-- move or a durability that differs changes at least one of them.
+local walking = { SYNC_MS = 4, SLICE_MS = 3, GAP_MS = 30, VERIFY_S = 10, MAX_SLICES = 400, MAX_RESTARTS = 3, by = {}, gen = 0,
+                  J = nil, events = true }
+
+function walking.fp_new() return { nc = 0, ni = 0, uid = 0, cnt = 0, nh = 0, pos = 0, dur = 0 } end
+
+local function fp_q(x) return math.floor(x * 100 + 0.5) end
+walking.q = fp_q
+
+function walking.fp_item(f, a, b, n, x, idx)
+    local h = (a * 1000003 + b) % 1000000007
+    f.ni = f.ni + 1
+    f.uid = f.uid + h
+    f.cnt = f.cnt + n
+    f.nh = f.nh + n * h   -- (a count moved from one stack to another with the same total)
+    f.pos = f.pos + (f.nc * 65599 + idx + 1) * h
+    f.dur = f.dur + fp_q(x)
+end
+
+function walking.fp_same(a, b)
+    return a ~= nil and b ~= nil and a.nc == b.nc and a.ni == b.ni and a.uid == b.uid and a.cnt == b.cnt
+        and a.nh == b.nh and a.pos == b.pos and a.dur == b.dur
+end
+
+-- A full walk: { list, by_uid, at0, full = true, fp } to fill; a verify: only fp.
+function walking.fresh() return { list = {}, by_uid = {}, at0 = {}, full = true, fp = walking.fp_new() } end
+function walking.fresh_fp() return { fp = walking.fp_new(), verify = true } end
+
+-- A change signal for the inventory of JigComponent `comp` (a request of its
+-- player, a grant, a multicast, a load ...): its next walk is due at the
+-- next host tick. Only the inventories already walked (remote players') have
+-- an entry; anything else (the game's add / remove functions run for every
+-- item it generates, on every component) costs the address and a table
+-- lookup: IsValid is asked only for a hit.
+function walking.touch(comp)
+    local k = comp ~= nil and addr(comp)
+    local e = k and walking.by[k]
+    if e and ue.valid(comp) then
+        e.sig = e.sig + 1
+        M.stats.signals = M.stats.signals + 1
+    end
+end
+
+-- A durability that changed on the host (the night vision battery drain, a
+-- shot's wear, a filter): written into the snapshot (and a walk in slices)
+-- in place, with its fingerprint; no walk. An item the snapshot does not have:
+-- a change signal.
+local function dur_into(w, uid, new)
+    local en = w and w.by_uid and w.by_uid[uid]
+    if not en then return false end
+    if type(en.dur) == "number" and w.fp then w.fp.dur = w.fp.dur + fp_q(new) - fp_q(en.dur) elseif w.fp then w.fp = nil end
+    en.dur = new
+    return true
+end
+function walking.note_dur(comp, uid, new)
+    if not ue.valid(comp) then return end
+    local k = addr(comp)
+    local e = k and walking.by[k]
+    if not e then return end
+    if type(new) ~= "number" or new ~= new then
+        e.sig = e.sig + 1
+        return
+    end
+    local here = dur_into(e.inv, uid, new)
+    if e.job and e.job.w and e.job.w.full then dur_into(e.job.w, uid, new) end
+    if not here then e.sig = e.sig + 1 end
+    M.stats.dur_patched = M.stats.dur_patched + (here and 1 or 0)
+end
+
 local function rd_dur(info) return info[F_DUR].X end
 local function rd_index(item) return item[F_INDEX] end
 local function rd_cuid(cont) return guid_str(cont[F_CONT_UID]) end
@@ -309,6 +399,9 @@ local function rd_item(it)
     if okd then e.dur = x elseif not w.bad then w.bad = x end
     local oki, i = pcall(rd_index, item)
     if oki then e.idx = i elseif not w.bad then w.bad = i end
+    if w.fp then   -- (the fingerprint of this walk; an item it cannot take in: none, a verify then asks for a full walk)
+        if not (okd and oki and pcall(walking.fp_item, w.fp, a, b, e.n, x, i)) then w.fp = nil end
+    end
     w.sub = nil
     pcall(rd_sub, item)
     e.sub = w.sub
@@ -328,6 +421,7 @@ local function rd_cont(c)
     local cont = c:get()
     local w = W
     w.cuid = nil
+    if w.fp then w.fp.nc = w.fp.nc + 1 end
     if w.full then
         local ok, cu = pcall(rd_cuid, cont)
         if ok then w.cuid = cu elseif not w.bad then w.bad = cu end
@@ -345,7 +439,7 @@ local function rd_all(jig) jig.MainJigContainers:ForEach(cont_cb) end
 -- Host: the inventory of a JigComponent (see above); `full` adds what
 -- sdc_items / sdc_tools need (durabilities, sub-containers).
 function M.inventory(jig, full)
-    local w = { list = {}, by_uid = {}, at0 = {}, full = full == true }
+    local w = { list = {}, by_uid = {}, at0 = {}, full = full == true, fp = full == true and walking.fp_new() or nil }
     if not ue.valid(jig) then return w end
     local prev = W
     W = w
@@ -1052,6 +1146,7 @@ local function on_craft_request(c, station_p, index_p, uids_p)
         return
     end
     local k = addr(comp)
+    walking.touch(comp)
     local before = k and ledger[k]
     local after = server_items(comp)
     if k then ledger[k] = after end
@@ -1130,6 +1225,7 @@ local LEDGER_RPCS = {
 }
 local function renew_ledger(comp)
     if not ue.valid(comp) or not is_remote_character(owner_of(comp)) then return end
+    walking.touch(comp)   -- (a change of that inventory: its walk is due)
     local k = addr(comp)
     if k then ledger[k] = server_items(comp) end
 end
@@ -1672,6 +1768,8 @@ function M.host_drop_report(c, uid_p, count_p, target_p)
     local target = param(target_p)
     if not ue.valid(target) then target = comp end
     local k = addr(target)
+    walking.touch(target)
+    walking.touch(comp)
     local before = k and ledger[k]
     local after = server_items(target)
     if before then ledger[k] = after end
@@ -1934,6 +2032,8 @@ local function on_remove_request(c, target_p, uid_p, amount_p)
     local target = param(target_p)
     if not ue.valid(target) then target = comp end
     local k = addr(target)
+    walking.touch(target)
+    walking.touch(comp)
     local before = k and ledger[k]
     local after = server_items(target)
     if before then ledger[k] = after end
@@ -1973,6 +2073,8 @@ local function on_consume_request(c, target_p, uid_p, amount_p)
     local k = addr(target)
     -- only the player's own inventory has a snapshot; an item used from a
     -- container (a loot box, a station) is not judged ("?")
+    walking.touch(target)
+    walking.touch(comp)
     local before = k and ledger[k]
     local after = server_items(target)
     if k and ledger[k] then ledger[k] = after end
@@ -2196,6 +2298,7 @@ local function on_ghost_msg(f, pc)
             ue.short(pawn), #ended, table.concat(ended, ", "))
     end
     if #held > 0 then
+        walking.touch(comp)   -- (the client list was old: our snapshot may be too)
         local items = package.loaded["sdc_items"]
         if type(items) == "table" and items.resend_items then items.resend_items(pc) end
         log.info("consume: %s asked about %d item(s) that their inventory here has: the item list goes to them again (%s)",
@@ -2217,6 +2320,8 @@ local function on_try_add(c, comp_p, item_p, count_p, added_p)
     if S.role == "client" then
         on_local_add(c, comp_p, item_p, count_p)
     elseif S.role == "host" then
+        walking.touch(param(comp_p))   -- (an add, wherever it ended up: that inventory is walked again)
+        walking.touch(c and c:get())
         on_host_add(c, comp_p, item_p, count_p, added_p)
     end
 end
@@ -2253,11 +2358,108 @@ function GAIN.on_load(c, comp_p)
     local comp = param(comp_p)
     if not ue.valid(comp) then comp = c and c:get() end
     if not ue.valid(comp) then return end
+    walking.touch(comp)   -- (the player's own game loaded its inventory: SERVER_RequestDataFromSave)
     local owner = owner_of(comp)
     if is_remote_character(owner) then place.on_load(owner) end
 end
 
-local function try_hooks_host()
+-- Change signals of the host's inventory walk (see "Host: the tick's walk"):
+-- every call of these on the component of a remote player marks its snapshot
+-- old. SELF: the component the call runs on; PARAMS: also the components its
+-- parameters name (a request to move / drop into another one).
+local SIGNAL_SELF = {
+    -- (the plugin's multicasts: run on the host for every component)
+    "MC_AddNewItem", "MC_ItemRemoved", "MC_MoveItemToIndex", "MC_UpdateStack", "MC_UpdateCount", "MC_UpdateCounts",
+    "MC_NewItemAdded", "MC_SameCompUpdateSplitRequest",
+    -- (the plugin's own server-side functions: every add, removal, stat / custom data write, swap and payment goes
+    -- through them, whoever called: the game, a station, the mod's grants. Plain BlueprintEvents, not RPCs: they run
+    -- - and their hook fires - on the host. The Client RPCs (CLIENT_AddNewItem ...) are NOT hooked: FUNC_NetClient,
+    -- their body does not run on the host for a remote-owned component, so no hook of theirs ever fires there)
+    "TryAddNewItem", "RemoveGetInfo", "AddNewItemToSlot", "FireArmChamberWeapon", "HandleTwoContainerSwap",
+    "TakeMoney", "UpdateStatByUID", "ServerFunc_UpdateCustomDataByUID", "ServerFunc_UpdateDurabilityByUID",
+    "ServerUpdateCountByUID", "ServerFindThenConsumeByItemID",
+    "ServerFunc_HandleMoveToCapacityContainer", "ServerHandleSplitRequest", "ServerFunc_RequestStackItem",
+    "HandleServerDropRequest", "HandleLocalRequestConsumeItem", "ServerFuncHandleEquipActor", "HandleMainPlayerRequestedData",
+}
+local SIGNAL_PARAMS = {
+    "SERVER_RequestDropItem", "SERVER_RequestData", "SERVER_LoadSaveDataFromClientSide",
+    "SERVER_RequestLoadReplaceOneContainerByIndex", "SERVER_RequestSwapContainers", "SERVER_UpdateStatByUID",
+}
+local SIGNAL_TRIES = 6   -- a function missing in this game build is asked for this many times (5 s apart)
+walking.tries, walking.hooks = {}, 0
+
+local function on_signal(c)
+    local ok, comp = pcall(p_get, c)
+    if ok then walking.touch(comp) end
+end
+local function on_signal_params(c, ...)
+    on_signal(c)
+    for i = 1, select("#", ...) do
+        local v = param((select(i, ...)))
+        if type(v) == "userdata" and ue.valid(v) and ue.class_name(v):find("JigComponent", 1, true) then walking.touch(v) end
+    end
+end
+
+-- ServerFuncUpdateDurabilityByUID(UID, MinusDur, DestroyIfZero?, out NewDur),
+-- post (host): the new durability goes into the snapshot in place (a shot's
+-- wear, the night vision drain, a filter); not readable: a change signal.
+local function on_dur_call(c, uid_p, _, destroy_p, out_p)
+    local ok, comp = pcall(p_get, c)
+    if not ok or not ue.valid(comp) then return end
+    local k = addr(comp)
+    if not k or not walking.by[k] then return end
+    local out = param(out_p)
+    local new = type(out) == "number" and out or (type(out) == "userdata" or type(out) == "table") and ue.try(function() return out.NewDur end)
+        or nil
+    local u = ue.try(function() return guid_str(param(uid_p)) end)
+    if u and type(new) == "number" and param(destroy_p) ~= true then
+        walking.note_dur(comp, u, new)
+    else
+        M.stats.dur_unread = M.stats.dur_unread + 1   -- (the log's counters show whether the game gives the new value)
+        walking.touch(comp)
+    end
+end
+
+local function hook_signals()
+    local function one(name, fn)
+        local path = JIG_FN .. name
+        if hooked[path] or (walking.tries[name] or 0) >= SIGNAL_TRIES then return end
+        walking.tries[name] = (walking.tries[name] or 0) + 1
+        walking.tried = true
+        if pcall(RegisterHook, path, fn) then
+            hooked[path] = true
+            walking.hooks = walking.hooks + 1
+            if walking.hooks == #SIGNAL_SELF + #SIGNAL_PARAMS + 1 then
+                log.info("consume: %d change-signal hooks ok (inventory walks only after a change)", walking.hooks)
+            end
+        end
+    end
+    for _, name in ipairs(SIGNAL_SELF) do one(name, on_signal) end
+    for _, name in ipairs(SIGNAL_PARAMS) do one(name, on_signal_params) end
+    one("ServerFuncUpdateDurabilityByUID", on_dur_call)
+    -- the ones this game build does not have (or that could not be hooked): said once
+    if walking.tried and not walking.said then
+        local missing, waiting = {}, false
+        local all = {}
+        for _, n in ipairs(SIGNAL_SELF) do all[#all + 1] = n end
+        for _, n in ipairs(SIGNAL_PARAMS) do all[#all + 1] = n end
+        all[#all + 1] = "ServerFuncUpdateDurabilityByUID"
+        for _, n in ipairs(all) do
+            if not hooked[JIG_FN .. n] then
+                if (walking.tries[n] or 0) >= SIGNAL_TRIES then missing[#missing + 1] = n else waiting = true end
+            end
+        end
+        if not waiting and #missing > 0 then
+            walking.said = true
+            log.warn("consume: %d change-signal hook(s) could not be installed after %d tries: %s (those changes are found by the %d s check)",
+                #missing, SIGNAL_TRIES, table.concat(missing, ", "), walking.VERIFY_S)
+        end
+    end
+end
+
+local function try_hooks_host(with_signals)
+    -- (each BP call in the game looks through the hook list: the signal hooks only once a remote player is here)
+    if with_signals then hook_signals() end
     try_hook(JIG_FN .. "SERVER_RequestDataFromSave", "load-host", GAIN.on_load)
     try_hook(PLAYER_FN .. "JigMP_OnRequestDropItem", "use-local-drop", on_local_drop)
     place.drop_hook = hooked[PLAYER_FN .. "JigMP_OnRequestDropItem"] == true
@@ -2292,33 +2494,85 @@ end
 -- ---------------------------------------------------------------------------
 -- 0.8.1, a client with 80 containers / 200+ items: the 1 s walk was one frame
 -- of 20-46 ms ([PERF] h:items.inv) - the host stuttered every second. An
--- inventory whose last walk took more than SYNC_MS is now walked in slices
--- of SLICE_MS (whole containers), GAP_MS apart (timed as h:items.inv); until
+-- inventory whose last walk took more than SYNC_MS is walked in slices of
+-- SLICE_MS (whole containers), GAP_MS apart (timed as h:items.inv); until
 -- that walk is done the tick's readers (sdc_tools, sdc_items: UIDS / ITEMS)
--- get the last finished one. A small inventory is walked at once, as before.
+-- get the last finished one. A small inventory is walked at once.
 -- The use / craft snapshot (ledger) takes a finished sliced walk (it began
 -- after the last inventory request: see rd_slice).
--- by: [JigComponent address] = { pk = character address, inv = last finished
--- walk, ms = its engine time, job = the walk in slices }; gen: bumped by
--- reset() (slices of an older session do nothing); J: the job being stepped;
--- MAX_RESTARTS: see rd_slice; fresh(): an empty full walk.
-local walking = { SYNC_MS = 4, SLICE_MS = 3, GAP_MS = 30, MAX_SLICES = 400, MAX_RESTARTS = 3, by = {}, gen = 0, J = nil,
-                  fresh = function() return { list = {}, by_uid = {}, at0 = {}, full = true } end }
+--
+-- 0.13.0: the walk is no longer continuous (a walk every second: ~11.8 ms a
+-- second on average with one client, 2026-11-13 log). The host sees every
+-- inventory action of a client - the game's SERVER_* requests, its own
+-- multicasts and the plugin's add / remove functions, the mod's grants and loads - so an inventory
+-- is walked again only after such a signal (touch: the next tick, only that
+-- player), and every VERIFY_S s a cheap fingerprint of it (counts, UIDs,
+-- slots, durabilities; nothing is allocated, about half the engine reads of a
+-- walk) is compared with the last walk's: the same -> nothing more; different
+-- -> a change no signal told about: it is walked at once (and logged). The
+-- tick's readers read the snapshot: durabilities changed on the host in the
+-- meantime (the night vision drain, a shot's wear) are written into it in
+-- place (note_dur). A consumer that must see the data of this moment does not
+-- use the snapshot: the use / craft / drop reports and the ghost check walk
+-- the inventory themselves (server_items / inventory) when they run.
+--
+-- Change signals (touch), all on the host, for the JigComponent of a remote
+-- player: the game's inventory requests (SERVER_*: the ledger's list, craft,
+-- use, remove, drop, data / load requests, equip, split / stack / move, the
+-- reload; the buy / sell of a trader and every item moved between the
+-- player and a trunk, station or chest are SERVER_RequestMoveItemToAnotherComp),
+-- the plugin's answers the game sends for any change (MC_* multicasts, the
+-- BlueprintEvents TryAddNewItem / RemoveGetInfo / AddNewItemToSlot / TakeMoney /
+-- FireArmChamberWeapon (the chamber after a reload or shot) / HandleTwoContainerSwap /
+-- UpdateStatByUID / UpdateCustomDataByUID: every add, removal, payment and write
+-- of the plugin's server data goes through them, whoever calls (a host's own
+-- add, the death box's copy, a persist restore, a rescue drop, a station, a
+-- harvest's new stack). The Client RPCs (CLIENT_AddNewItem ...) are not hooked:
+-- their body does not run on the host, no hook of theirs fires), the
+-- mod's own grants and removals (renew_ledger: place, grant, rescue,
+-- crafts taken back), JigTryAddItemSomewhere, the host's counts (reloadcap's
+-- ServerUpdateCountByUID), a new character (respawn: another component, the
+-- first walk of it). Durability: ServerFuncUpdateDurabilityByUID is written
+-- in place; ServerFunc_UpdateDurabilityByUID (a repair) is a signal.
+-- Equip / unequip and vehicle / station storage are moves (above); item
+-- spoilage timers: the game has none (nothing found in its item data). What
+-- no signal reaches is found by the verify within VERIFY_S s.
+-- The old continuous walk stays a switch (config inventory_walk_events =
+-- false): one walk every tick for everyone.
 
--- (module-level callback: no closure per container) the containers before
+-- (module-level callback: no closures per container) the containers before
 -- `done` were read by earlier slices; stops after SLICE_MS (a walk read
 -- whole, j.whole: at the end).
 local function slice_cb(_, c)
     local j = walking.J
     j.pos = j.pos + 1
     if j.pos <= j.done then return end
-    cont_cb(nil, c)
+    j.cb(nil, c)
     j.done = j.pos
     if not j.whole and (os.clock() - j.t0) * 1000 >= walking.SLICE_MS then
         j.more = true
         return true   -- (UE4SS stops a ForEach on true)
     end
 end
+
+-- The verify's read of one item / container: only the numbers of the
+-- fingerprint (see walking.fp_item), no table, string or closure.
+local function fp_item_cb(_, it)
+    local item = it:get()
+    local u = item[F_USID]
+    local info = item[F_INFO]
+    walking.fp_item(W.fp, u.A, u.B, info[F_COUNT], info[F_DUR].X, item[F_INDEX])
+end
+local function rd_fcont(c)
+    local f = W.fp
+    f.nc = f.nc + 1
+    c:get()[F_ITEMS]:ForEach(fp_item_cb)
+end
+local function fp_cont_cb(_, c)
+    local ok, err = pcall(rd_fcont, c)
+    if not ok and not W.bad then W.bad = err end
+end
+local function rd_fp_all(jig) jig.MainJigContainers:ForEach(fp_cont_cb) end
 
 -- A slice goes on by position in MainJigContainers, so the inventory must
 -- not change between two slices: a container gone before `done` (a backpack
@@ -2327,20 +2581,21 @@ end
 -- one (no battery / durability for its items on the client: a light or the
 -- night vision switching off); an item moved from an unread container into a
 -- read one would be missing. So each slice first compares the number of
--- containers and the use / craft snapshot (renewed by every inventory
--- request of the player) with the walk's; changed: the walk starts over.
--- After MAX_RESTARTS (the player keeps moving things) it is read whole in
--- this frame, as every walk was before the slices: the tick's readers do
--- not wait long for a finished walk.
+-- containers, the use / craft snapshot (renewed by every inventory request
+-- of the player) and the change signals with the walk's; changed: the walk
+-- starts over. After MAX_RESTARTS (the player keeps moving things) it is
+-- read whole in this frame, as every walk was before the slices: the tick's
+-- readers do not wait long for a finished walk.
 local function rd_slice(j, k)
     local a = j.jig.MainJigContainers
     local n = a:GetArrayNum()
-    if j.done > 0 and (n ~= j.cnt or ledger[k] ~= j.ledger) then
-        j.w, j.done, j.restarts = walking.fresh(), 0, j.restarts + 1
+    local e = j.e
+    if j.done > 0 and (n ~= j.cnt or ledger[k] ~= j.ledger or e.sig ~= j.sig) then
+        j.w, j.done, j.restarts = j.fresh(), 0, j.restarts + 1
         j.whole = j.restarts > walking.MAX_RESTARTS
         M.stats.walk_restarts = M.stats.walk_restarts + 1
     end
-    j.cnt, j.ledger = n, ledger[k]
+    j.cnt, j.ledger, j.sig = n, ledger[k], e.sig
     W = j.w
     a:ForEach(slice_cb)
 end
@@ -2374,6 +2629,19 @@ local function walk_next(k, e, j)
     j.stalled = not ok or h == false
 end
 
+-- The verify found what no signal told about: logged (the first ones in
+-- full: which signal is missing), a full walk follows.
+local function verify_missed(e, w)
+    if w.bad or not w.fp then
+        log.debug("consume: the %d s check could not read an inventory in full (%s); it is walked again", walking.VERIFY_S, tostring(w.bad))
+        return
+    end
+    M.stats.verify_diffs = M.stats.verify_diffs + 1
+    local line = string.format("consume: the %d s check found the inventory of a remote player changed with no change signal (items %d -> %d, containers %d -> %d); it is walked again",
+        walking.VERIFY_S, e.inv.fp.ni, w.fp.ni, e.inv.fp.nc, w.fp.nc)
+    if M.stats.verify_diffs <= 20 then log.info("%s", line) else log.debug("%s", line) end
+end
+
 walk_step = function(k, e, j)
     if S.role ~= "host" or not ue.valid(j.jig) then
         e.job = nil
@@ -2391,9 +2659,20 @@ walk_step = function(k, e, j)
         return
     end
     local w = j.w
+    e.verified = os.clock()
+    if j.kind == "verify" then
+        e.vms = j.ms
+        M.stats.verifies = M.stats.verifies + 1
+        if not w.bad and walking.fp_same(w.fp, e.inv and e.inv.fp) then return end
+        if e.sig ~= e.snap then return end   -- (a signal came meanwhile: it explains the difference, its walk is due)
+        verify_missed(e, w)
+        e.sig = e.sig + 1   -- (the full walk goes in the next tick)
+        return
+    end
     w.full, w.cuid, w.sub = nil, nil, nil
-    e.inv, e.ms = w, j.ms
+    e.inv, e.ms, e.snap = w, j.ms, j.sig
     if ledger[k] == j.ledger then ledger[k] = w.by_uid end
+    M.stats.walks_full = M.stats.walks_full + 1
     M.stats.walks_sliced = M.stats.walks_sliced + 1
     M.stats.walk_slices = M.stats.walk_slices + j.n
     if j.restarts > 0 then
@@ -2402,12 +2681,64 @@ walk_step = function(k, e, j)
     end
 end
 
--- The walk the tick shares: the last finished one (a new one goes on in
--- slices), or one now (a small inventory, or the first walk of it).
+-- A job in slices (kind "walk": a full walk, "verify": the fingerprint).
+local function start_job(kind, k, e, jig, fresh, cb)
+    local j = { kind = kind, jig = jig, e = e, fresh = fresh, w = fresh(), cb = cb, done = 0, n = 0, ms = 0, restarts = 0,
+                ledger = ledger[k], sig = e.sig, step_at = os.clock() }
+    e.job = j
+    -- the first slice in a frame of its own (not on top of this tick)
+    walk_next(k, e, j)
+end
+
+-- A full walk of the inventory: at once (a small one, or the first), else in
+-- slices; the snapshot of before until it is done.
+local function start_walk(k, e, jig)
+    if not e.inv or (e.ms or 0) <= walking.SYNC_MS then
+        local sig = e.sig
+        local t0 = os.clock()
+        local inv = M.inventory(jig, true)
+        e.inv, e.ms, e.snap, e.verified = inv, (os.clock() - t0) * 1000, sig, os.clock()
+        ledger[k] = inv.by_uid
+        M.stats.walks_full = M.stats.walks_full + 1
+        return inv
+    end
+    start_job("walk", k, e, jig, walking.fresh, cont_cb)
+    return e.inv
+end
+
+-- The cheap check of the last walk; a full walk when it differs.
+local function start_verify(k, e, jig)
+    -- (a walk that could not read everything has no fingerprint: a full walk every VERIFY_S s)
+    if not e.inv.fp then return start_walk(k, e, jig) end
+    if (e.vms or (e.ms or 0) / 4) <= walking.SYNC_MS then
+        local t0 = os.clock()
+        local w = walking.fresh_fp()
+        local prev = W
+        W = w
+        local ok, err = pcall(rd_fp_all, jig)
+        W = prev
+        if not ok and not w.bad then w.bad = err end
+        e.vms, e.verified = (os.clock() - t0) * 1000, os.clock()
+        M.stats.verifies = M.stats.verifies + 1
+        if not w.bad and walking.fp_same(w.fp, e.inv and e.inv.fp) then return e.inv end
+        verify_missed(e, w)
+        return start_walk(k, e, jig)
+    end
+    start_job("verify", k, e, jig, walking.fresh_fp, fp_cont_cb)
+    return e.inv
+end
+
+function walking.events_on()
+    return walking.events and cfg.get("inventory_walk_events") ~= false
+end
+
+-- The walk the tick shares: the last finished one; a new one (a change
+-- signal came, the verify found a difference, the first time, or events are
+-- off: every tick) goes on in slices when the inventory is big.
 local function walk_of(k, jig, pk)
     local e = walking.by[k]
     if not e or e.pk ~= pk then
-        e = { pk = pk }
+        e = { pk = pk, sig = 0, snap = -1, verified = -1e9 }
         walking.by[k] = e
     end
     local j = e.job
@@ -2416,18 +2747,12 @@ local function walk_of(k, jig, pk)
         if j.stalled or os.clock() - j.step_at > 1 then walk_step(k, e, j) end
         return e.inv
     end
-    if not e.inv or (e.ms or 0) <= walking.SYNC_MS then
-        local t0 = os.clock()
-        local inv = M.inventory(jig, true)
-        e.inv, e.ms = inv, (os.clock() - t0) * 1000
-        ledger[k] = inv.by_uid
-        return inv
+    if e.inv and e.inv.bad and not e.bad_said then
+        e.bad_said = true
+        log.info("consume: an inventory that cannot be read in full (%s): it is walked every tick again, as before the change signals", tostring(e.inv.bad))
     end
-    j = { jig = jig, w = walking.fresh(), done = 0, n = 0, ms = 0, restarts = 0,
-          ledger = ledger[k], step_at = os.clock() }
-    e.job = j
-    -- the first slice in a frame of its own (not on top of this tick)
-    walk_next(k, e, j)
+    if not e.inv or e.sig ~= e.snap or e.inv.bad or not walking.events_on() then return start_walk(k, e, jig) end
+    if os.clock() - e.verified >= walking.VERIFY_S then return start_verify(k, e, jig) end
     return e.inv
 end
 
@@ -2444,7 +2769,7 @@ function M.host_player(pc, pass)
         local inv = walk_of(k, jig, addr(pawn))
         if pass then pass.inv = inv end
         -- items in a wallet / med bag that player's window refuses (sdc_place)
-        place.scan(pawn, jig, inv)
+        place.scan(pawn, jig, inv, true)
     end
     local pk = pawn and addr(pawn)
     if pk then health[pk] = tonumber(ue.prop(ue.prop(pawn, "MedicalComponent"), "Health")) end
@@ -2455,9 +2780,12 @@ end
 -- host_player (sdc_items calls it for each remote player), else taken here.
 function M.host_tick(remote_pcs, split)
     local now = os.clock()
+    local here = remote_pcs ~= nil and #remote_pcs > 0
+    if here and not walking.had_remote then hook_at = -100 end   -- (the first remote player: the signal hooks now)
+    walking.had_remote = here
     if now - hook_at >= 5 then
         hook_at = now
-        try_hooks_host()
+        try_hooks_host(here)
     end
     local inv, hp, wb = {}, {}, {}
     for _, pc in ipairs(remote_pcs or {}) do
@@ -2545,6 +2873,9 @@ function M.register_handlers()
 end
 
 -- (tests: the sliced walks and the use / craft snapshot; the gains' state)
+M.touch = walking.touch
+M.note_dur = walking.note_dur
+
 M._t = { walking = walking, ledger = function() return ledger end, gain = GAIN, gate = function() return gate end }
 
 return M

@@ -295,16 +295,31 @@ local look = f[6]
 advance(1.0); npc.tick()
 check(#msgs("NPCSET") == 1, "host: not re-sent within 30 s")
 advance(30.0); npc.tick()
-check(#msgs("NPCSET") == 2, "host: re-sent after 30 s")
+check(#msgs("NPCSET") == 2, "host: in the first 2 minutes the NPC is re-sent every 30 s (its look may wait for an asset on the client)")
+advance(100.0); npc.tick()
+check(#msgs("NPCSET") == 2, "host: later the same NPCSET is not re-sent after 30 s")
+advance(100.0); npc.tick()
+check(#msgs("NPCSET") == 3, "host: re-sent as the verify after 180 s")
+-- traffic of one NPC near one client, 6 minutes of nothing changing: NETQ line for the net-quiet report
+do
+    local keep_n, n, bytes = #W.out, 0, 0
+    for _ = 1, 360 do advance(1.0); npc.tick() end
+    for i = keep_n + 1, #W.out do
+        local e = W.out[i]
+        if e.msg and e.msg:find("^SDC1|NPCSET|") then n = n + 1; bytes = bytes + #e.msg end
+    end
+    for i = #W.out, keep_n + 1, -1 do W.out[i] = nil end
+    io.write(string.format("NETQ NPCSET idle (1 NPC near 1 client) msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+end
 -- client goes away -> restored; comes back -> sent again after 1.5 s
 rpawn._p._loc = { X = 300000, Y = 0, Z = 0 }
 advance(1.0); npc.tick()
 check(bandit._p.Mesh._p.VisibilityBasedAnimTickOption == 3, "host: bandit far from every client gets its own tick option back")
 rpawn._p._loc = { X = 100000, Y = 0, Z = 0 }
 advance(1.0); npc.tick()
-check(#msgs("NPCSET") == 2, "host: back in range: waits 1.5 s")
+check(#msgs("NPCSET") == 3, "host: back in range: waits 1.5 s")
 advance(1.6); npc.tick()
-check(#msgs("NPCSET") == 3, "host: back in range: sent again")
+check(#msgs("NPCSET") == 4, "host: back in range: sent again")
 
 -- death roar once
 fire(BOSS .. ":DeathEvent", param(boss), param(nil))

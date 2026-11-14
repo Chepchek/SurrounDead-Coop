@@ -168,8 +168,8 @@ local PALETTE = {
     { R = 0.60, G = 0.45, B = 1.00 },   -- violet
 }
 
-local GPS_RESEND_S = 10
-local INFO_RESYNC_S = 10
+local GPS_RESEND_S = 60    -- the verify (a change goes at once)
+local INFO_RESYNC_S = 60   -- the verify (a change of a name / GPS / slot goes at once, a joiner gets the table after its HI)
 local RELAY_FAR_CM = 10000      -- relay positions to clients farther than 100 m
 local RELAY_MAX_AGE_S = 4.0
 local NAME_LINGER_S = 0.75
@@ -1220,7 +1220,8 @@ local MK = {
     NEAR_CM = 150,         -- one spot (the game spawns exactly at the trace point)
     DUP_S = 10,            -- the game's RPC and MKREQ of one double-click
     CHUNK = 20,            -- list entries per MKSYNC message
-    RESYNC_S = 30,
+    RESYNC_S = 30,         -- the lists are compared this often (a change sets dirty: at once) ...
+    VERIFY_S = 180,        -- ... a list that did not change is sent again this often (the verify)
     REREG_S = 5,
     REREG_MAX = 3,         -- RespawnMarker calls per marker and map widget
     HOOK_RETRY_S = 5,
@@ -1229,7 +1230,7 @@ local MK = {
     REMOVED_KEEP_S = 30,
     SOLO_S = 5,
     hooks = {}, hook_at = -1000, hook_first = nil, hook_warned = false,
-    next_key = 1, seq = 0, title_checked = false,
+    next_key = 1, seq = 0, title_checked = false, sent_t = {},
     rt_cache = {},         -- [name] = the name after an FText round trip
     stats = { placed = 0, via_rpc = 0, via_req = 0, req_dup = 0, dups = 0, removed = 0, lists = 0,
               requests = 0, spawned = 0, unparented = 0, rereg = 0, client_removed = 0, remade = 0 },
@@ -1237,7 +1238,7 @@ local MK = {
 
 function MK.reset()
     -- host
-    MK.recs, MK.by_addr, MK.dirty, MK.synced, MK.sent_at, MK.sent_sig = {}, {}, false, {}, -1000, {}
+    MK.recs, MK.by_addr, MK.dirty, MK.synced, MK.sent_at, MK.sent_sig, MK.sent_t = {}, {}, false, {}, -1000, {}, {}
     MK.placing, MK.last_shared, MK.solo_at = nil, nil, -1000
     -- client
     MK.locals, MK.want, MK.parts, MK.removed, MK.need_apply, MK.want_sig, MK.hide_others = {}, nil, nil, {}, false, nil, nil
@@ -1662,7 +1663,8 @@ function MK.host_view(now, found, shared)
     MK.rereg_missing(seen, missing, found, now, decide)
 end
 
-function MK.send_list(rkey, r, shared)
+-- `verify`: send even when this client was told this very list (sdc_net's verify)
+function MK.send_list(rkey, r, shared, verify)
     local cid = pc_id(r.pc)
     local host_name = MK.host_name()
     local entries, own = {}, 0
@@ -1676,6 +1678,8 @@ function MK.send_list(rkey, r, shared)
         end
     end
     table.sort(entries)
+    local sig = table.concat(entries, ";")
+    if MK.sent_sig[rkey] == sig and not verify then return false end
     MK.seq = MK.seq + 1
     local parts = math.max(1, math.ceil(#entries / MK.CHUNK))
     for p = 1, parts do
@@ -1684,12 +1688,13 @@ function MK.send_list(rkey, r, shared)
         net.send_to(r.pc, "MKSYNC", MK.seq, p, parts, table.concat(chunk, ";"))
     end
     MK.stats.lists = MK.stats.lists + 1
-    local sig = table.concat(entries, ";")
+    MK.sent_t[rkey] = MK.now or os.clock()
     if MK.sent_sig[rkey] ~= sig then
         MK.sent_sig[rkey] = sig
         log.info("playermarks: map markers for player %s: %d (%d own; sharing %s) in %d message(s)",
             tostring(cid), #entries, own, shared and "on" or "off", parts)
     end
+    return true
 end
 
 -- The whole list (it is small) to every client when something changed, to
@@ -1699,13 +1704,15 @@ function MK.host_send(now, shared)
     local remote = S.remote or {}
     for rkey, r in pairs(remote) do
         if r.hello and ue.valid(r.pc) and (due or not MK.synced[rkey]) then
-            MK.send_list(rkey, r, shared)
+            -- a list the client already has is not sent again before the verify
+            MK.now = now
+            MK.send_list(rkey, r, shared, not MK.synced[rkey] or now - (MK.sent_t[rkey] or -1000) >= MK.VERIFY_S)
             MK.synced[rkey] = true
         end
     end
     if due then MK.sent_at, MK.dirty = now, false end
     for rkey in pairs(MK.synced) do
-        if not remote[rkey] then MK.synced[rkey], MK.sent_sig[rkey] = nil, nil end
+        if not remote[rkey] then MK.synced[rkey], MK.sent_sig[rkey], MK.sent_t[rkey] = nil, nil, nil end
     end
 end
 

@@ -120,7 +120,7 @@ local C = {
     PROBE_TTL_S = 1, RESTORE_MIN_S = 20, RESTORE_WAIT_S = 3, RESTORE_OLD_S = 20, RESTORE_MAX_S = 120,
     ZOMBIE_CM = 5000, ZOMBIE_LOG_S = 10, NOTICE_AT = { 30, 10 },
     FUSE_N = 5, FUSE_WIN_S = 60, REC_ERRORS = 3,
-    DIAG_DROP = 5, NEAR_CM = 1000, CAP_EVERY_S = 30,
+    DIAG_DROP = 5, NEAR_CM = 1000, CAP_AGAIN_S = 10,
 }
 M.C = C
 
@@ -1458,17 +1458,24 @@ local function client_tick(now, second)
         if CL.cap_conn ~= cs then
             CL.cap_conn, CL.ready_sent = cs, false
             net.send_to_host("DOWNCAP", "1")
+            CL.cap_at = now
             log.info("[DOWN] DOWNCAP sent to the host (this version knows knockdown)")
         end
         if not CL.ready_sent and second and client_ready() then
             CL.ready_sent, CL.cap_at = true, now
             net.send_to_host("DOWNCAP", "1", "ready")
-        elseif CL.ready_sent and now - (CL.cap_at or 0) >= C.CAP_EVERY_S then
-            -- again now and then: the host's record of this player may be a
-            -- new one (its world reset drops them; nothing changes there
-            -- when it knows it already)
-            CL.cap_at = now
-            net.send_to_host("DOWNCAP", "1", "ready")
+        elseif now - (CL.cap_at or 0) >= C.CAP_AGAIN_S then
+            -- No periodic repeat: the host's ROSTER tells this client what the
+            -- host knows of it (cs.roster_cap: 0 nothing, 1 DOWNCAP, 2 DOWNCAP
+            -- + ready). Less than what was sent = the host's record of this
+            -- player is a new one (its world reset drops them) or the message
+            -- was lost: say it again.
+            local sent = CL.ready_sent and 2 or 1
+            if type(cs.roster_cap) == "number" and cs.roster_cap < sent then
+                CL.cap_at = now
+                if sent == 2 then net.send_to_host("DOWNCAP", "1", "ready") else net.send_to_host("DOWNCAP", "1") end
+                log.info("[DOWN] the host's list says it knows %d of %d about this client: DOWNCAP again", cs.roster_cap, sent)
+            end
         end
     end
     local my = M.my_id()
@@ -1542,6 +1549,15 @@ end
 function M.downcap(key)
     local r = S and S.remote and S.remote[key]
     return r ~= nil and r.downcap == true
+end
+
+-- Host (sdc_session's ROSTER): what is known of this client's cap: 0 nothing,
+-- 1 DOWNCAP, 2 DOWNCAP + "ready". The client reads it back and says more
+-- when it is less than what it sent.
+function M.downcap_level(key)
+    local r = S and S.remote and S.remote[key]
+    if r == nil or r.downcap ~= true then return 0 end
+    return r.down_ready == true and 2 or 1
 end
 
 -- Host (sdc_persist read_vitals): seconds left and health before the hit

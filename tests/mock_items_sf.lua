@@ -204,6 +204,9 @@ end
 local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:"
 local items = require("sdc_items")
 local consume = items.consume
+-- (this file tests the slices of a walk: the continuous walk starts one every tick; the
+-- event-driven start of walks is mock_consume_walk_events)
+consume._t.walking.events = false
 local containers = items.containers
 local S = { role = "host", remote_pcs = {} }
 items.init(S)

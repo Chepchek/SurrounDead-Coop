@@ -254,6 +254,30 @@ local function resolve(wco, a)
     return nil
 end
 
+-- sdc_ctx's idle check: true exactly when resolve(wco, a) would answer nil
+-- without side effects. With bed routing on (every host game with a client)
+-- only a BedComponent can get an answer: an object whose class this second's
+-- class_cache already knows (resolve fills it on the object's first slow
+-- call) is idle when it is not one. An open scope (a respawn in progress,
+-- short) keeps everything busy.
+function M.resolver_idle(a)
+    if #scopes ~= 0 then
+        ctx.note_busy("respawn:a scope is open")
+        return false
+    end
+    if not bed_routing then return true end
+    local c = class_cache[a]
+    if c == nil then
+        ctx.note_busy("respawn:class of the object not read yet")
+        return false
+    end
+    if c == BED_COMP_CLASS then
+        ctx.note_busy("respawn:a bed")
+        return false
+    end
+    return true
+end
+
 -- ---------------------------------------------------------------------------
 -- Transforms
 -- ---------------------------------------------------------------------------
@@ -1316,9 +1340,7 @@ function M.install(state)
     ctx.scope_resolver = resolve
     -- sdc_ctx's idle check: resolve() answers nil without side effects while
     -- no scope is open and beds are not routed (its first line)
-    if ctx.set_idle_check then
-        ctx.set_idle_check(resolve, function() return #scopes == 0 and not bed_routing end)
-    end
+    if ctx.set_idle_check then ctx.set_idle_check(resolve, M.resolver_idle) end
     if not ctx.SCOPE_API then
         log.warn("respawn: sdc_ctx has no SCOPE_API: the game's respawn / bed functions stay with the host's player 0; the mod's own respawn is used")
     end

@@ -191,6 +191,10 @@ local function main_key(comp)
     return ue.try(guid_str, g)
 end
 
+-- (the queue of the JMC ops, below)
+local jmc = { q = {}, order = {}, due = false, PER_MSG = 24, FLUSH_MS = 30, vc = {}, sum = {}, sum_order = {} }
+local VC_KEEP_S = 0.05
+
 -- Host: a remote player has this world container open.
 function M.note_view(pawn, comp)
     if S.role ~= "host" or not is_remote_character(pawn) or not is_world_comp(comp) then return end
@@ -206,6 +210,7 @@ function M.note_view(pawn, comp)
     end
     v.comp = comp
     v.by[pk] = { pawn = pawn, name = ue.short(pawn), t = os.clock() }
+    jmc.vc[k] = nil   -- (the batch window's viewers: this one counts from now)
 end
 
 local function dist2(a, b)
@@ -252,11 +257,20 @@ end
 -- ran): JMC|*|<container key>|<op,arg,arg>|<op,...>|... Up to 0.7.3 every op
 -- was a message of its own to every viewer (a disassembly with N outputs:
 -- N messages per viewer).
-local jmc = { q = {}, order = {}, due = false, PER_MSG = 24, FLUSH_MS = 30 }
+-- Batched for a run of many count changes (0.12.x: a client disassembling a
+-- stack of 1000 made ~3500 ops, one 'cnt' per unit, 3550 log lines and a
+-- freeze of seconds):
+--   * a 'cnt' / 'dur' of an item replaces that item's pending one in the same
+--     batch (only the last count counts) unless an op in between touched the
+--     item (stk / rm / mv / add name it): then it is queued again, in order;
+--   * the viewers of a container are worked out once per batch window
+--     (VC_KEEP_S), not for every op; note_view forgets them;
+--   * one log line per container and batch, not one per op.
 
 local function jmc_flush()
-    local q, order = jmc.q, jmc.order
-    jmc.q, jmc.order, jmc.due = {}, {}, false
+    local q, order, sum, sum_order = jmc.q, jmc.order, jmc.sum, jmc.sum_order
+    jmc.q, jmc.order, jmc.due, jmc.sum, jmc.sum_order = {}, {}, false, {}, {}
+    local msgs = 0
     for _, bk in ipairs(order) do
         local b = q[bk]
         -- (the controller again: the same one, not a wrapper left from before)
@@ -264,8 +278,21 @@ local function jmc_flush()
             local n = #b.ops
             for i = 1, n, jmc.PER_MSG do
                 net.send_to(b.pc, "JMC", "*", b.key, table.unpack(b.ops, i, math.min(n, i + jmc.PER_MSG - 1)))
+                msgs = msgs + 1
             end
         end
+    end
+    M.stats.jmc_msgs = (M.stats.jmc_msgs or 0) + msgs
+    for _, ck in ipairs(sum_order) do
+        local e = sum[ck]
+        local kinds = {}
+        for _, k in ipairs({ "add", "cnt", "rm", "mv", "stk", "dur", "done" }) do
+            if e.by[k] then kinds[#kinds + 1] = k .. " " .. e.by[k] end
+        end
+        local line = string.format("containers: %d op(s) (%s)%s in %s -> %s (reliable copy of the plugin's multicast)",
+            e.n, table.concat(kinds, ", "), e.merged > 0 and string.format(", %d merged", e.merged) or "", e.name, e.who)
+        if e.n <= 3 then line = line .. " [" .. table.concat(e.items, " | ") .. "]" end
+        if counted("forwards") then log.info("%s", line) else log.debug("%s", line) end
     end
 end
 
@@ -274,37 +301,85 @@ function M.flush_viewers()
     if jmc.due or next(jmc.q) ~= nil then jmc_flush() end
 end
 
+-- The viewers of a world container for this batch window: { ok =, vs =, key =,
+-- who = "names", name = container name, t = } (one walk per window).
+local function viewer_cache(comp, ck)
+    local now = os.clock()
+    local c = jmc.vc[ck]
+    if c and now - c.t <= VC_KEEP_S then return c end
+    c = { t = now, ok = is_world_comp(comp), vs = {}, key = nil, who = "", name = "?" }
+    if c.ok then
+        local vs, key = viewers_of(comp)
+        c.key = key
+        local names = {}
+        for _, e in ipairs(vs) do
+            local pk = ue.valid(e.pc) and addr(e.pc)
+            if pk then
+                c.vs[#c.vs + 1] = { pc = e.pc, pk = pk, pname = ue.short(e.pc) }
+                names[#names + 1] = ue.short(e.pawn)
+            end
+        end
+        c.who = table.concat(names, ", ")
+        c.name = comp_name(comp)
+    end
+    jmc.vc[ck] = c
+    return c
+end
+
 -- One multicast of a world container to its remote viewers.
 local function forward(comp, op, ...)
-    if S.role ~= "host" or not on() or not views[addr(comp) or -1] or not is_world_comp(comp) then return end
-    local vs, key = viewers_of(comp)
-    if #vs == 0 or not key then return end
+    if S.role ~= "host" or not on() then return end
+    local ck = addr(comp)
+    if not ck or not views[ck] then return end
+    local c = viewer_cache(comp, ck)
+    if not c.ok or #c.vs == 0 or not c.key then return end
     local parts = { op }
     for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
     local item = table.concat(parts, ",")
-    local names = {}
     M.stats.forwards = M.stats.forwards + 1
-    for _, e in ipairs(vs) do
-        local pk = ue.valid(e.pc) and addr(e.pc)
-        if pk then
-            local bk = tostring(pk) .. "|" .. key
-            local b = jmc.q[bk]
-            if not b then
-                b = { pc = e.pc, pname = ue.short(e.pc), key = key, ops = {} }
-                jmc.q[bk] = b
-                jmc.order[#jmc.order + 1] = bk
+    local merged = false
+    for _, e in ipairs(c.vs) do
+        local bk = tostring(e.pk) .. "|" .. c.key
+        local b = jmc.q[bk]
+        if not b then
+            b = { pc = e.pc, pname = e.pname, key = c.key, ops = {}, last = {} }
+            jmc.q[bk] = b
+            jmc.order[#jmc.order + 1] = bk
+        end
+        local last = b.last
+        if op == "cnt" or op == "dur" then
+            local lk = op .. "|" .. parts[2]
+            local at = last[lk]
+            if at then
+                b.ops[at] = item
+                merged = true
+            else
+                b.ops[#b.ops + 1] = item
+                last[lk] = #b.ops
+            end
+        else
+            -- an op that names an item ends the merging of that item's earlier count
+            for i = 2, #parts do
+                last["cnt|" .. parts[i]] = nil
+                last["dur|" .. parts[i]] = nil
             end
             b.ops[#b.ops + 1] = item
-            names[#names + 1] = ue.short(e.pawn)
         end
     end
-    if not jmc.due and #names > 0 then
+    if not jmc.due then
         jmc.due = true
         ue.delay("containers-jmc", jmc.FLUSH_MS, jmc_flush)
     end
-    local line = string.format("containers: %s %s in %s -> %s (reliable copy of the plugin's multicast)", op,
-        table.concat(parts, " ", 2), comp_name(comp), table.concat(names, ", "))
-    if counted("forwards") then log.info("%s", line) else log.debug("%s", line) end
+    local e = jmc.sum[ck]
+    if not e then
+        e = { n = 0, merged = 0, by = {}, items = {}, name = c.name, who = c.who }
+        jmc.sum[ck] = e
+        jmc.sum_order[#jmc.sum_order + 1] = ck
+    end
+    e.n = e.n + 1
+    if merged then e.merged = e.merged + 1 end
+    e.by[op] = (e.by[op] or 0) + 1
+    if #e.items < 3 then e.items[#e.items + 1] = item end
 end
 
 -- Host: a change the mod made itself in a world container's server data (no
@@ -1004,6 +1079,7 @@ function M.host_tick()
         end
         if not ue.valid(v.comp) or next(v.by) == nil then
             views[k] = nil
+            jmc.vc[k] = nil
             if by_key[v.key] == k then by_key[v.key] = nil end
         end
     end
@@ -1030,7 +1106,7 @@ end
 function M.reset()
     views, by_key, resend_at = {}, {}, {}
     gone.told = {}
-    jmc.q, jmc.order, jmc.due = {}, {}, false
+    jmc.q, jmc.order, jmc.due, jmc.vc, jmc.sum, jmc.sum_order = {}, {}, false, {}, {}, {}
     opened, waiting, logged = {}, {}, {}
     hook_at = -100
     deathbox.reset()

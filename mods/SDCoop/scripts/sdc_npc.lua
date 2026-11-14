@@ -186,7 +186,9 @@ local TICK_FAR = 9000       -- cm: ... and gets its own setting back beyond this
 local SET_RANGE = 14500     -- cm: NPCSET to clients this close (their copy exists: net range 150 m)
 local GONE_RANGE = 15200    -- cm: beyond this the client's copy is gone; send again when it comes back
 local SET_DELAY_S = 1.5     -- the NPC near that client for this long first (its actor channel is open)
-local RESEND_S = 30
+local RESEND_S = 30           -- an NPC near a client is compared with what that client was told this often
+local WARM_S = 120            -- the first minutes of an NPC for a viewer: every RESEND_S (its look may wait for an asset there)
+local VERIFY_S = 180          -- ... and told again (the full NPCSET) only when it differs, or this often
 local SET_PER_PASS = 10     -- NPCSET per client and pass
 local MAX_NPCS = 96         -- human NPCs looked at per pass
 local FX_RANGE = 16000      -- cm: rock / sounds / fire to clients this close
@@ -589,7 +591,8 @@ local function civilian_name(npc)
     return (s:gsub("[|;%c]", " "))
 end
 
-local function send_set(v, npc, key)
+-- st: the record of this NPC for this viewer (its last NPCSET: sig, at)
+local function send_set(v, npc, key, st, now)
     local comp = ue.prop(npc, "BP_AIComponent")
     local max, hp = "", ""
     if opt("npc_health") and ue.valid(comp) then
@@ -608,6 +611,12 @@ local function send_set(v, npc, key)
     local name = ""
     if opt("npc_looks") and host.friendly[key] and ue.has_prop(npc, "NameWidget") then name = civilian_name(npc) end
     if max == "" and look == "" and name == "" then return false end
+    -- the same thing again is not told before the verify
+    local sig = max .. "|" .. hp .. "|" .. look .. "|" .. name
+    if st and st.sig == sig and st.at and now - st.at < VERIFY_S and now - (st.first or 0) >= WARM_S then
+        st.chk = now
+        return "same"
+    end
     local ok
     if name ~= "" then
         ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look, name)
@@ -615,6 +624,7 @@ local function send_set(v, npc, key)
         ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look)
     end
     if not ok then return false end
+    if st then st.sig = sig end
     M.stats.set_sent = M.stats.set_sent + 1
     if first("set", 3) then
         log.info("npc: set: %s -> %s: max health %s, health %s, look %d chars", ue.short(npc), ue.short(v.pc), max, hp,
@@ -641,9 +651,12 @@ local function set_for_viewers(npc, key, loc, now)
             if not st then
                 per[v.key] = { first = now }
             elseif v.budget > 0 and ((not st.at and now - st.first >= SET_DELAY_S)
-                    or (st.at and now - st.at >= RESEND_S)) then
+                    or (st.at and now - (st.chk or st.at) >= RESEND_S)) then
                 v.budget = v.budget - 1
-                if send_set(v, npc, key) then st.at = now else st.at = now - RESEND_S + 5 end
+                local r = send_set(v, npc, key, st, now)
+                if r == true then st.at, st.chk = now, now
+                elseif r == "same" then st.chk = now; v.budget = v.budget + 1   -- nothing went out
+                else st.at, st.chk = now - RESEND_S + 5, nil end
             end
         end
     end

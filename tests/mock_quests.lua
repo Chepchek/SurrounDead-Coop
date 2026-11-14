@@ -586,6 +586,11 @@ local gp = param(gm)
 fire(GNC, param(LIBCDO), gp)
 check(gp:get() == gm, "group: bounty manager untouched")
 check(#msgs("QS", false) == 1, "group: QS mirror sent")
+-- the list is told again only as the verify (120 s), not every 30 s
+quests.host_tick(3060)
+check(#msgs("QS", false) == 1, "group: unchanged after 60 s: QS not repeated")
+quests.host_tick(3125)
+check(#msgs("QS", false) == 2, "group: the verify after 120 s: QS again")
 
 quiet_print(string.format("%d checks, %s", checks, fails == 0 and "ALL OK" or (fails .. " FAILED")))
 os.exit(fails == 0 and 0 or 1)

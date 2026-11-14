@@ -62,8 +62,10 @@ package.loaded["sdc_net"] = { broadcast = function() end,
 package.loaded["sdc_ctx"] = { addr = function(o) return o and (o.__name or tostring(o)) end }
 local hooks = {}
 RegisterHook = function(path, fn)
-  assert(not hooks[path], "second RegisterHook on " .. path)
-  hooks[path] = fn; return 1, 2
+  -- (several modules may hook one function: sdc_consume's change signal and sdc_stations' open)
+  local prev = hooks[path]
+  hooks[path] = prev and function(...) prev(...); fn(...) end or fn
+  return 1, 2
 end
 NotifyOnNewObject = function() end
 FName = function(s) return s end
@@ -149,13 +151,14 @@ hooks[JIG .. "MC_UpdateStack"](C(chest), P(G(7)), P(0), P(G(8)), P(5))
 assert(to_client[#to_client].f[1] == "stk" and to_client[#to_client].f[4] == 0 and to_client[#to_client].f[6] == 5, "stk not forwarded")
 hooks[JIG .. "MC_UpdateCount"](C(chest), P(G(7)), P(2), P(G(0)))
 assert(to_client[#to_client].f[1] == "cnt" and to_client[#to_client].f[4] == 2, "cnt not forwarded")
-assert(has_log("mv 7:0:0:0 500:0:0:0 4 0 in Container_MedicalLoot_MedicalCrate2_C_33 -> guest"), "forward log")
+assert(has_log("(mv 1) in Container_MedicalLoot_MedicalCrate2_C_33 -> guest (reliable copy of the plugin's multicast) [mv,7:0:0:0,500:0:0:0,4,0]"), "forward log")
 -- a player's own inventory multicast? (not a world container): nothing
 local n0 = #to_client
 hooks[JIG .. "MC_ItemRemoved"](C(djig), P(G(7)))
 assert(#to_client == n0, "player inventory forwarded")
 -- guest walked away (40 m): nothing more
 guest.__loc = { X = 4000, Y = 0, Z = 0 }
+offset = offset + 0.06   -- (the viewers of a batch window are kept 0.05 s)
 hooks[JIG .. "MC_ItemRemoved"](C(chest), P(G(7)))
 assert(#to_client == n0, "sent to a player far away")
 guest.__loc = { X = 0, Y = 0, Z = 0 }

@@ -62,6 +62,7 @@ local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
+local netsync = require("sdc_netsync")
 
 local M = {
     stats = { sent = 0, snaps = 0, dirs_here = 0, toggles = 0, dirs_fixed = 0, power_fixed = 0, timers_cleared = 0,
@@ -91,8 +92,10 @@ local GEN_TIMERS = { "GetObjects", "FuelCost" }
 local PLACE_MATCH = 100     -- cm
 local GRACE = 2.5           -- s after the host's change before a copy is toggled here
 local PASS_S = 2            -- client pass
-local SNAP_S = 20           -- host: all doors to every client
-local KEEP_S = 45           -- client: a host state not refreshed this long is forgotten
+local SNAP_S = 20           -- host: the doors are read this often; a client gets them only when they differ
+                        -- from what it was last told (a door the hooks missed, a new / gone door) ...
+local SNAP_VERIFY_S = 180   -- ... or this often as the verify (sdc_netsync)
+local KEEP_S = 400          -- client: a host state not refreshed this long is forgotten (2 verifies)
 local SNAP_AFTER_S = 3
 local CHUNK = 900
 local HOOK_RETRY_S = 2
@@ -244,13 +247,38 @@ local function all_doors()
     return out
 end
 
-local function snapshot(pcs, why)
+-- The text a client was told: every door's entry, in a stable order.
+local function door_entries()
     local entries = {}
     for _, e in ipairs(all_doors()) do
         local s = entry_of(e.d, e.k)
         if s then entries[#entries + 1] = s end
     end
-    if #entries > 0 then send_entries(pcs, "s", entries) end
+    table.sort(entries)
+    return entries
+end
+
+-- A client's record of one door: "WD:<class> <x,y,z>" -> that door's entry text.
+local function door_key(entry) return "WD:" .. (entry:match("^(%S+ %S+)") or entry) end
+
+-- why "join" / "all": every door to these clients at once; "periodic": to each
+-- client the doors whose entry differs from what it was last told, or whose
+-- verify is due (each door has its own record per client).
+local function snapshot(pcs, why)
+    local entries = door_entries()
+    for _, pc in ipairs(pcs) do
+        local peer = ue.name(pc)
+        local out = {}
+        for _, e in ipairs(entries) do
+            if why ~= "periodic" then
+                netsync.mark(peer, door_key(e), e)
+                out[#out + 1] = e
+            elseif netsync.due_mark(peer, door_key(e), e, SNAP_VERIFY_S) then
+                out[#out + 1] = e
+            end
+        end
+        if #out > 0 then send_entries({ pc }, "s", out) end
+    end
     M.stats.snaps = M.stats.snaps + 1
     return #entries
 end
@@ -261,6 +289,8 @@ local function host_change(d, k, why)
     local s, open = entry_of(d, k)
     if not s then return end
     send_entries(pcs, "c", { s })
+    -- they now know this door's state (only this door): the next check does not repeat it
+    for _, pc in ipairs(pcs) do netsync.mark(ue.name(pc), door_key(s), s) end
     log.info("bdoors: host: %s %s (%s): WBDOOR to %d client(s)%s", ue.short(d), open and "opens" or "closes", why, #pcs,
         k.kind == "swing" and string.format(", swings %s (dot %.2f)", num(ue.prop(d, "DotProduct")) >= 0 and "+90" or "-90",
             num(ue.prop(d, "DotProduct"))) or (k.power and (", power " .. tostring(ue.prop(d, "PoweredOn?") == true)) or ""))

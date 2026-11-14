@@ -198,7 +198,7 @@ local PROG_WRITE_S = 15     -- host: a level / skill / kill change is written at
 local CLIENT_PID_EVERY = 4
 local CLIENT_PID_MAX = 15
 local CLIENT_PROG_CHECK = 3
-local CLIENT_PROG_MINOR_S = 20
+local CLIENT_PROG_MINOR_S = 60    -- XP trickle (a level, points, kills, skills go at once: major_key)
 local CLIENT_PROG_RESEND_S = 120
 local CLIENT_READY_EVERY = 5
 local CLIENT_MAP_CHECK = 5  -- client: own explored POIs looked at this often (one FindAllOf)
@@ -3526,8 +3526,9 @@ local function client_tick(now)
     local full = vals .. "|" .. tlist .. "|" .. hot
     local send = false
     if C.last_major ~= major then send = true
-    elseif C.last_full ~= full and now - (C.prog_at or 0) >= CLIENT_PROG_MINOR_S then send = true
+    elseif C.last_full ~= full and (C.prog_force or now - (C.prog_at or 0) >= CLIENT_PROG_MINOR_S) then send = true
     elseif now - (C.prog_at or 0) >= CLIENT_PROG_RESEND_S then send = true end
+    C.prog_force = nil
     if send and net.send_to_host("PSPROG", C.gen, vals, tlist, hot) then
         C.last_major, C.last_full, C.prog_at = major, full, now
         if tlist ~= "?" then C.tree_sent = C.gen end
@@ -3546,6 +3547,13 @@ end
 -- checks the progression line (a skill change goes out at once).
 function M.prog_soon()
     if type(C) == "table" then C.prog_check = nil end
+end
+
+-- sdc_session (client): the pause menu opened - the way out to the main menu.
+-- The small XP that waits for its 60 s goes now (the connection may be gone
+-- by the time the player leaves).
+function M.prog_final()
+    if type(C) == "table" then C.prog_check, C.prog_force = nil, true end
 end
 
 local function on_set(f)

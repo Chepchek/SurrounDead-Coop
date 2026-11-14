@@ -360,6 +360,36 @@ local hkey = nil
 for k, e in pairs(l1 or {}) do if e.id == 256 then hkey = k end end
 check(hkey and l1[hkey].name == "Host" and same_col(l1[hkey], YELLOW), "list to the client right away: the host's marker, host colour and name")
 
+-- traffic with nothing changing, 6 minutes: NETQ line for the net-quiet report
+do
+    sent = {}
+    for _ = 1, 360 do tick(1) end
+    local ninfo = 0
+    for _, m in ipairs(sent) do if m.kind == "PINFO" then ninfo = ninfo + 1 end end
+    check(ninfo >= 8 and ninfo <= 16, "PINFO: the table again as the verify every 60 s, not every 10 s (" .. ninfo .. " in 6 minutes)")
+    local n, bytes = 0, 0
+    for _, m in ipairs(sent) do
+        if m.kind == "MKSYNC" then n = n + 1; for _, v in ipairs(m.f) do bytes = bytes + #tostring(v) + 1 end end
+    end
+    check(n >= 1, "MKSYNC: an unchanged list is told again only as the verify (at least once in 6 minutes: " .. n .. ")")
+    check(n <= 4, "MKSYNC: ... and not every 30 s any more")
+    io.write(string.format("NETQ MKSYNC idle msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+end
+
+-- a client that leaves: its records are dropped; back again it gets the list at once
+do
+    check(MK.sent_sig["PC_client"] ~= nil and MK.sent_t["PC_client"] ~= nil, "MKSYNC: the host keeps what it told the client")
+    local keep_remote, keep_pcs = S.remote["PC_client"], S.remote_pcs
+    S.remote["PC_client"], S.remote_pcs = nil, {}
+    tick()
+    check(MK.sent_sig["PC_client"] == nil and MK.sent_t["PC_client"] == nil and MK.synced["PC_client"] == nil,
+        "MKSYNC: a client that left: its records are forgotten")
+    S.remote["PC_client"], S.remote_pcs = keep_remote, keep_pcs
+    sent = {}
+    tick()
+    check(#msgs("MKSYNC", cpc) >= 1, "MKSYNC: back again: the list goes at once")
+end
+
 -- H2: a client's marker through the game's RPC (lands on the host's map in the game)
 print("-- client marker via the game's RPC")
 sent = {}
@@ -525,6 +555,14 @@ S.role = "standalone"   -- (the host's table above is not used any more)
 tick()
 tick()
 
+-- the client's own GPS state: told on a change and as the verify every 60 s
+do
+    sent = {}
+    for _ = 1, 360 do tick(1) end
+    local n = 0
+    for _, m in ipairs(sent) do if m.kind == "MYGPS" then n = n + 1 end end
+    check(n >= 5 and n <= 8, "MYGPS: the verify every 60 s, not every 10 s (" .. n .. " in 6 minutes)")
+end
 -- C1: the host's list in two parts, second part first
 print("-- list")
 sent = {}

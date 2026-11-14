@@ -170,6 +170,8 @@ function M.host_player(pc, pass)
             if ok and type(out.NewDur) == "number" then
                 bat.dur = out.NewDur
                 -- the shared walk is read again by sdc_items (ITEMS) after this
+                -- (and kept: its fingerprint follows the new value, sdc_consume)
+                consume.note_dur(pawn.BP_JigMultiplayer, bat.e.uid, out.NewDur)
                 bat.e.dur = out.NewDur
             end
             if bat.dur <= 0 then log.info("tools: night vision battery of %s is empty", ue.short(pawn)) end

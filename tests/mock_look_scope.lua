@@ -96,6 +96,16 @@ check(flags_in(tp, "Torso") == "" and flags_in(tp, "Head") == "", "body and head
 check(flags_in(tp, "HairMesh") == "h", "hair under the helmet: hidden (h)")
 check(not tp:find("CharacterMesh0", 1, true), "CharacterMesh0 never published")
 
+print("== a held item's temporary mesh component is not part of the look")
+do
+    local t1, t2 = new_comp("NODE_AddStaticMeshComponent-2_0"), new_comp("StaticMeshComponent_2147463626")
+    comps[#comps + 1] = t1; comps[#comps + 1] = t2
+    local with = appearance.look_string(pawn)
+    check(with == tp, "temporary components (NODE_Add..., StaticMeshComponent_<number>): the look string is the same")
+    check(not with:find("NODE_", 1, true) and not with:find("StaticMeshComponent_", 1, true), "... and they are not in it")
+    comps[#comps] = nil; comps[#comps] = nil
+end
+
 print("== scope (SetEnableScope(true) from third person)")
 scope(true)
 check(by.Torso.bVisible == false and by.Head.bHiddenInGame == true and cam.on, "setup: body bVisible off, head hidden, FP camera on")
@@ -163,7 +173,10 @@ local ue = package.loaded["sdc_ue"]
 local net = package.loaded["sdc_net"]
 local handlers, sent = {}, {}
 net.on = function(kind, fn) handlers[kind] = fn end
-net.broadcast = function(pcs, kind, id, s) sent[#sent + 1] = { to = pcs, kind = kind, id = id, s = s } end
+net.send_to = function(pc, kind, id, s) sent[#sent + 1] = { to = { pc }, kind = kind, id = id, s = s }; return true end
+net.broadcast = function(pcs, kind, id, s) for _, pc in ipairs(pcs) do sent[#sent + 1] = { to = { pc }, kind = kind, id = id, s = s } end end
+ue.name = function(o) return o.name end
+local function count_id(id) local n = 0; for _, m in ipairs(sent) do if m.id == id then n = n + 1 end end; return n end
 ue.pawn_of = function(pc) return pc.pawn end
 ue.set_prop = function(o, n, v) o[n] = v; return true end
 ue.local_pc = function() return nil end
@@ -277,16 +290,84 @@ function pawn:IsLocallyControlled() return true end
 sent = {}
 host.tick({ pcA, pcB })
 local first = sent[1]
-check(first and first.kind == "LOOK" and first.id == 1 and first.s == tp, "host third person: its look broadcast")
+check(first and first.kind == "LOOK" and first.id == 1 and first.s == tp and count_id(1) == 2, "host third person: its look sent to both clients")
 scope(true)
 host.tick({ pcA, pcB })
-check(#sent == 1, "host scoped: nothing new broadcast (the clients keep the third-person look)")
+check(count_id(1) == 2, "host scoped: nothing new sent (the clients keep the third-person look)")
+do local back = 0; for _, m in ipairs(sent) do if m.id == 7 and m.to[1] == pcA then back = back + 1 end end
+    check(back == 0, "a client's own look is not sent back to it") end
 check(by.Torso.bVisible == false and by.Clothing_Torso.bVisible == false and by.Head.bHiddenInGame == true,
     "host's own character: body and head stay hidden for its own scope camera")
 check(all_shown(byA, "HairMesh"), "host's copy of client A untouched by the host's scope")
 scope(false)
 host.tick({ pcA, pcB })
-check(#sent == 1 and by.Torso.bVisible == true, "host scope off: body back, still nothing new to send")
+check(count_id(1) == 2 and by.Torso.bVisible == true, "host scope off: body back, still nothing new to send")
+
+-- traffic of an idle host with two clients, 10 minutes, a held item's temporary mesh component
+-- showing for 4 s every 2 minutes (bandage, ...): NETQ line for the net-quiet report
+do
+    local tmp = new_comp("NODE_AddStaticMeshComponent-2")
+    local n, bytes = 0, 0
+    sent = {}
+    local clock = os.clock
+    local t = 1000
+    os.clock = function() return t end
+    for sec = 0, 599, 2 do
+        t = 1000 + sec
+        local on = (sec % 120) < 4
+        if on and comps[#comps] ~= tmp then comps[#comps + 1] = tmp end
+        if not on and comps[#comps] == tmp then comps[#comps] = nil end
+        host.tick({ pcA, pcB })
+    end
+    if comps[#comps] == tmp then comps[#comps] = nil end
+    os.clock = clock
+    for _, m in ipairs(sent) do if m.kind == "LOOK" then n = n + 1; bytes = bytes + #m.s + 8 end end
+    io.write(string.format("NETQ LOOK idle (host + 2 clients, 10 min) msgs/min=%.1f bytes/min=%.0f", n / 10, bytes / 10), string.char(10))
+end
+
+-- the verify: an unchanged look is told again after 300 s, not before; a client that gets
+-- the look of everybody (send_all, after its HI) gets all of it even if it has the same text
+do
+    local clock = os.clock
+    local t0 = 20000
+    os.clock = function() return t0 end
+    host.tick({ pcA, pcB })
+    sent = {}
+    t0 = t0 + 100
+    host.tick({ pcA, pcB })
+    check(#sent == 0, "host: unchanged looks 100 s later: nothing")
+    t0 = t0 + 210
+    host.tick({ pcA, pcB })
+    local toA, toB = 0, 0
+    for _, m in ipairs(sent) do
+        if m.kind == "LOOK" and m.to[1] == pcA then toA = toA + 1 end
+        if m.kind == "LOOK" and m.to[1] == pcB then toB = toB + 1 end
+    end
+    check(toA >= 1 and toB >= 2, "host: the verify after 300 s: the looks again (A " .. toA .. ", B " .. toB .. ")")
+    sent = {}
+    host.send_all(pcA)
+    local all = 0
+    for _, m in ipairs(sent) do if m.kind == "LOOK" and m.to[1] == pcA then all = all + 1 end end
+    check(all >= 2, "host: send_all to a client sends every look even when it was told the same (" .. all .. ")")
+    -- a client's own look: MYLOOK on a change and as the verify
+    local to_host = {}
+    net.send_to_host = function(kind, s) to_host[#to_host + 1] = kind; return true end
+    ue.local_pawn = function() return pawn end
+    ue.player_chars = function() return { pawn } end
+    local cl = require("sdc_appearance")
+    cl.init({ role = "client" })
+    t0 = t0 + 1000
+    cl.tick()
+    local n0 = #to_host
+    check(n0 == 1, "client: its look goes once")
+    t0 = t0 + 100
+    cl.tick()
+    check(#to_host == n0, "client: unchanged 100 s later: not again")
+    t0 = t0 + 210
+    cl.tick()
+    check(#to_host == n0 + 1, "client: the verify after 300 s: MYLOOK again")
+    os.clock = clock
+end
 
 print(fails == 0 and ("ALL OK (" .. passed .. " checks)") or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)

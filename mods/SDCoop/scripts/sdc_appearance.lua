@@ -28,6 +28,7 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
+local netsync = require("sdc_netsync")
 
 local M = {}
 local S
@@ -37,6 +38,13 @@ function M.init(state) S = state end
 local FP_COMPS = { Head = true, Mouth = true, EyebrowsMesh = true, HairMesh = true, BeardMesh = true,
                    Accessory1 = true, Accessory2 = true, Accessory3 = true }
 local SKIP_COMPS = { CharacterMesh0 = true }
+-- Components the game adds for a moment (a held item's mesh while it is used:
+-- "NODE_AddStaticMeshComponent-2", "StaticMeshComponent_2147463626"): they are
+-- not part of the look, no other machine has one of that name, and every one
+-- changed the look string twice (13.11: 70 of 73 MYLOOK of a session).
+local function transient_comp(name)
+    return name:find("^NODE_") ~= nil or name:find("^StaticMeshComponent_%d+$") ~= nil
+end
 
 -- S_RepNonActorData / clothing settings members (BP structs)
 local F_SLOT = "Slot_4_8843E80049E14A7C56C7E89EF659AAEC"
@@ -314,7 +322,7 @@ function M.look_string(pawn)
     local parts = { "m=" .. ((ue.prop(pawn, "IsPlayerMale?") == true) and "1" or "0") }
     for _, comp in ipairs(mesh_comps(pawn)) do
         local name = ue.short(comp)
-        if not SKIP_COMPS[name] and ue.prop(comp, "bOnlyOwnerSee") ~= true then
+        if not SKIP_COMPS[name] and not transient_comp(name) and ue.prop(comp, "bOnlyOwnerSee") ~= true then
             local flags = flags_of(comp)
             if scoped then flags = (flags:gsub("v", "")) end
             if FP_COMPS[name] then
@@ -475,6 +483,16 @@ end
 
 local looks = {}        -- [player id] = look string (known on this machine)
 local published = nil   -- own look last sent
+local published_at = -1000
+local LOOK_VERIFY_S = 300   -- a look is told again this often when it did not change (a lost message heals)
+
+-- Host: a look to one client when that client has not got this text yet (a
+-- changed look, a new client) or as the verify (sdc_netsync).
+local function send_look(pc, id, s, forced)
+    local peer, key = ue.name(pc), "LOOK:" .. id
+    if not forced and not netsync.due(peer, key, s, LOOK_VERIFY_S) then return end
+    if net.send_to(pc, "LOOK", id, s) then netsync.mark(peer, key, s) end   -- only a sent look counts as told
+end
 
 -- A client's own character whose co-op look (sdc_charcreate) is not on it
 -- yet: its look is not published now - the host would put that default look
@@ -500,15 +518,28 @@ function M.tick(remote_pcs)
         local id = player_id(me)
         if id and s ~= published and own_look_pending(me) then
             log.debug("look: own look not published yet (the co-op character's look is not on it yet)")
-        elseif id and s ~= published then
-            published = s
+        elseif id and (s ~= published or os.clock() - published_at >= LOOK_VERIFY_S) then
+            local changed = s ~= published
+            published, published_at = s, os.clock()
             looks[id] = s
-            if S.role == "host" then
-                net.broadcast(remote_pcs or {}, "LOOK", id, s)
-            elseif S.role == "client" then
+            if S.role == "client" then
                 net.send_to_host("MYLOOK", s)
             end
-            log.debug("look: own look published (%d bytes)", #s)
+            if changed then log.debug("look: own look published (%d bytes)", #s) end
+        end
+    end
+    if S.role == "host" then
+        -- every client has every look known here; only a changed one (or the
+        -- verify) goes out
+        for _, pc in ipairs(remote_pcs or {}) do
+            if ue.valid(pc) then
+                -- (a client's own look is not sent back to it)
+                local pawn = ue.pawn_of(pc)
+                local own = pawn and player_id(pawn) or nil
+                for id, s in pairs(looks) do
+                    if id ~= own then send_look(pc, id, s) end
+                end
+            end
         end
     end
     for _, p in ipairs(ue.player_chars() or {}) do
@@ -532,7 +563,7 @@ end
 -- are dropped first).
 function M.send_all(pc)
     if S and S.role == "host" then M.drop_left(looks, S.remote_pcs) end
-    for id, s in pairs(looks) do net.send_to(pc, "LOOK", id, s) end
+    for id, s in pairs(looks) do send_look(pc, id, s, true) end
 end
 
 function M.reset()
@@ -555,7 +586,7 @@ function M.register_handlers()
         for _, other in ipairs(S.remote_pcs or {}) do
             if addr(other) ~= addr(pc) then others[#others + 1] = other end
         end
-        net.broadcast(others, "LOOK", id, f[1])
+        for _, other in ipairs(others) do send_look(other, id, f[1]) end
         apply_look(pawn, f[1])
     end)
 end

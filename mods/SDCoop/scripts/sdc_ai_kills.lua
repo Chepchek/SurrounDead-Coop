@@ -404,7 +404,8 @@ end
 -- lookups unless an AI is dying right now.
 -- sdc_ctx's idle check (through sdc_ai): stand_in answers nil without side
 -- effects while no AI is dying
-function M.stand_in_idle() return next(dying) == nil end
+-- (per object: stand_in only answers for the address of a dying AI)
+function M.stand_in_idle(a) return next(dying) == nil or (a ~= nil and dying[a] == nil) end
 
 function M.stand_in(wco)
     if next(dying) == nil then return nil end

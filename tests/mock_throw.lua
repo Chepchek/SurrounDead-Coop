@@ -543,5 +543,24 @@ local o5 = game_throw(CW, "BP_Throwable_Frag_C", { X = 0, Y = 0, Z = 150 }, { X 
 run_timers(CW)
 check(o5._valid and sent(CW, "THROW") == 0, "single player untouched")
 
+-- traffic of an idle host with one client, 6 minutes (the launcher cap, PRJCAP): NETQ line for the net-quiet report
+do
+    CS.role = "client"
+    H.throw.reset("netq")
+    HW.outbox = {}
+    local n, bytes = 0, 0
+    for _ = 1, 360 do
+        advance(1)
+        host_tick()
+    end
+    for _, m in ipairs(HW.outbox) do
+        if m:find("SDC1|PRJCAP|", 1, true) then n = n + 1; bytes = bytes + #m end
+    end
+    io.write(string.format("NETQ PRJCAP idle msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+    check(n >= 1, "PRJCAP: the cap is told (at least once)")
+    check(n >= 2, "PRJCAP: the verify comes (every 300 s) - " .. n)
+    check(n <= 3, "PRJCAP: ... and not every minute (verify every 300 s): " .. n)
+end
+
 print(fails == 0 and "ALL OK" or (fails .. " FAILED"))
 os.exit(fails == 0 and 0 or 1)
