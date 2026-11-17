@@ -164,7 +164,10 @@ local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigCompone
 local WANDERER = "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C"
 local GIVER = "/Game/Quests/Blueprints/NPCs/BP_QuestGiver.BP_QuestGiver_C"
 local GIVER_SERVER = GIVER .. ":OnServerExecuteInteract"
-local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker.Quest_Event_SpawnMarker_C:ExecuteEvent"
+-- 17.11.2026: _AI / _Object events (ActorTag only); the level's spawner places the marker with its MarkerData
+local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker_AI.Quest_Event_SpawnMarker_AI_C:ExecuteEvent"
+local SPAWN_MARKER_OBJ = "/Game/Quests/Events/Quest_Event_SpawnMarker_Object.Quest_Event_SpawnMarker_Object_C:ExecuteEvent"
+local MDF = require("sdc_markerdata").F
 local REMOVE_MARKER = "/Game/Quests/Events/Quest_Event_RemoveMarker.Quest_Event_RemoveMarker_C:ExecuteEvent"
 local REWARD_XP = "/Game/Quests/Events/Reward/Quest_Event_RewardPlayerXP.Quest_Event_RewardPlayerXP_C:ExecuteEvent"
 local CRATE_OPEN = "/Game/Quests/Blueprints/Objects/BP_GuaranteedSpawner.BP_GuaranteedSpawner_C:OpenContainer"
@@ -193,7 +196,7 @@ local function new_world(is_server)
     W.paths["/Script/Engine.Default__GameplayStatics"] = new({ "GameplayStatics" }, "GPS", {}, {
         DeleteGameInSlot = record("DeleteGameInSlot", true),
         BeginDeferredActorSpawnFromClass = function(_, _, _, tf)
-            local m = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147400000 - next_addr), { _loc = tf.Translation },
+            local m = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147400000 - next_addr), { _loc = tf.Translation, MarkerData = {} },
                 { K2_DestroyActor = function(self) self._valid = false end })
             W.spawned[#W.spawned + 1] = m
             return m
@@ -213,7 +216,7 @@ local function new_world(is_server)
     class_asset(MARKER, "BP_QuestMarker_C")
     for _, p in ipairs({ GNC, BEGIN, CBEGIN, CEXIT, SPAWN, CNDT, TEVENT, JIG .. ":Handle Comp to Comp Move",
             JIG .. ":CheckVendorAmountOfMoney", WANDERER .. ":OnExecuteInteractEnded", GIVER_SERVER,
-            SPAWN_MARKER, REMOVE_MARKER, REWARD_XP, CRATE_OPEN, JOURNAL .. ":Show Quest", JOURNAL .. ":ForgetQuest",
+            SPAWN_MARKER, SPAWN_MARKER_OBJ, REMOVE_MARKER, REWARD_XP, CRATE_OPEN, JOURNAL .. ":Show Quest", JOURNAL .. ":ForgetQuest",
             NC_BEGINQ, NC_FORGETQ, NC_ONREP }) do
         fn_obj(p)
     end
@@ -329,8 +332,9 @@ end
 local function quest_event(chain, state, props)
     return new(chain, chain[1] .. "_" .. next_addr, props, { GetOuter = function() return state end })
 end
-local function world_marker(tag)
-    return new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147300000 - next_addr), { Tags = tarray({ tag }) },
+local function world_marker(tag, loc, title)   -- the marker the level's spawner placed in the host's world
+    return new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147300000 - next_addr),
+        { Tags = tarray({ tag }), _loc = loc, MarkerData = { [MDF.title] = title, [MDF.radius] = 1500 } },
         { K2_DestroyActor = function(self) self._valid = false end })
 end
 local function last(kind, pc)
@@ -353,7 +357,7 @@ dlg.init(S); quests.init(S)
 dlg.install(); quests.install()
 dlg.register_handlers(); quests.register_handlers()
 quests.host_tick(1000)
-check(W.hooks[SPAWN_MARKER] and W.hooks[REMOVE_MARKER] and W.hooks[REWARD_XP], "host: marker / reward hooks in")
+check(W.hooks[SPAWN_MARKER] and W.hooks[SPAWN_MARKER_OBJ] and W.hooks[REMOVE_MARKER] and W.hooks[REWARD_XP], "host: marker / reward hooks in")
 
 print("H1. the host bought the intel: its bounty")
 local TAG1 = "Quest_Bounty_EliminateCoyotes001"
@@ -362,11 +366,12 @@ local q1, t1, st1 = bounty("Quest_Bounty_EliminateCoyotes001_C", "Coyote Checkpo
     { desc = "Kill the coyotes", cur = 0, req = 5 },
 })
 hcomp._p.QuestList = tarray({ q1 })
-local hm1 = world_marker(TAG1)   -- the copy the quest's event placed in the host's world
-local ev1 = quest_event({ "Quest_Event_SpawnMarker_C" }, st1, { ActorTag = TAG1, Location = { X = 50000, Y = 0, Z = 0 }, Text = "Coyote Checkpoint" })
+local hm1 = world_marker(TAG1, { X = 50000, Y = 0, Z = 0 }, "Coyote Checkpoint")   -- the copy the quest's event placed in the host's world
+local ev1 = quest_event({ "Quest_Event_SpawnMarker_AI_C" }, st1, { ActorTag = TAG1 })
 fire(SPAWN_MARKER, param(ev1), param(hpawn), param(hpc), param(hcomp))
 local qm = last("QM", rpc)
-check(qm and qm.f[3] == "a" and qm.f[4] == TAG1 and qm.f[5] == "50000", "host: the host's bounty marker sent to the client")
+check(qm and qm.f[3] == "a" and qm.f[4] == TAG1 and qm.f[5] == "50000" and qm.f[9] == "Coyote Checkpoint" and qm.f[15] == "1500",
+    "host: the host's bounty marker sent to the client (its place, title and radius from the marker)")
 check(hm1._valid == true, "host: the host's own copy of the marker stays")
 quests.host_tick(1001)
 local qg = last("QG", rpc)
@@ -407,9 +412,9 @@ local q2, t2, st2 = bounty("Quest_Bounty_ClassifiedContainer001_C", "Classified 
     { desc = "Kill the guards", cur = 0, req = 3 },
 })
 rcomp._p.QuestList = tarray({ q2 })
-local hm2 = world_marker(TAG2)
-local ev2 = quest_event({ "Quest_Event_SpawnMarker_C" }, st2, { ActorTag = TAG2, Location = { X = 7000, Y = 8000, Z = 100 }, Text = "Case" })
-fire(SPAWN_MARKER, param(ev2), param(rpawn), param(rpc), param(rcomp))
+local hm2 = world_marker(TAG2, { X = 7000, Y = 8000, Z = 100 }, "Case")
+local ev2 = quest_event({ "Quest_Event_SpawnMarker_Object_C" }, st2, { ActorTag = TAG2 })
+fire(SPAWN_MARKER_OBJ, param(ev2), param(rpawn), param(rpc), param(rcomp))
 qm = last("QM", rpc)
 check(qm and qm.f[3] == "a" and qm.f[4] == TAG2, "host: the client's bounty marker sent to the client")
 check(hm2._valid == true, "host: its copy in the host's world stays (the host sees it)")
@@ -432,8 +437,8 @@ check(table.concat(lines, "\n"):find("Общие задания с ноутбу�
 
 print("H3. not a bounty: the client's own quest stays its own")
 local _, _, st3 = bounty("Quest_Dungeon_LaboratoryBunker_C", "Lab", { { desc = "Find the lab", cur = 0, req = 1 } })
-local hm3 = world_marker("Lab")
-local ev3 = quest_event({ "Quest_Event_SpawnMarker_C" }, st3, { ActorTag = "Lab", Location = { X = 1, Y = 2, Z = 3 }, Text = "Lab" })
+local hm3 = world_marker("Lab", { X = 1, Y = 2, Z = 3 }, "Lab")
+local ev3 = quest_event({ "Quest_Event_SpawnMarker_AI_C" }, st3, { ActorTag = "Lab" })
 fire(SPAWN_MARKER, param(ev3), param(rpawn), param(rpc), param(rcomp))
 check(hm3._valid == false, "host: a client's other quest marker: the host's copy goes (as before)")
 local xev3 = quest_event({ "Quest_Event_RewardPlayerXP_C" }, st3, { Amount = 50 })
@@ -496,7 +501,8 @@ dlg.register_handlers(); quests.register_handlers()
 quests.host_tick(1000)
 local q4, _, st4 = bounty("Quest_Bounty_EliminateCoyotes001_C", "Coyote Checkpoint", { { desc = "Kill the coyotes", cur = 0, req = 5 } })
 hcomp._p.QuestList = tarray({ q4 })
-local ev4 = quest_event({ "Quest_Event_SpawnMarker_C" }, st4, { ActorTag = TAG1, Location = { X = 5, Y = 6, Z = 7 }, Text = "C" })
+world_marker(TAG1, { X = 5, Y = 6, Z = 7 }, "C")
+local ev4 = quest_event({ "Quest_Event_SpawnMarker_AI_C" }, st4, { ActorTag = TAG1 })
 fire(SPAWN_MARKER, param(ev4), param(hpawn), param(hpc), param(hcomp))
 quests.host_tick(1001)
 check(#msgs("QM", false) == 0 and #msgs("QG", false) == 0, "off: the host's bounty stays the host's (no QM, no QG)")

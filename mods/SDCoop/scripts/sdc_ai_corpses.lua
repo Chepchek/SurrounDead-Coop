@@ -70,7 +70,7 @@ local ue = require("sdc_ue")
 
 local M = {
     stats = { rooted = 0, root_kept = 0, root_failed = 0, ragdolls = 0, ragdoll_failed = 0, boss_lootable = 0,
-              animal_roots = 0, dead_sent = 0, pass_sent = 0, animal_ragdolls = 0, came_dead = 0, stood = 0,
+              animal_roots = 0, dead_sent = 0, pass_sent = 0, animal_ragdolls = 0, came_dead = 0, stood = 0, death_state = 0,
               re_ragdolls = 0 },
 }
 local core
@@ -271,6 +271,18 @@ local function make_corpse(z)
     for _, fx in ipairs({ "ZombieMist", "BloodSpitFX" }) do
         call(ue.prop(z, fx), fx, function(o) o:Deactivate() end)
     end
+    -- The game's Death ends the anim BP too (BP_MasterZombie Death @1249:
+    -- AnimBP_Zombie.DeathState(true), the walk state machine stops). A client's copy
+    -- gets IsDead? through replication and OnRep_IsDead? is empty, so its anim BP kept
+    -- walking: AnimBP_Zombie.AnimNotify_Footstep went on playing footstep sounds at a
+    -- corpse (the same for a copy that came into view dead). The game's own call here,
+    -- then the animals' way: no anim pass at all.
+    local anim = mesh and ue.try(function() return mesh:GetAnimInstance() end)
+    if ue.valid(anim) then
+        local okd = pcall(function() anim:DeathState(true) end)
+        if okd then M.stats.death_state = M.stats.death_state + 1 end
+    end
+    if mesh then ue.set_prop(mesh, "bPauseAnims", true) end
     -- JigCanInteract = Dead (Death @293): the corpse can be looted here
     ue.set_prop(z, "Dead", true)
     local key = ue.name(z)

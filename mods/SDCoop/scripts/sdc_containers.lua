@@ -54,13 +54,15 @@ local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local ctx = require("sdc_ctx")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 -- (a dead player's loot box that was emptied goes away; driven from here)
 local deathbox = require("sdc_deathbox")
 
 local M = {
     stats = { host_moves = 0, host_refused = 0, failed_sent = 0, forwards = 0, resends = 0,
               host_partial = 0, gone_sent = 0,
-              client_moves = 0, applied = 0, already = 0, unknown = 0, asked = 0, stuck = 0 },
+              client_moves = 0, applied = 0, already = 0, unknown = 0, asked = 0, stuck = 0,
+              relocated = 0 },
 }
 local S
 function M.init(state)
@@ -80,6 +82,10 @@ local F_COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
 local F_ITEMID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
 local F_MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
 local F_SLOT = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
+-- A container's slot list (sdc_stations reads the same field): its entries
+-- give the container's capacity. What occupies a slot is read from the items
+-- themselves (item_at), not from the list's order.
+local F_SLOTS = "ContainerSlots_13_97B5C4324E23EC5C1D899EA59CCDD3AC"
 local F_SUBS = "SubContainers_35_9B8F8C174A191BE2B5DAE19C1EB3FAAE"
 local F_SUB_ID = "UniqueID_9_C5CA265F40546A19DEB2539CEC625BC7"
 local U_UID = "UID_2_DC6DBB72457305316FAC19A4399A1CB5"
@@ -277,7 +283,7 @@ local function jmc_flush()
         if ue.valid(b.pc) and ue.short(b.pc) == b.pname then
             local n = #b.ops
             for i = 1, n, jmc.PER_MSG do
-                net.send_to(b.pc, "JMC", "*", b.key, table.unpack(b.ops, i, math.min(n, i + jmc.PER_MSG - 1)))
+                net.send_to(b.pc, "JMC", "*", wire.uid_enc(b.key), table.unpack(b.ops, i, math.min(n, i + jmc.PER_MSG - 1)))
                 msgs = msgs + 1
             end
         end
@@ -327,6 +333,9 @@ local function viewer_cache(comp, ck)
 end
 
 -- One multicast of a world container to its remote viewers.
+-- Which arguments of an op are UIDs (sent short, see sdc_wire).
+local UID_ARGS = { mv = { 1, 2 }, rm = { 1 }, add = { 1 }, stk = { 1, 3 }, cnt = { 1 }, dur = { 1 }, done = { 1 } }
+
 local function forward(comp, op, ...)
     if S.role ~= "host" or not on() then return end
     local ck = addr(comp)
@@ -335,7 +344,12 @@ local function forward(comp, op, ...)
     if not c.ok or #c.vs == 0 or not c.key then return end
     local parts = { op }
     for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
-    local item = table.concat(parts, ",")
+    local wired = { op }
+    for i = 2, #parts do wired[i] = parts[i] end
+    for _, i in ipairs(UID_ARGS[op] or {}) do
+        if wired[i + 1] then wired[i + 1] = wire.uid_enc(wired[i + 1]) end
+    end
+    local item = table.concat(wired, ",")
     M.stats.forwards = M.stats.forwards + 1
     local merged = false
     for _, e in ipairs(c.vs) do
@@ -379,7 +393,7 @@ local function forward(comp, op, ...)
     e.n = e.n + 1
     if merged then e.merged = e.merged + 1 end
     e.by[op] = (e.by[op] or 0) + 1
-    if #e.items < 3 then e.items[#e.items + 1] = item end
+    if #e.items < 3 then e.items[#e.items + 1] = table.concat(parts, ",") end   -- (the log shows the readable UIDs)
 end
 
 -- Host: a change the mod made itself in a world container's server data (no
@@ -480,7 +494,7 @@ local function on_mc_dur(c, uid_p, dur_p)
     if not comp then return end
     local u, d = ue.try(guid_str, param(uid_p)), param(dur_p)
     local x, y = d and tonumber(ue.try(function() return d.X end)), d and tonumber(ue.try(function() return d.Y end))
-    if u and x and y then forward(comp, "dur", u, string.format("%.3f", x), string.format("%.3f", y)) end
+    if u and x and y then forward(comp, "dur", u, wire.num(x, 3), wire.num(y, 3)) end
 end
 
 -- MC_OnPendingDone(Item: ContainerPickupsInfo[]): timed station crafts done.
@@ -561,6 +575,68 @@ local function item_at(comp, mother, slot)
     return found
 end
 
+-- How many slots a container has in a component's server data, or nil when the
+-- container does not show them.
+local function slot_count(comp, mother)
+    local n = nil
+    pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            if n then return end
+            local x = c:get()
+            if guid_str(x[F_CONT_UID]) ~= mother then return end
+            local i = 0
+            local ok = pcall(function() x[F_SLOTS]:ForEach(function() i = i + 1 end) end)
+            if ok then n = i end
+        end)
+    end)
+    return n
+end
+
+-- The first slot of `mother` that no item of the server data occupies, the
+-- slot `skip` itself not counting (the item there is the one being moved).
+local function free_slot(comp, mother, skip)
+    local n = slot_count(comp, mother)
+    if not n then return nil end
+    for i = 0, n - 1 do
+        if i ~= skip and not item_at(comp, mother, i) then return i end
+    end
+    return nil
+end
+
+-- The host's own repeat of a refused move: the item goes to the first free
+-- slot of the same container instead of the one the client picked (a slot the
+-- host keeps for another item: the client's grid and the host's inventory were
+-- out of step, 49 "NOT moved" lines in a session). On by default (config
+-- container_relocate; the self test step C.relocate runs it in the game, with the
+-- host starting the move itself, not a client's click over the net). The plugin's
+-- server side is not documented and a wrong call would move an item the client
+-- never asked about, so the result is read back from the server data before the
+-- client is told anything, and the guard `moving` covers the hook of the call
+-- made here itself.
+local moving = {}   -- [mover address|uid] = true: the host's own move is running
+local function relocate(mcomp, mover, ref, to_g, g, u, from_slot)
+    if cfg.get("container_relocate") ~= true then return false, "off" end
+    local k = tostring(addr(mover)) .. "|" .. u
+    if moving[k] then return false, "its own move is running" end
+    local to = ue.try(guid_str, to_g)
+    if not to then return false, "no container uid" end
+    local free = free_slot(ref, to, from_slot)
+    if free == nil then return false, "no free slot, or the container does not show its slots" end
+    moving[k] = true
+    M.stats.relocated = M.stats.relocated + 1
+    local ok, err = pcall(function()
+        mcomp:SERVER_SameContainer_MoveToIndex(ref, g, to_g, free, false, -1)
+    end)
+    ue.delay("containers.relocate", 500, function() moving[k] = nil end)
+    if not ok then
+        moving[k] = nil
+        return false, "the call failed: " .. tostring(err)
+    end
+    local now = find_item(ref, u)
+    if now and now.mother == to and tonumber(now.slot) == free then return true, free end
+    return false, "the host did not move it"
+end
+
 -- The plugin's own answer to a refused move: the pending slot in `holder`
 -- stops blinking, the item stays where it is.
 local function send_failed(mover_comp, holder, g)
@@ -633,6 +709,9 @@ local function on_same_move(mcomp, mover, before, ref_p, uid_p, to_p, idx_p)
     local g, to = param(uid_p), ue.try(guid_str, param(to_p))
     local u = g and ue.try(guid_str, g)
     if not ue.valid(ref) or not u or not to then return end
+    -- the host's own retry (relocate) goes through the same handler: count it
+    -- once, and do not answer a request nobody made
+    if moving[tostring(addr(mover)) .. "|" .. u] then return end
     M.note_view(mover, ref)
     M.stats.host_moves = M.stats.host_moves + 1
     local idx = math.floor(tonumber(param(idx_p)) or -1)
@@ -648,9 +727,19 @@ local function on_same_move(mcomp, mover, before, ref_p, uid_p, to_p, idx_p)
     elseif it then
         M.stats.host_refused = M.stats.host_refused + 1
         local at = item_at(ref, to, idx)
-        result = string.format("NOT moved (still at slot %s, x%s; slot %d there holds %s)", tostring(it.slot),
-            tostring(it.n), idx, at and string.format("%s x%s", at.name, tostring(at.n)) or "nothing")
-        answer, bad = " - " .. send_failed(mcomp, ref, g), true
+        local held = at and string.format("%s x%s", at.name, tostring(at.n)) or "nothing"
+        -- a free slot in the same container: put it there instead of answering
+        -- "not moved" (config container_relocate, see relocate)
+        local moved, where = relocate(mcomp, mover, ref, param(to_p), g, u, tonumber(it.slot))
+        if moved then
+            result = string.format("slot %d there holds %s: put in free slot %d instead", idx, held, where)
+            answer = " - the client gets the move from the plugin"
+        else
+            if where and where ~= "off" then log.debug("containers: relocate %s (uid %s): %s", it.name, u, where) end
+            result = string.format("NOT moved (still at slot %s, x%s; slot %d there holds %s)", tostring(it.slot),
+                tostring(it.n), idx, held)
+            answer, bad = " - " .. send_failed(mcomp, ref, g), true
+        end
     elseif was then
         result = "done (merged whole into a stack there: the plugin answered)"
     else
@@ -769,14 +858,14 @@ function M.host_rpc(rpc, c, before, ...)
     end
 end
 
--- net JADD|<container key>|<uid>, client -> host: an item the client's open
+-- net JADD|<container key>|<uid> (both short, sdc_wire), client -> host: an item the client's open
 -- container still does not show after its add.
 local resend_at = {}
 local function on_add_request(f, pc)
     if S.role ~= "host" or not on() then return end
     local pawn = ue.pawn_of(pc)
     if not is_remote_character(pawn) then return end
-    local key, u = f[1] or "", f[2] or ""
+    local key, u = wire.uid_dec(f[1]) or "", wire.uid_dec(f[2]) or ""
     local k = by_key[key]
     local v = k and views[k]
     local comp = v and v.comp
@@ -903,7 +992,7 @@ local function apply_added(key, f)
             return
         end
         M.stats.asked = M.stats.asked + 1
-        net.send_to_host("JADD", key, u)
+        net.send_to_host("JADD", wire.uid_enc(key), wire.uid_enc(u))
         client_log("asked", string.format("containers: %s was added to %s on the host but is not shown here; asked for it",
             u, ue.short(owner_of(comp))))
         -- the host's CLIENT_AddNewItem puts it where the host has it
@@ -978,17 +1067,24 @@ local function jmc_op(f)
 end
 
 -- net JMC|*|<container key>|<op,args...>|<op,args...>|... (the ops of one
--- host tick for one container, in order), or JMC|<op>|<container key>|<args...>
--- (one op, as before 0.7.3), host -> client.
+-- host tick for one container, in order), host -> client. The container key
+-- and every UID argument are the short form of sdc_wire (22 characters).
 local function on_jmc_msg(f)
-    if S.role ~= "client" or not on() then return end
-    if f[1] ~= "*" then return jmc_op(f) end
-    local key = f[2] or ""
+    if S.role ~= "client" or not on() or f[1] ~= "*" then return end
+    local key = wire.uid_dec(f[2])
+    if not key then return end
     for i = 3, #f do
         local one = {}
         for part in (f[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = part end
-        table.insert(one, 2, key)
-        jmc_op(one)
+        local ok = true
+        for _, a in ipairs(UID_ARGS[one[1]] or {}) do
+            local u = wire.uid_dec(one[a + 1])
+            if u then one[a + 1] = u else ok = false end
+        end
+        if ok then
+            table.insert(one, 2, key)
+            jmc_op(one)
+        end
     end
 end
 
@@ -1108,13 +1204,14 @@ function M.reset()
     gone.told = {}
     jmc.q, jmc.order, jmc.due, jmc.vc, jmc.sum, jmc.sum_order = {}, {}, false, {}, {}, {}
     opened, waiting, logged = {}, {}, {}
+    for k in pairs(moving) do moving[k] = nil end
     hook_at = -100
     deathbox.reset()
 end
 
 function M.register_handlers()
     -- host -> client: JMC|*|<container key>|<op,args>|...  (a world container's multicasts of one tick, reliably;
-    -- op mv|rm|add|stk|cnt|dur|done; the old single form JMC|<op>|<container key>|<args> is still read)
+    -- op mv|rm|add|stk|cnt|dur|done)
     net.on("JMC", on_jmc_msg)
     -- client -> host: JADD|<container key>|<uid>   (an added item the open container does not show)
     net.on("JADD", on_add_request)

@@ -56,6 +56,7 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 local consume = require("sdc_consume")   -- the host's inventory walk (item names, a missing item)
 
 local M = {
@@ -184,7 +185,7 @@ local function flush()
     local parts = {}
     for _, u in ipairs(list) do
         local e = cl.pend[u]
-        parts[#parts + 1] = string.format("%s=%.4f/%d", u, e.m, e.n)
+        parts[#parts + 1] = string.format("%s=%s/%d", wire.uid_enc(u), wire.num(e.m, 4), e.n)
     end
     if not net.send_to_host(MSG, table.concat(parts, ";")) then return end
     local now = os.clock()
@@ -404,7 +405,8 @@ local function on_wear_msg(f, pc)
     for entry in tostring(f[1] or ""):gmatch("[^;]+") do
         n = n + 1
         if n > MAX_ITEMS then break end
-        local us, ms, ns = entry:match("^([%-%d:]+)=([%d%.]+)/(%d+)$")
+        local code, ms, ns = entry:match("^([%w_%-]+)=([%d%.]+)/(%d+)$")
+        local us = code and wire.uid_dec(code)
         local g, m, shots = parse_guid(us), tonumber(ms), math.max(1, math.floor(tonumber(ns) or 1))
         if not g or not m or m ~= m or m <= 0 then
             M.stats.host_refused = M.stats.host_refused + 1

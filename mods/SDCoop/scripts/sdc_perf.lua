@@ -13,6 +13,11 @@
 -- cycles finished, worst sampled step) and the UE4SS.log writes of the window
 -- (sdc_log: writes/s, KB/s, ms/s, the slowest, how many held the game >= 100
 -- ms, whether lines are batched).
+-- Spikes, not averages (a frame of 50 ms ruins 200 fps): every hook and task
+-- also keeps its worst single call of the window and how many calls took
+-- SPIKE_MS or more ("worst calls:"), and every frame the mod's own work since
+-- the last frame is summed (hooks and tasks, nested ones once): "mod work per
+-- frame: worst N ms, K of F frames over 4 ms". Both reset with each window.
 -- A single hook call of 100 ms or more is logged as "[SLOW] mod hook" (like
 -- sdc_ue's tasks); the hook running now is M.current (sdc_ue.activity).
 -- While sdc_ctx's player-0 hooks run, the line ends with "ctx:" (calls,
@@ -45,13 +50,18 @@ local worst_hook = { ms = 0 }
 
 -- A hook call of NOTE_MS or more: the longest one for [HITCH], and a
 -- "[SLOW] mod hook" line like the tasks' (the worst of each hook again when
--- it gets worse, and every one of a second or more).
+-- it gets worse, and every one of a second or more). The line is queued for
+-- the frame loop: writing it here would print inside the game's own call.
+local slow_hooks = {}   -- [i] = the line, written by M.frame
 function M.note_hook(rec, ms, log_ms)
     if ms > worst_hook.ms then worst_hook = { ms = ms, name = rec.name, log_ms = log_ms } end
     if ms >= SLOW_HOOK_MS and (ms > (rec.slow or 0) * 1.5 or ms >= 1000) then
         rec.slow = math.max(ms, rec.slow or 0)
-        log.warn("[SLOW] mod hook '%s' held the game for %.0f ms (writing UE4SS.log in it: %.0f ms; lua heap %.1f MB)",
-            tostring(rec.name), ms, log_ms or 0, collectgarbage("count") / 1024)
+        if #slow_hooks < 64 then
+            slow_hooks[#slow_hooks + 1] = string.format(
+                "[SLOW] mod hook '%s' held the game for %.0f ms (writing UE4SS.log in it: %.0f ms; lua heap %.1f MB)",
+                tostring(rec.name), ms, log_ms or 0, collectgarbage("count") / 1024)
+        end
     end
 end
 
@@ -73,10 +83,33 @@ local function short(path)
     return path:match("[^/.]+$") or path
 end
 
+-- One finished call of a hook or task (rec = its record: hook rec or task_stats
+-- entry): its window maximum, the calls of SPIKE_MS or more, and the frame's
+-- mod work. `nested` = it ran inside another hook (sdc_perf.current before it);
+-- a call inside a scheduled task (sdc_ue.running) counts in that task.
+local SPIKE_MS = 4
+M.SPIKE_MS = SPIKE_MS
+M.work_ms = 0            -- mod work since the last frame (outermost calls)
+local fr = { n = 0, max = 0, over = 0, over16 = 0 }
+function M.note_call(rec, ms, nested)
+    if ms > (rec.wmax or 0) then rec.wmax = ms end
+    if ms >= SPIKE_MS then rec.over = (rec.over or 0) + 1 end
+    if nested then return end
+    local ue = package.loaded["sdc_ue"]
+    if type(ue) == "table" and ue.running ~= nil then return end
+    M.work_ms = M.work_ms + ms
+end
+-- a scheduled task's call (sdc_ue.guarded); `nested` = it ran inside another task
+function M.note_task(ts, ms, nested)
+    if ms > (ts.wmax or 0) then ts.wmax = ms end
+    if ms >= SPIKE_MS then ts.over = (ts.over or 0) + 1 end
+    if not nested then M.work_ms = M.work_ms + ms end
+end
+
 local function record(path)
     local r = M.hooks[path]
     if not r then
-        r = { name = short(path), calls = 0, ms = 0 }
+        r = { name = short(path), calls = 0, ms = 0, wmax = 0, over = 0 }
         M.hooks[path] = r
     end
     return r
@@ -93,6 +126,7 @@ local function wrap(fn, rec)
         rec.calls = rec.calls + 1
         rec.ms = rec.ms + ms
         M.current = prev
+        M.note_call(rec, ms, prev ~= nil)
         if ms >= NOTE_MS then pcall(M.note_hook, rec, ms, writes.ms - w0) end
         return ...
     end
@@ -261,6 +295,26 @@ end
 --     has not run in the game yet: opt-in (lua_gc = generational).
 -- None of these comes near a second: a full stop-the-world collection of the
 -- client's largest heap (88 MB) measured ~140 ms.
+-- Frame spikes (tests/gcwork/test_gcpace.lua; a 19 MB model with 32000 live
+-- tables, 12 KB of garbage per frame, 12000 frames; os.clock steps of 1 ms):
+--   incremental 150/200: 76-96 frames of 4 ms or more, worst 23-45 ms, p99.9
+--     17-19 ms. One sits at the end of every cycle (heap 29 -> 20 MB within
+--     one or two frames: the sweep and the atomic phase of a step whose work
+--     is worth stepmul x stepsize, measured in OBJECTS while sweeping, so one
+--     step frees 100000+ objects); the cycles of the client's log come every
+--     ~2 s (25-30 per 60 s window).
+--   generational 20/100: 55 frames of 4 ms or more, worst 41-56 ms (the
+--     major collections): no better.
+--   "paced" (EXPERIMENTAL, opt-in with lua_gc = paced; the in-game A/B of 14.11 lost: steps of 26-50 ms,
+--     host heap +38 MB in one window, no fewer long frames; the model below does not show it): the automatic collector is stopped and the
+--     frame loop (M.frame) runs collectgarbage("step") with a small step
+--     (2^8 bytes) for PACE_BUDGET_MS of every frame, from the moment the heap
+--     passes lua_gc_pause % of the live data until the cycle ends: worst 3-4
+--     ms, 0-4 frames of 4 ms or more, same total work. os.clock has 1 ms
+--     steps, so the loop also stops after PACE_MAX_STEPS steps; when the
+--     collector falls behind (heap 2.5x / 4x the live data) the budget grows
+--     x3 / x8, and M.gc_watch (the 1 s task) catches up if the frame loop
+--     stood still.
 M.gc_mode = "incremental"
 M.gc_desc = "incremental"
 M.gc_pause = 200
@@ -277,23 +331,44 @@ local function canary()
 end
 canary()
 
+-- "paced": the frame loop drives the collector (see above)
+local PACE_BUDGET_MS = 1.0
+local PACE_MAX_STEPS = 400
+local PACE_STEP_LOG2 = 8
+local pace = { on = false, want = false, stalled = 0, last_frames = -1, active = false, base_kb = nil, start = 1.5, frames = 0, ms = 0, max = 0, cycles = 0 }
+M.pace = pace
+
 function M.set_gc_mode(mode, pause, stepmul)
     mode = tostring(mode or "")
-    if mode ~= "generational" and mode ~= "incremental" then return false end
+    if mode ~= "generational" and mode ~= "incremental" and mode ~= "paced" then return false end
     local ok, prev
-    if mode == "incremental" then
+    if mode == "incremental" or mode == "paced" then
         -- 0 / nil = keep Lua's value
         pause, stepmul = math.floor(tonumber(pause) or 0), math.floor(tonumber(stepmul) or 0)
         if pause < 0 or pause > 1000 then pause = 0 end
         if stepmul < 0 or stepmul > 1000 then stepmul = 0 end
-        ok, prev = pcall(collectgarbage, "incremental", pause, stepmul)
+        ok, prev = pcall(collectgarbage, "incremental", pause, stepmul, mode == "paced" and PACE_STEP_LOG2 or 0)
         if ok then
             M.gc_pause = pause > 0 and pause or M.gc_pause
-            M.gc_desc = string.format("incremental %d/%d", M.gc_pause, stepmul > 0 and stepmul or 100)
+            M.gc_desc = string.format("%s %d/%d", mode, M.gc_pause, stepmul > 0 and stepmul or 100)
+            if mode == "paced" then
+                -- only recorded here: the collector is stopped by the first frame of the frame loop
+                -- (M.frame), so a main.lua that dies before that loop exists never leaves it stopped
+                pace.want, pace.on, pace.active = true, false, false
+                pace.start = math.max(1.1, M.gc_pause / 100)
+                M.gc_desc = M.gc_desc .. string.format(" paced %.1f ms/frame", PACE_BUDGET_MS)
+            else
+                pace.want, pace.on = false, false
+                pcall(collectgarbage, "restart")
+            end
         end
     else
         ok, prev = pcall(collectgarbage, "generational", 10, 100)
-        if ok then M.gc_desc = "generational 10/100" end
+        if ok then
+            M.gc_desc = "generational 10/100"
+            pace.want, pace.on = false, false
+            pcall(collectgarbage, "restart")
+        end
     end
     if ok then
         M.gc_mode = mode
@@ -302,6 +377,68 @@ function M.set_gc_mode(mode, pause, stepmul)
         log.warn("perf: Lua collector %s refused: %s", mode, tostring(prev))
     end
     return ok
+end
+
+-- "paced": a share of this frame for the collector, from the moment a cycle is
+-- due until it ends. `budget_ms` = more (or less) than a normal frame's share.
+local function gc_pace(budget_ms)
+    local kb = collectgarbage("count")
+    local base = pace.base_kb
+    if not base then pace.base_kb = kb; return end
+    if not pace.active then
+        if kb < base * pace.start then return end
+        pace.active = true
+    end
+    if not budget_ms then
+        budget_ms = PACE_BUDGET_MS
+        -- behind: the heap far above where this cycle began
+        if kb > base * 4 then budget_ms = budget_ms * 8 elseif kb > base * 2.5 then budget_ms = budget_ms * 3 end
+    end
+    local t0 = clock()
+    local n = 0
+    repeat
+        n = n + 1
+        if collectgarbage("step", 0) then
+            pace.active, pace.cycles = false, pace.cycles + 1
+            pace.base_kb = collectgarbage("count")
+            M.gc_cycles_paced = pace.cycles
+            break
+        end
+    until n >= PACE_MAX_STEPS or (clock() - t0) * 1000 >= budget_ms
+    local ms = (clock() - t0) * 1000
+    pace.frames, pace.ms = pace.frames + 1, pace.ms + ms
+    if ms > pace.max then pace.max = ms end
+end
+
+-- a driver that failed hands the collector back to Lua
+local function pace_failed(err)
+    pace.on, pace.want = false, false
+    pcall(collectgarbage, "restart")
+    M.gc_mode, M.gc_desc = "incremental", "incremental (paced driver failed)"
+    log.err("perf: paced Lua collector failed, automatic collector back on: %s", tostring(err))
+end
+
+-- main.lua's 1 s task: the collector must not stand still when the frame loop
+-- does (a long load): a heap far above the live data is collected here.
+function M.gc_watch()
+    if not pace.on then return end
+    -- the frame loop stood still for 3 calls (3 s): the collector goes back to Lua; the first
+    -- frame after that stops it again (pace.want)
+    if M.frames == pace.last_frames then
+        pace.stalled = pace.stalled + 1
+        if pace.stalled >= 3 then
+            pace.on, pace.want, pace.stalled = false, true, 0
+            pcall(collectgarbage, "restart")
+            log.warn("perf: no frame for 3 s: the automatic Lua collector is back on until frames run again")
+            return
+        end
+    else
+        pace.stalled, pace.last_frames = 0, M.frames
+    end
+    if not pace.base_kb then return end
+    if collectgarbage("count") < pace.base_kb * 3 then return end
+    local ok, err = pcall(gc_pace, 20)
+    if not ok then pace_failed(err) end
 end
 
 -- One incremental collector step, timed (sdc_diag, once a second): only in
@@ -323,6 +460,31 @@ end
 M.bench_frame = nil
 function M.frame()
     M.frames = M.frames + 1
+    -- slow hooks are written here, not inside the hook: a print there is a
+    -- disk write inside the game's own call (it made the log slow itself)
+    if #slow_hooks > 0 then
+        local list = slow_hooks
+        slow_hooks = {}
+        for i = 1, math.min(#list, 8) do log.warn("%s", list[i]) end
+        if #list > 8 then
+            log.warn("[SLOW] mod hooks: %d more line(s) of this kind", #list - 8)
+        end
+    end
+    local w = M.work_ms
+    M.work_ms = 0
+    fr.n = fr.n + 1
+    if w > fr.max then fr.max = w end
+    if w >= SPIKE_MS then fr.over = fr.over + 1 end
+    if w >= 16 then fr.over16 = fr.over16 + 1 end
+    if pace.want and not pace.on then
+        pace.want = false
+        pcall(collectgarbage, "stop")
+        pace.on, pace.active, pace.base_kb, pace.stalled = true, false, collectgarbage("count"), 0
+    end
+    if pace.on then
+        local okp, err = pcall(gc_pace)
+        if not okp then pace_failed(err) end
+    end
     local bf = M.bench_frame
     if bf then bf() end
 end
@@ -362,6 +524,24 @@ local function build(why, tasks, commit)
         end
         if commit then win.tasks[label] = { calls = r.calls, ms = r.ms } end
     end
+    -- the worst single calls of the window (hooks and tasks together) and the
+    -- mod's work per frame; the maxima restart with a real window
+    local wl = {}
+    for _, r in pairs(M.hooks) do
+        if (r.wmax or 0) >= 1 then wl[#wl + 1] = { name = r.name, ms = r.wmax, over = r.over or 0, kind = "hook" } end
+        if commit then r.wmax, r.over = 0, 0 end
+    end
+    for label, r in pairs(tasks or {}) do
+        if (r.wmax or 0) >= 1 then wl[#wl + 1] = { name = label, ms = r.wmax, over = r.over or 0, kind = "task" } end
+        if commit then r.wmax, r.over = 0, 0 end
+    end
+    local ws = {}
+    for _, e in ipairs(top(wl, 6)) do
+        ws[#ws + 1] = string.format("%s %s %.0fms (%d >= %d ms)", e.kind, e.name, e.ms, e.over, SPIKE_MS)
+    end
+    local frame_text = string.format("worst %.1f ms, %d of %d frames >= %d ms, %d >= 16 ms", fr.max, fr.over,
+        fr.n, SPIKE_MS, fr.over16)
+    if commit then fr.n, fr.max, fr.over, fr.over16 = 0, 0, 0, 0 end
     local hs, ts = {}, {}
     for _, e in ipairs(top(hl, 8)) do
         hs[#hs + 1] = string.format("%s %.0f/s %.1fms/s", e.name, e.calls / dt, e.ms / dt)
@@ -411,6 +591,13 @@ local function build(why, tasks, commit)
     -- collector: cycles finished in the window, worst sampled step
     local cycles = M.gc_cycles - (win.gc_cycles or M.gc_cycles)
     local step = gc_steps.n > 0 and string.format(", step max %.0f ms", gc_steps.max) or ""
+    -- paced collector: frames it worked in this window, its time, the worst frame's share
+    if pace.on then
+        local pw = win.pace or { frames = 0, ms = 0 }
+        step = step .. string.format(", paced: %d frames %.0f ms, worst %.1f ms", pace.frames - pw.frames,
+            pace.ms - pw.ms, pace.max)
+        if commit then win.pace = { frames = pace.frames, ms = pace.ms }; pace.max = 0 end
+    end
     -- UE4SS.log writes in the window (sdc_log): rate, time, the slowest one
     local lw = win.log or { n = 0, bytes = 0, ms = 0, slow = 0 }
     local wn, wb, wms = (writes.n or 0) - lw.n, (writes.bytes or 0) - lw.bytes, (writes.ms or 0) - lw.ms
@@ -452,10 +639,11 @@ local function build(why, tasks, commit)
         ctxs = ctxs .. string.format(" | BENCH MODE: %d Blueprint hooks not registered", M.reg.skipped_bp)
     end
     local line = string.format("[PERF] %s %.0fs: fps=%.0f | mod hooks %.1fms/s: %s | mod tasks %.1fms/s: %s"
-        .. " | parts: %s | msgs in: %s | FindAllOf: %s | lua heap %.1f MB (%+.1f, gc %s, %d cycles%s)"
+        .. " | worst calls: %s | mod work per frame: %s | parts: %s | msgs in: %s | FindAllOf: %s | lua heap %.1f MB (%+.1f, gc %s, %d cycles%s)"
         .. " | log writes %.1f/s %.1f KB/s %.1fms/s, max %.0f ms%s%s%s%s",
         why or "window", dt, fps, total_ms / dt, #hs > 0 and table.concat(hs, ", ") or "-",
-        task_ms / dt, #ts > 0 and table.concat(ts, ", ") or "-", parts, msgs, finds,
+        task_ms / dt, #ts > 0 and table.concat(ts, ", ") or "-", #ws > 0 and table.concat(ws, ", ") or "-",
+        frame_text, parts, msgs, finds,
         kb / 1024, grow / 1024, M.gc_desc or M.gc_mode or "incremental", cycles, step,
         wn / dt, wb / 1024 / dt, wms / dt, wmax, wslow > 0 and string.format(", %d slow (>= %d ms)", wslow,
             log.SLOW_WRITE_MS or 100) or "", (log.batching and log.batching()) and ", batched" or "", queued, ctxs)

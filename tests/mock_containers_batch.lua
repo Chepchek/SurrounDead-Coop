@@ -16,6 +16,7 @@
 -- usage: lua mock_disasm_output.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -312,7 +313,7 @@ local function jmc_ops(pcx)
   local ops = {}
   for _, s in ipairs(sent) do
     if s.kind == "JMC" and (pcx == nil or s.pc == pcx) then
-      for i = 3, #s.args do ops[#ops + 1] = s.args[i] end
+      for i = 3, #s.args do ops[#ops + 1] = (s.args[i]:gsub("[^,]+", function(t) return wire.uid_dec(t) or t end)) end
     end
   end
   return ops
@@ -542,8 +543,8 @@ fire(comp, "MC_UpdateDurability", P(guid(7302)), durp(5, 5))
 T = T + 1
 run_delays()
 local o6 = jmc_ops(pc)
-check(#o6 == 4 and o6[1] == "dur,7300:0:0:0,2.000,2.000" and o6[2]:sub(1, 3) == "stk" and o6[3] == "dur,7300:0:0:0,4.000,4.000"
-  and o6[4] == "dur,7302:0:0:0,5.000,5.000", "dur: merged before and after the stk, not across it: " .. table.concat(o6, " | "))
+check(#o6 == 4 and o6[1] == "dur,7300:0:0:0,2,2" and o6[2]:sub(1, 3) == "stk" and o6[3] == "dur,7300:0:0:0,4,4"
+  and o6[4] == "dur,7302:0:0:0,5,5", "dur: merged before and after the stk, not across it: " .. table.concat(o6, " | "))
 -- cnt and dur of one item do not swallow each other
 sent = {}
 fire(comp, "MC_UpdateCount", P(guid(7310)), P(1), P(false))

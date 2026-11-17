@@ -80,7 +80,7 @@ items.client_tick()
 -- a repair sets a durability in the empty data here: sent, and Updated answered
 local up = P(false)
 hooks[JIG .. "ServerFunc_UpdateDurabilityByUID"](C(mycomp), P(G(7)), P({ X = 80, Y = 100 }), up)
-assert(to_host[#to_host][1] == "SETDUR" and to_host[#to_host][2] == "7:0:0:0" and to_host[#to_host][3] == "80.000", "SETDUR not sent")
+assert(to_host[#to_host][1] == "SETDUR" and require("sdc_wire").uid_dec(to_host[#to_host][2]) == "7:0:0:0" and to_host[#to_host][3] == "80", "SETDUR not sent")
 assert(up.v == true, "Updated not answered")
 -- loot: a request without an answer is reported; one with an answer is logged
 local crate = { __name = "Container_HighTierMilitaryLoot_Crates_C_5", __cls = "Container_HighTierMilitaryLoot_Crates_C", Role = 1 }
@@ -143,18 +143,18 @@ print("host: purify gives the clean bottle")
 
 -- repair: raise first (waits), then the kit wears (applied, raise flushed)
 offset = offset + 10
-handlers.SETDUR({ "7:0:0:0", "90" }, pc)
+handlers.SETDUR({ "AAAABwAAAAAAAAAAAAAAAA", "90" }, pc)
 assert(#setdur == 0, "raise applied without a kit")
-handlers.SETDUR({ "8:0:0:0", "30" }, pc)
+handlers.SETDUR({ "AAAACAAAAAAAAAAAAAAAAA", "30" }, pc)
 assert(#setdur == 2 and setdur[1].a == 8 and setdur[1].x == 30 and setdur[2].a == 7 and setdur[2].x == 90, "repair not applied")
 -- a raise with nothing around: refused after the window
 offset = offset + 10
-handlers.SETDUR({ "7:0:0:0", "100" }, pc)
+handlers.SETDUR({ "AAAABwAAAAAAAAAAAAAAAA", "100" }, pc)
 offset = offset + 3
 items.host_tick({ pc })
 assert(#setdur == 2 and has_log("raised the durability of 7:0:0:0 with no repair kit used around it; not applied", "warn"), "unpaid raise not refused")
 -- unknown item
-handlers.SETDUR({ "99:0:0:0", "10" }, pc)
+handlers.SETDUR({ "AAAAYwAAAAAAAAAAAAAAAA", "10" }, pc)
 assert(has_log("set the durability of item 99:0:0:0, which is not in their inventory here", "warn"), "unknown item")
 -- loot request diagnostics on the host
 local crate = { __name = "Crate_5", __cls = "Container_HighTierMilitaryLoot_Crates_C",

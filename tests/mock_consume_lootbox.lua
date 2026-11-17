@@ -18,6 +18,7 @@
 -- usage: lua mock_consume_lootbox.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local T = 1000.0
 os.clock = function() return T end
@@ -591,7 +592,7 @@ rcomp:AddNewItemSomewhere(DA.DA_Katana, 1, nil, 1, true, "None", added, dropped,
 check(gs(to) == gs(G_WALLET), "(the plugin's add picked the wallet)")
 client_apply()
 f = sent("IGLOST")
-check(f and f[1] == gs(uid), "the client's wallet widget refused it: IGLOST sent")
+check(f and f[1] == wire.uid_enc(gs(uid)), "the client's wallet widget refused it: IGLOST sent")
 check(log_has("whose widget here does not take it (not shown): asked the host to drop it", n_log), "client log")
 deliver()
 local dr = last_call("SERVER_RequestDropItem")
@@ -609,18 +610,18 @@ check(#outbox.client == 0, "the same item is told only once in " .. tostring(CM.
 CUR = "host"; WHO = "host"
 rcomp.__fail_drop = true
 local nd0 = ncalls("SERVER_RequestDropItem")
-handlers.host.IGLOST({ u2 }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(u2) }, rpc)
 local nd = ncalls("SERVER_RequestDropItem")
-handlers.host.IGLOST({ u2 }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(u2) }, rpc)
 check(nd == nd0 + 1 and ncalls("SERVER_RequestDropItem") == nd and log_has("NOT dropped (still in their inventory", n_log),
     "the host tries it once in " .. tostring(HM._t.gain.AGAIN_S) .. " s and says when the drop did not happen")
 rcomp.__fail_drop = nil
 advance(6)
-handlers.host.IGLOST({ u2 }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(u2) }, rpc)
 check(ncalls("SERVER_RequestDropItem") == nd + 1 and find_server(u2) == nil, "later it is tried again (and dropped)")
 nd = ncalls("SERVER_RequestDropItem")
 -- an item not in the player's inventory: nothing
-handlers.host.IGLOST({ gs(G(123456)) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(G(123456))) }, rpc)
 check(ncalls("SERVER_RequestDropItem") == nd and log_has("not in their inventory here either", n_log), "unknown item: nothing dropped")
 
 print("== 7. what is not judged")
@@ -646,7 +647,7 @@ fire("client", JIG .. "CLIENT_AddNewItem", C(mycomp), P(refused), P({}), P(mycom
 check(sent("IGLOST") == nil and log_has("refused_items_to_feet is off", n_log), "setting off: the client only logs it")
 CUR = "host"; WHO = "host"
 local nd2 = ncalls("SERVER_RequestDropItem")
-handlers.host.IGLOST({ gs(CAN_STACK[F.USID]) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(CAN_STACK[F.USID])) }, rpc)
 check(ncalls("SERVER_RequestDropItem") == nd2, "setting off: the host drops nothing")
 CFG.refused_items_to_feet = nil
 
@@ -1366,7 +1367,7 @@ check(seen_r >= 8 and unmarked == 0, "the rescue's drop requests are marked (" .
 CUR = "host"; WHO = "host"
 local kl = server_item(DA.DA_Katana, 1, server[2])
 advance(10)
-handlers.host.IGLOST({ gs(kl[F.USID]) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(kl[F.USID])) }, rpc)
 local lc = last_call("SERVER_RequestDropItem")
 check(lc and lc[2] == gs(kl[F.USID]) and lc[4] == true and find_server(gs(kl[F.USID])) == nil and HP.dropping == false,
     "IGLOST's drop request is marked")
@@ -1379,7 +1380,7 @@ check(jd and jd[2] == "DA_Cloth" and jd[5] == true and HP.dropping == false, "a 
 -- IGLOST: an item with no pickup class is not dropped (it would only leave the data)
 local npl = server_item(DA.DA_NoPickup, 1, server[3])
 local dl0 = ncalls("SERVER_RequestDropItem")
-handlers.host.IGLOST({ gs(npl[F.USID]) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(npl[F.USID])) }, rpc)
 check(ncalls("SERVER_RequestDropItem") == dl0 and find_server(gs(npl[F.USID])) ~= nil, "IGLOST: no pickup class, not dropped")
 local st15 = sent_host("IHID")
 check(st15 and st15[1] == DA.DA_NoPickup.__path and st15[3] == DA.DA_MedBag.__path and st15[4] == "stuck",
@@ -1388,7 +1389,7 @@ check(st15 and st15[1] == DA.DA_NoPickup.__path and st15[3] == DA.DA_MedBag.__pa
 local kst = server_item(DA.DA_Katana, 1, server[3])
 rcomp.__fail_drop = true
 outbox.host = {}
-handlers.host.IGLOST({ gs(kst[F.USID]) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(kst[F.USID])) }, rpc)
 rcomp.__fail_drop = nil
 local stg = sent_host("IHID")
 check(find_server(gs(kst[F.USID])) ~= nil and stg and stg[4] == "stuck" and stg[1] == DA.DA_Katana.__path,
@@ -1397,7 +1398,7 @@ check(find_server(gs(kst[F.USID])) ~= nil and stg and stg[4] == "stuck" and stg[
 n_log = #logs
 local kl2 = server_item(DA.DA_Katana, 1, server[3])
 rpawn.__fail_jdrop = true
-handlers.host.IGLOST({ gs(kl2[F.USID]) }, rpc)
+handlers.host.IGLOST({ wire.uid_enc(gs(kl2[F.USID])) }, rpc)
 rpawn.__fail_jdrop = nil
 check(log_has("LOST - out of their inventory, but no pickup of it came", n_log) ~= nil, "IGLOST: no pickup came, said so")
 local lo15 = sent_host("IHID")

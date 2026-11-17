@@ -107,7 +107,11 @@
 -- client leaves.
 --
 -- Messages host -> client:
---   NPCSET|<class>|<max health>|<health>|<look>[|<name>]   + ClientRepObjRef(npc)
+--   NPCSET|<defs>|<class>|<max health>|<look>[|<name>]   + ClientRepObjRef(npc)
+--       the look, once and on a change (and as the verify); class and look as
+--       sdc_dict tokens, <defs> the definitions the client lacks
+--   NPCHP|<health>                                 + ClientRepObjRef(npc)
+--       the NPC's health on its own, when it changed (at most once per pass) and as the verify
 --   NPCFIRE|<class>|1/0                            + ClientRepObjRef(npc)
 --   NPCBLOOD|<class>                               + ClientRepObjRef(npc)
 --   NPCROCK|ox|oy|oz|tx|ty|tz
@@ -116,6 +120,7 @@
 local log = require("sdc_log")
 local ue = require("sdc_ue")
 local net = require("sdc_net")
+local dict = require("sdc_dict")
 local cfg = require("sdc_config")
 local ai = require("sdc_ai")   -- shared helpers (ai.core) and the hooks it installs for both (M.hook_external)
 local core = ai.core
@@ -123,7 +128,7 @@ local core = ai.core
 local M = {
     stats = { boss_tick = 0, human_tick = 0, human_back = 0, rocks_sent = 0, rocks_spawned = 0, rocks_failed = 0,
               sounds = 0, fire_sent = 0, fire_applied = 0, blood_sent = 0, blood_applied = 0,
-              set_sent = 0, set_applied = 0, looks = 0, look_parts = 0, look_failed = 0, look_later = 0,
+              set_sent = 0, set_applied = 0, hp_sent = 0, hp_applied = 0, hp_held = 0, set_unreadable = 0, looks = 0, look_parts = 0, look_failed = 0, look_later = 0,
               objref_got = 0, objref_nil = 0, objref_stale = 0, objref_other = 0, objref_failed = 0,
               friendly_set = 0, names = 0, marks_seen = 0, marks_removed = 0, marks_failed = 0, slow_objref = 0 },
 }
@@ -190,6 +195,7 @@ local RESEND_S = 30           -- an NPC near a client is compared with what that
 local WARM_S = 120            -- the first minutes of an NPC for a viewer: every RESEND_S (its look may wait for an asset there)
 local VERIFY_S = 180          -- ... and told again (the full NPCSET) only when it differs, or this often
 local SET_PER_PASS = 10     -- NPCSET per client and pass
+local HP_PER_PASS = 24      -- NPCHP per client and pass (a few bytes each)
 local MAX_NPCS = 96         -- human NPCs looked at per pass
 local FX_RANGE = 16000      -- cm: rock / sounds / fire to clients this close
 local BLOOD_RANGE = 10000
@@ -278,9 +284,15 @@ local function guarded(h)
     end
 end
 
+local HOOK_SLICE_S = 0.003   -- a pass over the hooks stops after this long (a failing RegisterHook costs ~22 ms)
+
 local function install_hooks(now, role)
+    local t0 = clock()
     for _, h in ipairs(HOOKS) do
         if not h.installed and h.role == role and now >= h.next_try and wanted(h) then
+            -- (14.11: 11 animal hooks of a class not loaded yet failed in one tick: 250 ms; the rest of
+            -- the list goes on at the next tick, the failed ones are backed off)
+            if clock() - t0 >= HOOK_SLICE_S then return end
             local g = guarded(h)
             local ok, err
             if h.kind == "pre" then
@@ -336,16 +348,17 @@ local function viewers_near(loc, range)
     return out
 end
 
--- payload, then the object it is about
+-- payload, then the object it is about. Returns ok, sent (sent: the payload
+-- was accepted by sdc_net, even when the object reference then failed).
 local function send_obj(pc, obj, kind, ...)
-    if not ue.valid(obj) then return false end
-    if not net.send_to(pc, kind, ...) then return false end
+    if not ue.valid(obj) then return false, false end
+    if not net.send_to(pc, kind, ...) then return false, false end
     local ok, err = pcall(function() pc:ClientRepObjRef(obj) end)
     if not ok then
         M.stats.objref_failed = M.stats.objref_failed + 1
         log.err_throttled("npc.objref", "npc: ClientRepObjRef failed: %s", tostring(err))
     end
-    return ok
+    return ok, true
 end
 
 -- A growl / roar goes only as far as it carries: ZombieGrowlShort and
@@ -510,7 +523,7 @@ local function build_viewers()
     for _, pc in ipairs(S.remote_pcs or {}) do
         local p = ue.pawn_of(pc)
         local l = p and ue.location(p)
-        if l then v[#v + 1] = { pc = pc, key = ue.name(pc), X = l.X, Y = l.Y, Z = l.Z, budget = SET_PER_PASS } end
+        if l then v[#v + 1] = { pc = pc, key = ue.name(pc), X = l.X, Y = l.Y, Z = l.Z, budget = SET_PER_PASS, hp_budget = HP_PER_PASS } end
     end
     return v
 end
@@ -591,14 +604,35 @@ local function civilian_name(npc)
     return (s:gsub("[|;%c]", " "))
 end
 
--- st: the record of this NPC for this viewer (its last NPCSET: sig, at)
+-- The look on the wire: "<token>;<token>;..." - each "<part>=<asset>,<material>[,<transform>]"
+-- entry is one sdc_dict token (its definition goes once per client), a short
+-- one stays as it is. Decoded it is exactly the string look_of made.
+local function pack_look(e, look)
+    local out = {}
+    for entry in (look .. ";"):gmatch("(.-);") do out[#out + 1] = e:ref(entry) end
+    return table.concat(out, ";")
+end
+
+-- nil when a token is not known (yet)
+local function unpack_look(d, packed)
+    local out = {}
+    for entry in (packed .. ";"):gmatch("(.-);") do
+        local x = d:get(entry)
+        if x == nil then return nil end
+        out[#out + 1] = x
+    end
+    return table.concat(out, ";")
+end
+M.pack_look, M.unpack_look = pack_look, unpack_look
+
+-- st: the record of this NPC for this viewer (its last NPCSET: sig, at; its
+-- last NPCHP: hp, hp_at)
 local function send_set(v, npc, key, st, now)
     local comp = ue.prop(npc, "BP_AIComponent")
-    local max, hp = "", ""
+    local max = ""
     if opt("npc_health") and ue.valid(comp) then
-        local mx, h = ue.prop(comp, "MaxHealth"), ue.prop(comp, "Health")
+        local mx = ue.prop(comp, "MaxHealth")
         if type(mx) == "number" and mx > 0 then max = tostring(math.floor(mx)) end
-        if type(h) == "number" then hp = tostring(math.floor(h)) end
     end
     local look = ""
     if opt("npc_looks") then
@@ -611,33 +645,64 @@ local function send_set(v, npc, key, st, now)
     local name = ""
     if opt("npc_looks") and host.friendly[key] and ue.has_prop(npc, "NameWidget") then name = civilian_name(npc) end
     if max == "" and look == "" and name == "" then return false end
-    -- the same thing again is not told before the verify
-    local sig = max .. "|" .. hp .. "|" .. look .. "|" .. name
+    -- the same thing again is not told before the verify (the health goes by NPCHP)
+    local sig = max .. "|" .. look .. "|" .. name
     if st and st.sig == sig and st.at and now - st.at < VERIFY_S and now - (st.first or 0) >= WARM_S then
         st.chk = now
         return "same"
     end
-    local ok
+    local e = dict.encoder(v.key, "n")
+    local cls = e:ref(ue.class_name(npc))
+    local packed = pack_look(e, look)
+    local ok, sent
     if name ~= "" then
-        ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look, name)
+        ok, sent = send_obj(v.pc, npc, "NPCSET", e:defs(), cls, max, packed, name)
     else
-        ok = send_obj(v.pc, npc, "NPCSET", ue.class_name(npc), max, hp, look)
+        ok, sent = send_obj(v.pc, npc, "NPCSET", e:defs(), cls, max, packed)
     end
+    if sent then e:commit() end
     if not ok then return false end
-    if st then st.sig = sig end
+    if st then st.sig, st.hp = sig, nil end   -- its health goes again right after the look (the copy may not have had one)
     M.stats.set_sent = M.stats.set_sent + 1
     if first("set", 3) then
-        log.info("npc: set: %s -> %s: max health %s, health %s, look %d chars", ue.short(npc), ue.short(v.pc), max, hp,
-            #look)
+        log.info("npc: set: %s -> %s: max health %s, look %d chars (%d on the wire)", ue.short(npc), ue.short(v.pc), max,
+            #look, #packed)
     end
     return true
 end
 
--- NPCSET of one NPC to each viewer: 1.5 s after it came within SET_RANGE,
--- again every RESEND_S; forgotten for a viewer beyond GONE_RANGE.
+-- NPCHP: the health alone, when it differs from what this viewer was told
+-- (at most once per pass, so a hit every 100 ms is one short message a second)
+-- and as the verify. Only for a viewer that has had the look (NPCSET).
+local function send_hp(v, npc, st, now, hp)
+    if hp == "" then return end
+    if st.hp == hp and now - (st.hp_at or 0) < RESEND_S then return end
+    if v.hp_budget <= 0 then return end
+    -- a peer that is silent or has a lot in flight: the health waits for a later pass (st.hp stays)
+    if net.congested and net.congested(v.pc) then return end
+    v.hp_budget = v.hp_budget - 1
+    local ok = send_obj(v.pc, npc, "NPCHP", hp)
+    if ok then
+        st.hp, st.hp_at = hp, now
+        M.stats.hp_sent = M.stats.hp_sent + 1
+    end
+end
+
+local function health_of(npc)
+    local comp = ue.prop(npc, "BP_AIComponent")
+    if not ue.valid(comp) then return "" end
+    local h = ue.prop(comp, "Health")
+    if type(h) ~= "number" then return "" end
+    return tostring(math.floor(h))
+end
+
+-- NPCSET (the look) of one NPC to each viewer: 1.5 s after it came within
+-- SET_RANGE, again every RESEND_S while it differs / WARM_S, and the verify;
+-- NPCHP every pass the health moved; forgotten for a viewer beyond GONE_RANGE.
 local function set_for_viewers(npc, key, loc, now)
     local set2, gone2 = SET_RANGE * SET_RANGE, GONE_RANGE * GONE_RANGE
     local per = host.sent[key]
+    local hp = nil
     for _, v in ipairs(host.viewers) do
         local d = d2(v, loc)
         local st = per and per[v.key]
@@ -650,13 +715,19 @@ local function set_for_viewers(npc, key, loc, now)
             end
             if not st then
                 per[v.key] = { first = now }
-            elseif v.budget > 0 and ((not st.at and now - st.first >= SET_DELAY_S)
-                    or (st.at and now - (st.chk or st.at) >= RESEND_S)) then
-                v.budget = v.budget - 1
-                local r = send_set(v, npc, key, st, now)
-                if r == true then st.at, st.chk = now, now
-                elseif r == "same" then st.chk = now; v.budget = v.budget + 1   -- nothing went out
-                else st.at, st.chk = now - RESEND_S + 5, nil end
+            else
+                if v.budget > 0 and ((not st.at and now - st.first >= SET_DELAY_S)
+                        or (st.at and now - (st.chk or st.at) >= RESEND_S)) then
+                    v.budget = v.budget - 1
+                    local r = send_set(v, npc, key, st, now)
+                    if r == true then st.at, st.chk = now, now
+                    elseif r == "same" then st.chk = now; v.budget = v.budget + 1   -- nothing went out
+                    else st.at, st.chk = now - RESEND_S + 5, nil end
+                end
+                if st.at and st.sig and opt("npc_health") then
+                    hp = hp or health_of(npc)
+                    send_hp(v, npc, st, now, hp)
+                end
             end
         end
     end
@@ -754,6 +825,10 @@ local client = {
     pending = nil,     -- { kind, cls, data, t }: payload waiting for its object
     applied = {},      -- [copy full name] = look string applied completely
     applied_n = 0,
+    maxed = {},        -- [copy full name] = true: its NPCSET came (the host's MaxHealth is on it)
+    maxed_n = 0,
+    hp = {},           -- [copy full name] = the latest NPCHP that came before its NPCSET
+
     bad = {},          -- [asset path] = true: not an asset of the kind the part needs
     rocks = { t = 0, n = 0 },
     marks = {},        -- [copy full name] = clock of the last sight of its marker's AI (npc_marker)
@@ -856,14 +931,45 @@ local function apply_part(npc, entry)
     return complete
 end
 
+local function set_health(npc, comp, hp)
+    if ue.prop(comp, "Dead") ~= true and ue.prop(comp, "Health") ~= math.floor(hp) then
+        ue.set_prop(comp, "Health", math.floor(hp))
+    end
+end
+
+-- NPCHP onto the client's copy: its health, once the NPCSET (the host's
+-- MaxHealth) is on it; before that the latest one is kept for the NPCSET.
+local function apply_hp(npc, d)
+    if not opt("npc_health") then return end
+    local hp = num(d.hp)
+    if not hp then return end
+    local key = ue.name(npc)
+    if not client.maxed[key] then
+        client.hp[key] = hp
+        M.stats.hp_held = M.stats.hp_held + 1
+        return
+    end
+    local comp = ue.prop(npc, "BP_AIComponent")
+    if ue.valid(comp) then set_health(npc, comp, hp) end
+    M.stats.hp_applied = M.stats.hp_applied + 1
+end
+
 -- NPCSET onto the client's copy
 local function apply_set(npc, d)
     local comp = ue.prop(npc, "BP_AIComponent")
-    local max, hp = num(d.max), num(d.hp)
-    if ue.valid(comp) and max and max > 0 then
+    local max = num(d.max)
+    if opt("npc_health") and ue.valid(comp) and max and max > 0 then
         if ue.prop(comp, "MaxHealth") ~= math.floor(max) then ue.set_prop(comp, "MaxHealth", math.floor(max)) end
-        if hp and ue.prop(comp, "Dead") ~= true and ue.prop(comp, "Health") ~= math.floor(hp) then
-            ue.set_prop(comp, "Health", math.floor(hp))
+        local key = ue.name(npc)
+        if not client.maxed[key] then
+            client.maxed_n = client.maxed_n + 1
+            if client.maxed_n > 2000 then client.maxed, client.maxed_n, client.hp = {}, 1, {} end
+            client.maxed[key] = true
+        end
+        local held = client.hp[key]
+        if held then
+            client.hp[key] = nil
+            set_health(npc, comp, held)
         end
     end
     local look = d.look or ""
@@ -895,7 +1001,7 @@ local function apply_set(npc, d)
     end
     M.stats.set_applied = M.stats.set_applied + 1
     if first("set.applied", 3) then
-        log.info("npc: set: %s: max health %s health %s (host)", ue.short(npc), tostring(d.max), tostring(d.hp))
+        log.info("npc: set: %s: max health %s (host)", ue.short(npc), tostring(d.max))
     end
 end
 
@@ -924,7 +1030,7 @@ local function apply_blood(npc)
     if ok then M.stats.blood_applied = M.stats.blood_applied + 1 end
 end
 
-local APPLY = { set = apply_set, fire = apply_fire, blood = apply_blood }
+local APPLY = { set = apply_set, hp = apply_hp, fire = apply_fire, blood = apply_blood }
 
 -- PlayerController.ClientRepObjRef(Object), pre (client): the NPC of the
 -- payload that came just before. Cheap when nothing is pending.
@@ -1051,8 +1157,22 @@ local function client_message(kind, f)
         if opt("npc_boss_fx") then spawn_rock(f) end
     elseif kind == "NPCSET" then
         if opt("npc_health") or opt("npc_looks") then
-            expect("set", f[1], { max = f[2], hp = f[3], look = f[4] or "", name = f[5] or "" })
+            local d = dict.decoder("host", nil, "n")
+            d:receive(f[1])
+            local cls = d:get(f[2])
+            local look = cls and unpack_look(d, f[4] or "")
+            if look then
+                expect("set", cls, { max = f[3], look = look, name = f[5] or "" })
+            else
+                -- an id this machine does not know: the definitions are asked for, and the
+                -- host sends the NPC again (dict.on_heal); the object reference that follows
+                -- finds nothing pending
+                M.stats.set_unreadable = M.stats.set_unreadable + 1
+                d:ask()
+            end
         end
+    elseif kind == "NPCHP" then
+        if opt("npc_health") then expect("hp", "", { hp = f[1] }) end
     elseif kind == "NPCFIRE" then
         if opt("npc_effects") then expect("fire", f[1], { on = f[2] == "1" }) end
     elseif kind == "NPCBLOOD" then
@@ -1126,6 +1246,7 @@ function M.reset(why)
     host.active, host.viewers, host.last_pass = false, {}, -1000
     host.ticking, host.sent, host.looks, host.growl, host.roared, host.blood, host.burning = {}, {}, {}, {}, {}, {}, {}
     client.pending, client.applied, client.applied_n, client.bad = nil, {}, 0, {}
+    client.maxed, client.maxed_n, client.hp = {}, 0, {}
     client.marks, client.marks_pruned = {}, 0
     host.friendly, host.last_friendly = {}, -1000
     -- a new world loads its classes again: hooks still missing are retried soon
@@ -1186,7 +1307,15 @@ end
 
 function M.install(state)
     S = state
-    for _, kind in ipairs({ "NPCROCK", "NPCSET", "NPCFIRE", "NPCBLOOD" }) do
+    dict.install(state)
+    -- a client could not read an NPCSET: tell that viewer everything again
+    dict.on_heal(function(peer)
+        for _, per in pairs(host.sent) do
+            local st = per[peer]
+            if st then st.sig, st.hp, st.chk = nil, nil, -1e9 end
+        end
+    end)
+    for _, kind in ipairs({ "NPCROCK", "NPCSET", "NPCHP", "NPCFIRE", "NPCBLOOD" }) do
         net.on(kind, function(f) client_message(kind, f) end)
     end
     log.info("npc: installed (offscreen=%s boss_fx=%s effects=%s health=%s looks=%s marker=%s)", tostring(opt("npc_offscreen")),
@@ -1201,11 +1330,12 @@ function M.status_line()
     local n, shared = 0, 0
     for _, h in ipairs(HOOKS) do if h.installed then n = n + 1 end end
     for _, h in ipairs(SHARED) do if h.installed then shared = shared + 1 end end
-    return string.format("npc: hooks=%d (+%d shared with sdc_ai) | host: boss ticking=%d humans ticking=%d back=%d rocks=%d sounds=%d fire=%d blood=%d set=%d objref failed=%d | client: rocks=%d failed=%d fire=%d blood=%d set=%d looks=%d parts=%d failed=%d not in memory=%d names=%d objref got=%d nil=%d stale=%d other=%d slow=%d | markers seen=%d removed=%d failed=%d",
+    return string.format("npc: hooks=%d (+%d shared with sdc_ai) | host: boss ticking=%d humans ticking=%d back=%d rocks=%d sounds=%d fire=%d blood=%d set=%d objref failed=%d | client: rocks=%d failed=%d fire=%d blood=%d set=%d looks=%d parts=%d failed=%d not in memory=%d names=%d objref got=%d nil=%d stale=%d other=%d slow=%d | markers seen=%d removed=%d failed=%d | health sent=%d applied=%d held=%d, sets unreadable=%d",
         n, shared, s.boss_tick, s.human_tick, s.human_back, s.rocks_sent, s.sounds, s.fire_sent, s.blood_sent, s.set_sent,
         s.objref_failed, s.rocks_spawned, s.rocks_failed, s.fire_applied, s.blood_applied, s.set_applied, s.looks,
         s.look_parts, s.look_failed, s.look_later, s.names, s.objref_got, s.objref_nil, s.objref_stale, s.objref_other,
-        s.slow_objref, s.marks_seen, s.marks_removed, s.marks_failed)
+        s.slow_objref, s.marks_seen, s.marks_removed, s.marks_failed, s.hp_sent, s.hp_applied, s.hp_held,
+        s.set_unreadable)
 end
 
 return M

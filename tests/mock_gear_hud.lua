@@ -318,8 +318,8 @@ tick(CW, C)
 check(CW.hooks[RAD_FN .. "SetFilterUI"] ~= nil, "client: SetFilterUI hook (own zone exits)")
 -- the host's UIDS / ITEMS: flashlight with a battery at 64.2, the mask with a filter at 70.0
 WORLD = CW
-C.net.handlers.UIDS({ "Jig.PlayerSlot.Facewear=5:6:7:8@0.00;Jig.PlayerSlot.Flashlight=-1234567:2345678:3456789:4567890@0.00;None=0:0:0:0" }, CW.pc)
-C.net.handlers.ITEMS({ "-1234567:2345678:3456789:4567890=0.0/64.2;5:6:7:8=100.0/70.0;9:9:9:9=55.0" }, CW.pc)
+C.net.handlers.UIDS({ "Jig.PlayerSlot.Facewear=AAAABQAAAAYAAAAHAAAACA@0.00;Jig.PlayerSlot.Flashlight=_-0peQAjys4ANL8VAEWzUg@0.00;None=AAAAAAAAAAAAAAAAAAAAAA" }, CW.pc)
+C.net.handlers.ITEMS({ "_-0peQAjys4ANL8VAEWzUg=0.0/64.2;AAAABQAAAAYAAAAHAAAACA=100.0/70.0;AAAACQAAAAkAAAAJAAAACQ=55.0" }, CW.pc)
 check(C.items.own_slot_uid("Jig.PlayerSlot.Flashlight") == "-1234567:2345678:3456789:4567890",
     "sdc_items.own_slot_uid: the flashlight's UID from UIDS")
 check(C.items.own_slot_uid("None") == nil and C.items.own_slot_uid("Jig.PlayerSlot.Eyewear") == nil,
@@ -399,7 +399,7 @@ check(logged("hudmods: own flashlight in use: the game's own HUD call did it %(i
     "logged: the game's own call did it")
 -- battery drained on the host -> ITEMS
 WORLD = CW
-C.net.handlers.ITEMS({ "-1234567:2345678:3456789:4567890=0.0/63.0;5:6:7:8=100.0/70.0" }, CW.pc)
+C.net.handlers.ITEMS({ "_-0peQAjys4ANL8VAEWzUg=0.0/63.0;AAAABQAAAAYAAAAHAAAACA=100.0/70.0" }, CW.pc)
 tick(CW, C)
 check(last_mod_value(HUD, "GetFlashlightDurability") == nil and last_mod_value(HUD, "GetFlashlight") == 63.0, "battery 63.0 pushed")
 -- off by the game
@@ -427,7 +427,7 @@ ticks(CW, C, 6)
 check(mod_calls(HUD, "ShowFlashlight", false) == 1 and not shown(HUD, "Flashlight"), "light off, icon left on -> hidden by the mod")
 -- flashlight lit but no battery known from the host: icon yes, no percent from the mod
 WORLD = CW
-C.net.handlers.ITEMS({ "5:6:7:8=100.0/70.0" }, CW.pc)
+C.net.handlers.ITEMS({ "AAAABQAAAAYAAAAHAAAACA=100.0/70.0" }, CW.pc)
 local pushed0 = mod_calls(HUD, "GetFlashlight")
 A._p["FlashlightOn?"] = true
 lightA._p.Intensity = 6000.0

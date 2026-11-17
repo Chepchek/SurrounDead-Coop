@@ -14,6 +14,7 @@
 -- usage: lua mock_reloadcap.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -694,7 +695,7 @@ do
   local hj, cj = world(3, 1)
   sim({ hj = hj, cj = cj, l1 = 0.3, l2 = 0.3, period = 0.45, refuse = { [1] = true }, until_t = 15 })
   local asked = nil
-  for _, m in ipairs(up_sent) do if m.kind == "RESEND" and m.f[1] == gs(U_RESERVE) then asked = m end end
+  for _, m in ipairs(up_sent) do if m.kind == "RESEND" and m.f[1] == wire.uid_enc(gs(U_RESERVE)) then asked = m end end
   check(hj.count(U_RESERVE) == 1 and asked ~= nil, "the host still has it: RESEND|its uid to the host after the expiry")
   -- the host's answer to RESEND (sdc_consume: CLIENT_AddNewItem) puts it back
   if asked then cj.add_slot(G_POCKET, U_RESERVE, 1, DA_AMMO) end

@@ -467,11 +467,11 @@ check(sl.join("76561190000000302") == true, "M1 join a friend who never connecte
 take_cmds(L)
 fail_current("timeout")
 T = T + 1; helper_status(); sl.tick()
-check(toasted_since(nt0, "не отвечает через Steam") and toasted_since(nt0, "закрыта или вылетела"),
-    "M1 timeout: 'does not answer through Steam - closed or crashed?' (" .. tostring(last_toast().text) .. ")")
+check(toasted_since(nt0, "не отвечает через Steam") and not toasted_since(nt0, "закрыта или вылетела"),
+    "M1 timeout: 'does not answer through Steam - still trying' (" .. tostring(last_toast().text) .. ")")
 check(not toasted_since(nt0, "ещё не открыл мир"), "M1 ... and not 'has not opened a world yet'")
-check(sl.status().detail_key == "sl_st_silent" and sl.status().silent == true
-    and sl.status().detail:find("не отвечает", 1, true) ~= nil, "M1 status line (join screen): the host does not answer")
+check(sl.status().detail_key == "sl_st_no_answer" and sl.status().silent ~= true
+    and sl.status().detail:find("не отвечает", 1, true) ~= nil, "M1 status line (join screen): the host does not answer yet")
 check(logged_has("does not answer through Steam"), "M1 English text in the log")
 local n1 = #toasts
 for _ = 1, 8 do fail_current("timeout"); T = T + 1; helper_status(); sl.tick(); take_cmds(L) end

@@ -299,6 +299,12 @@ npc.install(S)
 npc.tick()
 local copy = make_bandit({ X = 101000, Y = 0, Z = 0 }, 1, "/Game/AI/Humans/Meshes/SK_Bandit_B.SK_Bandit_B")
 local OBJREF = "/Script/Engine.PlayerController:ClientRepObjRef"
+local function wire_set(cls, max, look)   -- NPCSET|defs|class|max|packed look
+    local e = require("sdc_dict").encoder("tester", "n")
+    local packed = npc.pack_look(e, look)
+    local c = e:ref(cls)
+    return "SDC1|NPCSET|" .. e:defs() .. "|" .. c .. "|" .. max .. "|" .. packed
+end
 local function deliver(msg, obj)
     local kind, fields = net.decode(msg)
     net.handlers[kind](fields, cpc)
@@ -308,7 +314,8 @@ end
 local NEW_BODY = "/Game/AI/Humans/Meshes/SK_Bandit_C.SK_Bandit_C"
 W.lazy[NEW_BODY] = "SkeletalMesh"
 local look = "Mesh=AI/Humans/Meshes/SK_Bandit_C.SK_Bandit_C,"
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|237|200|" .. look, copy)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "237", look), copy)
+deliver("SDC1|NPCHP|200", copy)
 check(W.loads == 0, "A1: no LoadAsset in the ClientRepObjRef hook")
 check(copy._p.BP_AIComponent._p.MaxHealth == 237, "A1: health applied anyway")
 check(copy._p.Mesh._p.SkeletalMeshAsset == W.paths["/Game/AI/Humans/Meshes/SK_Bandit_B.SK_Bandit_B"], "A1: body kept until its asset is in memory")
@@ -316,7 +323,7 @@ check(npc.stats.look_later == 1 and npc.stats.look_failed == 0, "A1: counted as 
 -- the asset comes into memory (another NPC, the game's streaming): the host's next NPCSET applies it
 asset("SkeletalMesh", NEW_BODY)
 advance(30)
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|237|190|" .. look, copy)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "237", look), copy)
 check(copy._p.Mesh._p.SkeletalMeshAsset == W.paths[NEW_BODY], "A1: the next NPCSET applies the body (not marked bad)")
 check(W.loads == 0 and npc.stats.looks == 1, "A1: look complete, still no load")
 check(npc.status_line():find("not in memory=1", 1, true) ~= nil, "A1: status line counts it")

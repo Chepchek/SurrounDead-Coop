@@ -52,7 +52,8 @@
 --     host   OnRep_PoweredOn? (post) of a door -> WBDOOR.
 -- Messages:
 --   WBDOOR|c or s|entries   host -> client; entries joined by ';', each
---          "class x,y,z open(1/0) dot(-) power(1/0/-)"
+--          "code x,y,z open(1/0) dot(-) power(1/0/-)" (code: one letter per door class,
+--          KINDS[...].code; dot without trailing zeros: "0", "-1", "0.707")
 --   WBDOORQ                 client -> host (once in a world)
 -- Hooks: post only, wrapped in pcall, return nothing; parameters are read
 -- inside the callback; no engine object is kept between calls.
@@ -63,6 +64,7 @@ local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 local netsync = require("sdc_netsync")
+local wire = require("sdc_wire")
 
 local M = {
     stats = { sent = 0, snaps = 0, dirs_here = 0, toggles = 0, dirs_fixed = 0, power_fixed = 0, timers_cleared = 0,
@@ -72,17 +74,19 @@ local M = {
 local DOORS = "/Game/Blueprints/BuildingSystem/Actors/Doors/"
 local SWING = { tl = "Timeline_OpenDoor", update = "Timeline_OpenDoor__UpdateFunc" }
 local KINDS = {
-    Buildable_WoodenDoor_C = { kind = "swing", path = DOORS .. "Buildable_WoodenDoor.Buildable_WoodenDoor_C" },
-    Buildable_WoodenDoor2_C = { kind = "swing", path = DOORS .. "Buildable_WoodenDoor2.Buildable_WoodenDoor2_C" },
-    Buildable_BarricadedMetalDoor_C = { kind = "swing",
+    Buildable_WoodenDoor_C = { code = "d", kind = "swing", path = DOORS .. "Buildable_WoodenDoor.Buildable_WoodenDoor_C" },
+    Buildable_WoodenDoor2_C = { code = "e", kind = "swing", path = DOORS .. "Buildable_WoodenDoor2.Buildable_WoodenDoor2_C" },
+    Buildable_BarricadedMetalDoor_C = { code = "m", kind = "swing",
         path = DOORS .. "Buildable_BarricadedMetalDoor.Buildable_BarricadedMetalDoor_C" },
-    Buildable_BunkerDoor_C = { kind = "swing", path = DOORS .. "Buildable_BunkerDoor.Buildable_BunkerDoor_C" },
-    Buildable_WoodenGate_C = { kind = "gate", path = DOORS .. "Buildable_WoodenGate.Buildable_WoodenGate_C",
+    Buildable_BunkerDoor_C = { code = "b", kind = "swing", path = DOORS .. "Buildable_BunkerDoor.Buildable_BunkerDoor_C" },
+    Buildable_WoodenGate_C = { code = "g", kind = "gate", path = DOORS .. "Buildable_WoodenGate.Buildable_WoodenGate_C",
         tl = "Timeline_0", tl2 = "Timeline_1" },
-    Buildable_GarageDoor_C = { kind = "garage", path = DOORS .. "Buildable_GarageDoor.Buildable_GarageDoor_C", power = true },
+    Buildable_GarageDoor_C = { code = "r", kind = "garage", path = DOORS .. "Buildable_GarageDoor.Buildable_GarageDoor_C", power = true },
 }
-for _, k in pairs(KINDS) do
+local BY_CODE = {}   -- the one-letter class code of a WBDOOR entry -> class name (a fixed table: both sides ship the same)
+for cls, k in pairs(KINDS) do
     if k.kind == "swing" then k.tl, k.update = SWING.tl, SWING.update end
+    BY_CODE[k.code] = cls
 end
 local BASE = "/Game/Blueprints/BuildingSystem/Actors/Buildable_MASTER.Buildable_MASTER_C"
 local GENERATOR = "/Game/Blueprints/BuildingSystem/Actors/Generator/Buildable_GeneratorMaster.Buildable_GeneratorMaster_C"
@@ -214,9 +218,9 @@ local function entry_of(d, k)
     local l = ue.location(d)
     if not l then return nil end
     local open = state_of(d, k)
-    local dot = k.kind == "swing" and string.format("%.3f", num(ue.prop(d, "DotProduct"))) or "-"
+    local dot = k.kind == "swing" and wire.num(num(ue.prop(d, "DotProduct")), 3) or "-"
     local pw = k.power and (ue.prop(d, "PoweredOn?") == true and "1" or "0") or "-"
-    return string.format("%s %s %s %s %s", ue.class_name(d), loc_str(l), open and "1" or "0", dot, pw), open
+    return string.format("%s %s %s %s %s", k.code, loc_str(l), open and "1" or "0", dot, pw), open
 end
 
 local function send_entries(pcs, why, entries)
@@ -366,8 +370,13 @@ local function door_msg(f)
     local now = clock()
     local n = 0
     for item in tostring(f[2] or ""):gmatch("[^;]+") do
-        local cls, locs, o, dot, pw = item:match("^(%S+) (%S+) ([01]) (%S+) (%S+)$")
+        local code, locs, o, dot, pw = item:match("^(%S+) (%S+) ([01]) (%S+) (%S+)$")
+        local cls = code and BY_CODE[code]
         local k = cls and KINDS[cls]
+        if code and not cls then
+            M.stats.bad = (M.stats.bad or 0) + 1
+            log.debug("bdoors: unknown door code '%s' in a WBDOOR entry: skipped", tostring(code))
+        end
         local loc = locs and parse_loc(locs)
         if k and loc then
             n = n + 1

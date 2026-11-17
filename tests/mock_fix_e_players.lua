@@ -160,6 +160,10 @@ local function fresh(cfgv)
         broadcast = function(pcs, kind, ...) for _, pc in ipairs(pcs) do W.sent[#W.sent + 1] = { to = pc, kind = kind, f = { ... } } end end,
         send_to_host = function(kind, ...) W.sent[#W.sent + 1] = { to = "host", kind = kind, f = { ... } }; return true end,
     }
+    do local n = package.loaded["sdc_net"]
+        n.send_to_cb = function(pc, cb, kind, ...) local r = n.send_to(pc, kind, ...); if r and cb then cb() end return r end
+        n.send_to_host_cb = function(cb, kind, ...) local r = n.send_to_host(kind, ...); if r and cb then cb() end return r end
+    end
     package.loaded["sdc_ctx"] = { addr = function(o) return o and o._addr end }
     return log, ue
 end
@@ -375,10 +379,10 @@ check(W.calls.local_pawn == 0 and #sent_of("PSTATE") == 0, "host alone: fast_tic
 S.remote_pcs = { apc, bpc }
 pawnstate.fast_tick()
 check(#sent_of("PSTATE") == 2, "a client connected: the own state goes out")
-W.handlers.MYLOOK({ "m=1" }, apc)
-W.handlers.MYLOOK({ "m=0" }, bpc)
-W.handlers.MYSTATE({ "hf=1" }, apc)
-W.handlers.MYSTATE({ "hf=0" }, bpc)
+W.handlers.MYLOOK({ "", "m=1" }, apc)
+W.handlers.MYLOOK({ "", "m=0" }, bpc)
+W.handlers.MYSTATE({ "2", "0" }, apc)
+W.handlers.MYSTATE({ "0", "0" }, bpc)
 S.remote_pcs = { apc }   -- B left
 local npc = mkpc("N", 4, true)
 W.sent = {}

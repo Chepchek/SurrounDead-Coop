@@ -2508,6 +2508,13 @@ local function on_pid(f, pc)
     decide(r, p)
 end
 
+-- PSPROG|gen|values|skills|hotbar|f or d (client -> host): values = "id=value;..." (the short
+-- field ids of sdc_progress); "f": every field (on joining, then every
+-- CLIENT_PROG_RESEND_S), "d": only the fields that changed since the report
+-- before (merged into p.prog_flat, the host's copy of the full state). skills /
+-- hotbar: "" = as in the report before (a "d" report only). The hotbar's UIDs
+-- are the short form of sdc_wire. A "d" report with no "f" before it for this
+-- gen is not used (the next "f" heals it).
 local function on_prog(f, pc)
     if not S or S.role ~= "host" then return end
     local pl = players_mod()
@@ -2515,10 +2522,24 @@ local function on_prog(f, pc)
     local p = r and P[r.key]
     if not p or not p.gen or f[1] ~= p.gen then return end
     local prog = progress_mod()
-    if prog and prog.decode_values and f[2] and f[2] ~= "" then
-        local vals = prog.decode_values(f[2])
+    if not (prog and prog.wire_decode) then return end
+    local delta = f[5] == "d"
+    local d = prog.wire_decode(f[2])
+    if delta then
+        if not p.prog_flat or p.prog_flat_gen ~= p.gen then
+            M.stats.prog_stale = (M.stats.prog_stale or 0) + 1
+            return
+        end
+        for k, v in pairs(d) do p.prog_flat[k] = v end
+    else
+        p.prog_flat, p.prog_flat_gen = d, p.gen
+    end
+    local text = prog.flat_text(p.prog_flat)
+    if text ~= "" then
+        local vals = prog.decode_values(text)
         if vals and next(vals) then p.prog = vals end
     end
+    if f[3] and f[3] ~= "" then p.tree_text = f[3] end
     if f[3] and f[3] ~= "" and f[3] ~= "?" then
         p.tree = parse_list(f[3])
         -- the same list answers the host's skill checks for this player
@@ -2529,10 +2550,15 @@ local function on_prog(f, pc)
             if not okt then log.err_throttled("persist-tree", "persist: skill list to sdc_skilltree: %s", tostring(terr)) end
         end
     end
-    if f[4] and f[4] ~= "" and f[4] ~= "?" then p.hot = parse_list(f[4]) end
+    if f[4] and f[4] ~= "" and f[4] ~= "?" then
+        local wire = require("sdc_wire")
+        local hot = {}
+        for tok in f[4]:gmatch("[^,]+") do hot[#hot + 1] = wire.uid_dec(tok) or "0:0:0:0" end
+        if #hot > 0 then p.hot = hot end
+    end
     -- a level, skill point, kill or skill-tree change is written soon
     -- (host_player), trickling XP with the next write
-    local major = ((prog and prog.major_key) and prog.major_key(f[2]) or "") .. "|" .. tostring(f[3])
+    local major = ((prog and prog.major_key) and prog.major_key(text) or "") .. "|" .. tostring(p.tree_text)
     if major ~= p.prog_major then p.prog_dirty = true end
     p.prog_major = major
     p.prog_at = clock()
@@ -3529,9 +3555,25 @@ local function client_tick(now)
     elseif C.last_full ~= full and (C.prog_force or now - (C.prog_at or 0) >= CLIENT_PROG_MINOR_S) then send = true
     elseif now - (C.prog_at or 0) >= CLIENT_PROG_RESEND_S then send = true end
     C.prog_force = nil
-    if send and net.send_to_host("PSPROG", C.gen, vals, tlist, hot) then
-        C.last_major, C.last_full, C.prog_at = major, full, now
-        if tlist ~= "?" then C.tree_sent = C.gen end
+    if send and prog and prog.wire_encode then
+        -- (sdc_progress: short field ids; between two full reports only what changed)
+        local is_full = C.sent_gen ~= C.gen or now - (C.full_at or 0) >= CLIENT_PROG_RESEND_S
+        local flat = prog.flat_of(vals)
+        local body = prog.wire_encode(flat, (not is_full) and C.sent_flat or nil)
+        local tsend = tlist   -- (the skill list goes in every report: the host's copy in sdc_skilltree may have been dropped)
+        local hsend = (not is_full and hot == C.sent_hot) and "" or hot
+        if hsend ~= "" and hsend ~= "?" then
+            local wire = require("sdc_wire")
+            local enc = {}
+            for tok in hsend:gmatch("[^,]+") do enc[#enc + 1] = wire.uid_enc(tok) end
+            hsend = table.concat(enc, ",")
+        end
+        if net.send_to_host("PSPROG", C.gen, body, tsend, hsend, is_full and "f" or "d") then
+            C.last_major, C.last_full, C.prog_at = major, full, now
+            C.sent_flat, C.sent_tlist, C.sent_hot = flat, tlist, hot
+            if is_full then C.sent_gen, C.full_at = C.gen, now end
+            if tlist ~= "?" then C.tree_sent = C.gen end
+        end
     end
 end
 

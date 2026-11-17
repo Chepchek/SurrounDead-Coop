@@ -398,10 +398,14 @@ check(#bpawn._p.BP_JigMultiplayer._p.MainJigContainers._i[1][F_ITEMS]._i == 1, "
 local vals = "L.CurrentLevel=4;L.CurrentXP=321.5;L.CurrentMaxXP=900;P.CurrentFitnessLevel=3;P.StrengthMultiplier=1.25;P.FitnessMultiplierUsed?=1;T.SkillPoints=2;T.CurrentPoints=5;J.ZombieKills=17;J.DaysSurvived=3"
 local skt = require("sdc_skilltree")
 local fp0 = skt.stats.from_prog
-deliver("PSPROG", { gen, vals, "Skill_Parkour", "101:2:3:4,0:0:0:0,0:0:0:0" }, bob.pc)
+local wirem = require("sdc_wire")
+local function PW(t) return progress.wire_encode(progress.flat_of(t)) end   -- PSPROG carries the short field ids
+deliver("PSPROG", { gen, PW(vals), "Skill_Parkour", wirem.uid_enc("101:2:3:4") .. "," .. wirem.uid_enc("0:0:0:0") .. "," .. wirem.uid_enc("0:0:0:0") }, bob.pc)
 check(skt.stats.from_prog == fp0 + 1, "PSPROG's skill list goes to sdc_skilltree (the host's skill checks)")
-deliver("PSPROG", { "wronggen", "L.CurrentLevel=1", "-", "?" }, bob.pc)
+deliver("PSPROG", { "wronggen", PW("L.CurrentLevel=1"), "-", "?" }, bob.pc)
 check(skt.stats.from_prog == fp0 + 1, "a PSPROG of another record (gen) does not")
+-- a changed-only report ("d": no skills / hotbar again) is merged into the full state before it
+deliver("PSPROG", { gen, PW("L.BufferXP=7"), "", "", "d" }, bob.pc)
 advance(16)   -- a level / skill change is written within PROG_WRITE_S
 host_tick()
 local files = persist.savegames_dir()
@@ -411,6 +415,7 @@ local doc = json_dec(slurp(SAVEDIR .. "SlotA_SDCoop.json"))
 local rec = doc and doc.players and doc.players.s76561190000000001
 check(rec ~= nil, "record of Bob in the slot file")
 check(rec and rec.prog and rec.prog.L.CurrentLevel == 4 and rec.prog.P["FitnessMultiplierUsed?"] == true, "progression from the client's report (gen-checked)")
+check(rec and rec.prog and rec.prog.L.BufferXP == 7 and rec.prog.L.CurrentLevel == 4 and rec.tree and rec.tree[1] == "Skill_Parkour", "a changed-only PSPROG: the new field merged, the level and skills kept")
 check(rec and rec.inv and rec.inv.items == 1 and rec.inv.containers == 2, "inventory summary 2 containers / 1 item")
 check(rec and rec.tree and rec.tree[1] == "Skill_Parkour", "skill list saved")
 
@@ -531,6 +536,11 @@ package.loaded["sdc_place"].rescue = function(p, why)
     return 0
 end
 package.loaded["sdc_place"].calls0 = #calls
+do -- a changed-only report with no full one before it (for this record) is not used
+  local st0 = persist.stats.prog_stale or 0
+  deliver("PSPROG", { gen2, PW("L.BufferXP=9"), "", "", "d" }, bob2.pc)
+  check((persist.stats.prog_stale or 0) == st0 + 1, "PSPROG 'd' without a full report of that gen: ignored, counted (prog_stale)")
+end
 deliver("PSRDY", { gen2 }, bob2.pc)
 advance(1)
 host_tick()
@@ -588,7 +598,7 @@ check(last("PSRDY") ~= nil, "client asks the host for the inventory (PSRDY)")
 advance(4)
 loops.persist()
 local prog = last("PSPROG")
-check(prog and prog.args[1] == set.args[1] and prog.args[2]:find("L.CurrentLevel=4", 1, true), "client reports progression with the record's gen")
+check(prog and prog.args[1] == set.args[1] and progress.wire_decode(prog.args[2])["L.CurrentLevel"] == "4", "client reports progression with the record's gen")
 check(prog and prog.args[3] == "Skill_Parkour", "client reports its skills")
 check(persist.carries_tree() == true, "client: a PSPROG with the skills went out for this record: no SKTREE needed")
 local sk_before = 0
@@ -615,6 +625,13 @@ do
         if m.kind == "PSPROG" then n = n + 1; for _, a in ipairs(m.args) do bytes = bytes + #tostring(a) + 1 end end
     end
     check(n >= 4 and n <= 7, "PSPROG: the small XP goes about once a minute, not every 20 s and not never (" .. n .. " in 5 minutes)")
+    local nd, nf, big = 0, 0, 0
+    for _, m in ipairs(sent) do
+        if m.kind == "PSPROG" then
+            if m.args[5] == "d" then nd = nd + 1; big = math.max(big, #tostring(m.args[2]) + #tostring(m.args[3]) + #tostring(m.args[4])) else nf = nf + 1 end
+        end
+    end
+    check(nd >= 3 and nf <= 3 and big < 40, "PSPROG: between the full reports only what changed goes (" .. nd .. " changed-only, " .. nf .. " full, biggest " .. big .. " bytes)")
     -- the pause menu opens (the way out): what has not gone yet goes now
     sent = {}
     ps.CurrentFitnessXP = ps.CurrentFitnessXP + 0.5

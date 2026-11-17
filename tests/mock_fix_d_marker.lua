@@ -53,6 +53,7 @@ local gs = {
     assert(cls == paths[MARKER], "spawned with the marker class")
     local m = marker("?", { X = tf.Translation.X, Y = tf.Translation.Y, Z = tf.Translation.Z })
     m.Tags = nil
+    m.MarkerData = {}   -- 17.11.2026: the marker's look is this struct
     spawned[#spawned + 1] = m
     return m
   end,
@@ -72,6 +73,9 @@ function ue.name(o) return ue.valid(o) and ((o.__cls or "Object") .. " /Game/Map
 function ue.path(o) return ue.valid(o) and (o.__path or "") or "" end
 function ue.class_name(o) return ue.valid(o) and (o.__cls or "") or "" end
 function ue.prop(o, n) if not ue.valid(o) then return nil end return o[n] end
+function ue.fstring(v) if v == nil then return "" end return tostring(v) end
+function ue.is_wrapper_text() return false end
+FText = function(s) return s end
 function ue.set_prop(o, n, v) if not ue.valid(o) then return false end o[n] = v return true end
 function ue.location(a) return ue.valid(a) and a.__loc or nil end
 function ue.is_runtime_spawned(a) return a.__runtime == true end
@@ -140,7 +144,8 @@ print("== client: markers")
 quests.client_tick(100, my_pc, { __name = "Pawn_1" })
 qm("a", "T1", "100", "200", "300", TEX, "Camp", "1", "0", "0", "1", "0")
 check(#spawned == 1 and spawned[1].__loc.X == 100, "QM: marker placed at the host's point")
-check(spawned[1]["Marker Texture"] == paths[TEX], "QM: texture in memory set")
+local MDF = require("sdc_markerdata").F
+check(spawned[1].MarkerData[MDF.texture] == paths[TEX], "QM: texture in memory set (in MarkerData)")
 local first = spawned[1]
 
 -- respawn: the old marker goes (still valid until GC), a new one is placed
@@ -179,7 +184,7 @@ check(#spawned == n0 + 1 and spawned[#spawned].__loc.X == 7 and dead.__destroyed
 -- a texture path that is not a texture: ignored
 paths["/Game/Not/A.Tex"] = { __name = "A", __cls = "SoundWave" }
 qm("a", "T5", "1", "1", "1", "/Game/Not/A.Tex", "x", "1", "1", "1", "1", "0")
-check(spawned[#spawned]["Marker Texture"] == nil, "a QM texture path of another class is not set")
+check(spawned[#spawned].MarkerData[MDF.texture] == nil, "a QM texture path of another class is not set")
 
 -- the marker class not in memory: nothing loaded synchronously, tried again
 local cls = paths[MARKER]

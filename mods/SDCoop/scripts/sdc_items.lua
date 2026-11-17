@@ -37,11 +37,13 @@ local stations = require("sdc_stations")
 local tools = require("sdc_tools")
 local wear = require("sdc_wear")
 local containers = require("sdc_containers")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 
 -- counters read by the log lines below (level_looks: mock_items_perf)
 local M = {
     stats = { runtime = 0, level = 0, ghosts_removed = 0, loot_blocked = 0, proxy_battery = 0, owner_relevant = 0,
-              level_looks = 0 },
+              level_looks = 0, dur_restored = 0, dur_no_data = 0, dur_from_ui = 0, dur_from_slot = 0,
+    uid_filled = 0, dur_calls = 0, equid_calls = 0 },
     consume = consume,
     stations = stations,
     tools = tools,
@@ -390,6 +392,18 @@ local function inventory_of(pawn, pass)
     return inv
 end
 
+-- A durability / battery charge as sent: rounded to 1 (the scale is 0..100: 1 %),
+-- so a change counts only at a step of 1 % and a number is 2-3 characters, not
+-- "86.4". A value above 0 stays at least 1 (0 means "broken").
+local function q1(x)
+    x = tonumber(x) or 0
+    local r = math.floor(x + 0.5)
+    if r < 1 and x > 0 then r = 1 end
+    return string.format("%d", r)
+end
+
+M.q1 = q1   -- (tests)
+
 local function uid_string(pawn, pass)
     local helper = ue.prop(pawn, "BP_JigHelperComp")
     if not ue.valid(helper) then return nil end
@@ -405,7 +419,7 @@ local function uid_string(pawn, pass)
     for _, e in ipairs(list) do
         local it = by_uid[e.g]
         local d = it and it.dur
-        parts[#parts + 1] = string.format("%s=%s%s", e.tag, e.g, d and string.format("@%.2f", d) or "")
+        parts[#parts + 1] = string.format("%s=%s%s", e.tag, wire.uid_enc(e.g), d and ("@" .. q1(d)) or "")
     end
     table.sort(parts)
     return table.concat(parts, ";")
@@ -431,7 +445,7 @@ local function items_string(pawn, pass)
     for _, e in ipairs(inv.list) do
         local s0 = e.sub and at0[e.sub]
         local bat = s0 and s0.dur
-        parts[#parts + 1] = string.format("%s=%.1f%s", e.uid, e.dur, bat and string.format("/%.1f", bat) or "")
+        parts[#parts + 1] = string.format("%s=%s%s", wire.uid_enc(e.uid), q1(e.dur), bat and ("/" .. q1(bat)) or "")
     end
     table.sort(parts)
     return table.concat(parts, ";")
@@ -439,22 +453,47 @@ end
 
 local uids_sent = {}   -- [pc address] = pawn address .. uid string
 local items_sent = {}  -- [pc address] = pawn address .. items string
+local sent_at = {}     -- ["U" / "I" .. pc address] = os.clock() of that send
+local VERIFY_S = 60    -- an unchanged UIDS / ITEMS goes again this often (a lost one heals; a joiner gets the first at once)
+
+local function stale(k)
+    return os.clock() - (sent_at[k] or -1000) >= VERIFY_S
+end
 
 -- UIDS / ITEMS of one remote player, when they changed.
+-- A host whose copy of a remote character has no equipment map (its
+-- EquipmentUIDs is empty: the proxy's inventory lives on the player's own
+-- machine) used to send an empty UIDS / ITEMS on every check: the client wrote
+-- 0/0 equipment UIDs and its own GetDurability stayed at 0 ("Item durability
+-- too low", the weapon jams, while the screen showed 95 %). An empty payload is
+-- not sent at all then; the client keeps its own values, read from the
+-- replicated item actors (see refresh_own_dur below).
+local no_uids = {}   -- [pc address] = clock of the last "no equipment map" line
+local NO_UIDS_S = 120
+
 local function send_uids(pc, pass)
     local pawn = pass.pawn
     if not pawn then return end
     local s = uid_string(pawn, pass)
     local key = tostring(addr(pawn)) .. "|" .. tostring(s)
-    if s and uids_sent[addr(pc)] ~= key then
+    if s == "" then
+        local k = addr(pc)
+        if os.clock() - (no_uids[k] or -1000) >= NO_UIDS_S then
+            no_uids[k] = os.clock()
+            log.warn("items: the host has no equipment UIDs for %s (its HelperComp.EquipmentUIDs is empty here):"
+                .. " nothing sent, the client keeps the durabilities of the item actors", ue.short(pc))
+        end
+    elseif s and (uids_sent[addr(pc)] ~= key or stale("U" .. tostring(addr(pc)))) then
         uids_sent[addr(pc)] = key
+        sent_at["U" .. tostring(addr(pc))] = os.clock()
         net.send_to(pc, "UIDS", s)
         log.debug("items: equipment UIDs sent to %s: %s", ue.short(pc), s)
     end
     local t = items_string(pawn, pass)
     local tkey = tostring(addr(pawn)) .. "|" .. tostring(t)
-    if t and items_sent[addr(pc)] ~= tkey then
+    if t and t ~= "" and (items_sent[addr(pc)] ~= tkey or stale("I" .. tostring(addr(pc)))) then
         items_sent[addr(pc)] = tkey
+        sent_at["I" .. tostring(addr(pc))] = os.clock()
         net.send_to(pc, "ITEMS", t)
     end
 end
@@ -471,12 +510,182 @@ local client_uids = { text = nil, applied = nil, dur = {} }
 -- Client: the own inventory's durabilities / battery charges from the host.
 local client_items = { dur = {}, bat = {}, n = 0 }
 
+-- Client: durability read from the own equipped item ACTORS. HelperComp's
+-- RepActorsData (slot tag -> item actor) is replicated to every machine, and an
+-- item actor's BP_JigMultiplayer.PickupInfo carries the same item info the
+-- host's copy has - the same number the host drains. Used when the host has no
+-- equipment map for this character (then it sends nothing) and for an item the
+-- host's map does not list: without it every own GetDurability read 0.
+local F_UP_INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
+local F_UP_USID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+local F_UP_DUR = "Durability_22_A3557C454274D193D47AB9B71FB0C0CA"
+local ZERO_UID = "0:0:0:0"      -- what the game passes for an item without a UID (no item)
+local own_dur = { at = -1000, dur = {}, n = 0, forced = -1000 }
+local OWN_DUR_S = 5       -- s: the actors' values are read at most this often
+local OWN_DUR_FRESH_S = 1 -- s: older than this and a read of 0 is double-checked with the actors
+
+local function refresh_own_dur(force)
+    local me = ue.local_pawn()
+    if not ue.valid(me) then return own_dur end
+    local now = os.clock()
+    if not force and now - own_dur.at < OWN_DUR_S then return own_dur end
+    own_dur.at = now
+    local out, n = {}, 0
+    for _, e in pairs(equipped_of(me)) do
+        local pi = ue.try(function() return ue.prop(e.actor, "BP_JigMultiplayer").PickupInfo end)
+        local info = pi and ue.try(function() return pi[F_UP_INFO] end)
+        local uid_g = pi and ue.try(function() return pi[F_UP_USID] end)
+        local uid = uid_g and ue.try(guid_str, uid_g)
+        local d = info and ue.try(function() return tonumber(info[F_UP_DUR].X) end)
+        -- 17.11, in the game (self test C.durability): on a client the item actor's PickupInfo reads 0.0 for a
+        -- whole item (the host says 100): it is not filled there. A 0 from here is "unknown", never an answer.
+        if uid and type(d) == "number" and d > 0 then
+            out[uid] = d
+            n = n + 1
+        end
+    end
+    own_dur.dur, own_dur.n = out, n
+    return own_dur
+end
+
+-- The own equipment slots: BP_JigHelperComp.ServerEquippedItems holds one
+-- RepItemInfo (ItemID, Count, Durability {X current, Y max}, ...) per slot. A
+-- client has this struct replicated; its HelperComp.EquipmentUIDs, however, is
+-- filled by its own game only - for a client the host sends an empty map, and
+-- then BP_PlayerCharacter's melee power attack (@41847) gets UID 0:0:0:0 from
+-- GetEquipmentUID, asks GetDurability(0:0:0:0), reads 0 and shows
+-- "Item durability too low" on every swing while the item is fine.
+-- Answer with a UID of our own for such a slot (the game only uses it as a key)
+-- and give GetDurability the slot's own number. A real UID the game already has
+-- is only remembered (its durability then comes from that slot too).
+local F_UP_FIELD = {
+    ["Jig.PlayerSlot.MeleeWeapon"] = "EquippedMelee_48_0C451F654720DD3648581EA9DB6E85D0",
+    ["Jig.PlayerSlot.PrimaryWeapon"] = "EquippedPrimary_43_71FDAE8F453FE0DADB6317949C57DDCF",
+    ["Jig.PlayerSlot.SecondaryWeapon"] = "EquippedSecondary_44_06F9E8664A16E6584B9772A436A872B0",
+    ["Jig.PlayerSlot.SidearmWeapon"] = "EquippedSidearm_45_DBAF50604B799AD8D36966B58FC8D116",
+    ["Jig.PlayerSlot.Throwable"] = "EquippedThrowable_55_56FFA8104E711A5D4173878FBB8E8BAE",
+    ["Jig.PlayerSlot.Flashlight"] = "EquippedFlashlight_56_2F5D9BE4430D3A53E563F384E51D1D96",
+    ["Jig.PlayerSlot.Binoculars"] = "EquippedBinoculars_57_FA37337F42E4A60116D21485F6D57AB7",
+    ["Jig.PlayerSlot.GPS"] = "EquippedGPS_58_A18BCF9B44989D75939B038888DBFC9C",
+    ["Jig.PlayerSlot.Compass"] = "EquippedCompass_59_E0A6289D4D59B1D4ABEB43AC8A5527BB",
+    ["Jig.PlayerSlot.FishingRod"] = "EquippedFishingRod_60_E44B357645599BFD4D7B52B9B64F2A9B",
+    ["Jig.PlayerSlot.Facewear"] = "EquippedFacewear_34_8AC8653C42B55B98B18B409ADF11C9D0",
+    ["Jig.PlayerSlot.Headwear"] = "EquippedHeadwear_35_8AE6F97846E0F3067404628BBA8FD496",
+    ["Jig.PlayerSlot.Eyewear"] = "EquippedEyewear_36_27F872F64826604D9E144B835F76AAA1",
+    ["Jig.PlayerSlot.Accessory"] = "EquippedAccessory_37_D9C5EBD3498FCB04AFC073AF597D0E61",
+    ["Jig.PlayerSlot.Torso"] = "EquippedTorso_38_68214F6745B9623EC27562AA1DFFE07F",
+    ["Jig.PlayerSlot.Gloves"] = "EquippedGloves_14_307137BA447CB8C0EDCE3E95850C75BA",
+    ["Jig.PlayerSlot.Legs"] = "EquippedLegs_39_2283163D415F1E31B016B19F2F5C5262",
+    ["Jig.PlayerSlot.Feet"] = "EquippedFeet_40_023355084FFB67B156D00A8D1F88F489",
+    ["Jig.PlayerSlot.Container"] = "EquippedContainer_41_1820AF744A68808040CE7AB76A7CDB39",
+    ["Jig.PlayerSlot.BodyArmor"] = "EquippedBodyArmor_42_28D80C89469B81E7286ADB81BE5B9F0F",
+    ["Jig.PlayerSlot.Backpack"] = "EquippedBackpack_30_A980E63A441FE0EF1756E2BB5EF88F82",
+}
+local slot_uid = {}     -- [slot tag] = { A, B, C, D } answered for it
+local uid_slot = {}     -- ["A:B:C:D"] = slot tag (a synthetic UID or a real one seen)
+local last_dur = {}     -- ["A:B:C:D"] = the last number answered for an equipped item
+-- 0x5DC00... range: no real item UID starts this high in A, and a collision
+-- would only make one slot answer for another.
+local function synth_uid(tag)
+    local h = 0
+    for i = 1, #tag do h = (h * 31 + tag:byte(i)) % 1000000007 end
+    return { A = 1572864000 + (h % 100000), B = h, C = 1, D = #tag }
+end
+
+-- Client: the number ServerEquippedItems has for a slot, or nil.
+local function slot_dur(tag)
+    local field = tag and F_UP_FIELD[tag]
+    if not field then return nil end
+    local me = ue.local_pawn()
+    local helper = me and ue.prop(me, "BP_JigHelperComp")
+    if not ue.valid(helper) then return nil end
+    local info = ue.try(function() return helper.ServerEquippedItems[field] end)
+    local d = info and ue.try(function() return tonumber(info[F_UP_DUR].X) end)
+    -- 17.11, in the game: ServerEquippedItems has no REPL flag and reads 0.0 on a client for a whole item (the
+    -- host says 100). 0 is "not filled here": nil, so the host's number / the screen get their turn.
+    if type(d) ~= "number" or d <= 0 then return nil end
+    return d
+end
+
+-- Client: BP_JigHelperComp.GetEquipmentUID(Slot, out Value). The value is only
+-- a key for GetDurability / GetAmmo style lookups; the host's map is empty for
+-- this character, so an empty answer is replaced with our own UID of the slot.
+local function fix_equipment_uid(c, ...)
+    if S.role ~= "client" then return end
+    M.stats.equid_calls = M.stats.equid_calls + 1
+    local args = { ... }
+    local slot_p, value_p = args[1], args[2]
+    if not slot_p or not value_p then M.stats.equid_last = "no params (" .. #args .. ")" return end
+    local tag = ue.try(function() return ue.str(slot_p:get().TagName) end)
+    if not tag or tag == "" then M.stats.equid_last = "no tag" return end
+    local cur = ue.try(function() return value_p:get() end)
+    local cur_s = cur and ue.try(guid_str, cur)
+    M.stats.equid_last = string.format("%s -> %s", tag:match("([%w_]+)$") or tag, tostring(cur_s))
+    if cur_s and cur_s ~= ZERO_UID then
+        uid_slot[cur_s] = tag   -- the game knows this slot: its durability is the slot's
+        return
+    end
+    local g = slot_uid[tag] or synth_uid(tag)
+    slot_uid[tag] = g
+    local s = string.format("%d:%d:%d:%d", g.A, g.B, g.C, g.D)
+    uid_slot[s] = tag
+    local oks, errs = pcall(function() value_p:set({ A = g.A, B = g.B, C = g.C, D = g.D }) end)
+    if not oks then
+        if not M.stats.uid_set_error then
+            M.stats.uid_set_error = true
+            log.warn("items: cannot answer %s with the own UID %s: %s", tag, s, tostring(errs))
+        end
+        return
+    end
+    M.stats.uid_filled = M.stats.uid_filled + 1
+    if M.stats.uid_filled <= 6 then
+        log.info("items: no UID for %s here (the host's map is empty): answered %s, durability comes from the "
+            .. "own equipment info", tag, s)
+    end
+end
+
+-- Client: the durability the own inventory SLOTS show (JSI_Slot.Dur, the number
+-- behind the percent and the tooltip). The widgets are the only place a client
+-- has the absolute durability of an item it does not wear, and they also have
+-- items the host's copy does not (a save written over the co-op world, an item
+-- granted a moment ago: the UID is on the screen at once, the host's ITEMS may
+-- come later or never). Read at most every UI_DUR_S; `force` asks at once.
+local ui_dur = { at = -1000, dur = {}, n = 0 }
+local UI_DUR_S = 2
+
+local function refresh_ui_dur(force)
+    local now = os.clock()
+    if not force and now - ui_dur.at < UI_DUR_S then return ui_dur end
+    local me = ue.local_pawn()
+    local jig = me and ue.prop(me, "BP_JigMultiplayer")
+    if not ue.valid(jig) or type(consume.client_view) ~= "function" then return ui_dur end
+    ui_dur.at = now
+    local out, n = {}, 0
+    local ok, view = pcall(consume.client_view, jig)
+    if ok and type(view) == "table" then
+        for uid, e in pairs(view) do
+            local slot = e and e.slot
+            local d = slot and ue.try(function() return tonumber(slot.Dur) end)
+            if type(d) == "number" then
+                out[uid] = d
+                n = n + 1
+            end
+        end
+    end
+    ui_dur.dur, ui_dur.n = out, n
+    return ui_dur
+end
+
 local function apply_items(s)
     local dur, bat, n = {}, {}, 0
-    for uid, d, b in (s or ""):gmatch("([%-%d:]+)=([%d%.%-]+)/?([%d%.]*)") do
-        dur[uid] = tonumber(d)
-        if b ~= "" then bat[uid] = tonumber(b) end
-        n = n + 1
+    for entry in (s or ""):gmatch("[^;]+") do
+        local code, d, b = entry:match("^([%w_%-]+)=(%-?[%d%.]+)/?([%d%.]*)$")
+        local uid = code and wire.uid_dec(code)
+        if uid then
+            dur[uid] = tonumber(d)
+            if b ~= "" then bat[uid] = tonumber(b) end
+            n = n + 1
+        end
     end
     local first = client_items.n == 0
     client_items = { dur = dur, bat = bat, n = n, at = os.clock() }
@@ -484,9 +693,20 @@ local function apply_items(s)
 end
 
 local function apply_uids()
-    local me = ue.local_pawn()
     local s = client_uids.text
-    if not me or not s then return end
+    if not s then return end
+    if s == "" then
+        -- the host has no map for this character: nothing to write and nothing
+        -- to clear (an empty write used to wipe the map every VERIFY_S)
+        if client_uids.no_map ~= true then
+            client_uids.no_map = true
+            log.info("items: the host sent no equipment UIDs: durability comes from the item actors here")
+        end
+        return
+    end
+    client_uids.no_map = nil
+    local me = ue.local_pawn()
+    if not me then return end
     local key = tostring(addr(me)) .. "|" .. s
     if client_uids.applied == key then return end
     local helper = ue.prop(me, "BP_JigHelperComp")
@@ -501,8 +721,9 @@ local function apply_uids()
     client_uids.dur = {}
     -- FGuid A..D are int32 in reflection: negative numbers are normal
     for entry in s:gmatch("[^;]+") do
-        local tag, a, b, c, d, dur = entry:match("^([^=]+)=(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)@?([%d%.]*)$")
-        if tag then
+        local tag, code, dur = entry:match("^([^=]+)=([%w_%-]+)@?([%d%.]*)$")
+        local a, b, c, d = (wire.uid_dec(code) or ""):match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
+        if tag and a then
             n = n + 1
             if dur ~= "" then client_uids.dur[string.format("%s:%s:%s:%s", a, b, c, d)] = tonumber(dur) end
             local ok, err = pcall(function()
@@ -520,41 +741,125 @@ local function apply_uids()
 end
 
 -- Client: BP_JigMultiplayer.GetDurability(UID, out NewDur) searched the empty
--- MainJigContainers and gave 0; give it the host's value instead.
+-- MainJigContainers and gave 0; give it the host's value instead, or the one
+-- the own item actor carries (the host's map may be missing for this character).
 local dur_fixes = 0
+-- What the hook saw and decided on its last call (the self test prints it), and the first calls in the log: whether
+-- the hook runs at all for the game's own swing / shot is the question a log of a real session has to answer
+-- (17.11: it does not run inside a call made from Lua - the self test's DurabilityCheck - so only a real one tells).
+local function dur_note(text)
+    M.stats.dur_last = text
+    if M.stats.dur_calls <= 4 then log.info("items: GetDurability call %d on this client: %s", M.stats.dur_calls, text) end
+end
+local dur_fixes_by = {}   -- [source] = how many answers came from it (the first two are logged)
+local dur_no_data_at = -1000
 local function fix_durability(c, ...)
     if S.role ~= "client" then return end
+    M.stats.dur_calls = M.stats.dur_calls + 1
     local args = { ... }
     local uid_p, out_p = args[1], args[2]
-    if not uid_p or not out_p then return end
+    if not uid_p or not out_p then dur_note("no params (" .. #args .. ")") return end
     local okv, cur = pcall(function() return out_p:get() end)
-    if not okv or (type(cur) == "number" and cur ~= 0) then return end
+    if not okv or (type(cur) == "number" and cur ~= 0) then dur_note("the answer is " .. tostring(cur)) return end
     local oku, u = pcall(function() return guid_str(uid_p:get()) end)
-    if not oku then return end
-    local want = client_items.dur[u] or client_uids.dur[u]
+    if not oku or u == ZERO_UID then dur_note("the uid is " .. tostring(u)) return end   -- no item: the game asks with an empty UID
+    -- The host's number comes first (it drains the durability, and it is what 0.12.1 answered with); a 0 there is
+    -- a really broken item. Then the slot / the screen / the item actor, for what the host's maps lack.
+    local want, src
+    want = client_items.dur[u] or client_uids.dur[u]
+    src = "the host"
+    if not want then
+        local slot = uid_slot[u]
+        if slot then
+            -- an equipped item: the struct of its slot (a number above 0 only, see slot_dur)
+            want = slot_dur(slot) or last_dur[u]
+            if want then
+                src = "the own slot"
+                M.stats.dur_from_slot = M.stats.dur_from_slot + 1
+            end
+        end
+    end
+    if not want then
+        -- the screen: the same number its percent and tooltip show, and it has
+        -- every own item (the host's copy may know none of them)
+        want = refresh_ui_dur().dur[u]
+        src = "the screen"
+        if want then M.stats.dur_from_ui = M.stats.dur_from_ui + 1 end
+    end
+    if not want then
+        -- The own item actor's info is replicated: the same number the host drains,
+        -- so a broken item (0) stays broken. A cached map older than a second is
+        -- read again here before a 0 is answered - the item may have just broken.
+        local now0 = os.clock()
+        if now0 - own_dur.at > OWN_DUR_FRESH_S and now0 - own_dur.forced >= 0.5 then
+            own_dur.forced = now0
+            want = refresh_own_dur(true).dur[u]
+        else
+            want = refresh_own_dur().dur[u]
+        end
+        src = "the item actor"
+        if want then
+            M.stats.dur_restored = M.stats.dur_restored + 1
+        else
+            M.stats.dur_no_data = M.stats.dur_no_data + 1
+            if os.clock() - dur_no_data_at >= 30 then
+                dur_no_data_at = os.clock()
+                log.debug("items: GetDurability of %s read 0 and no value is known here (no host map, no item actor)", u)
+            end
+        end
+    end
+    dur_note(string.format("uid %s: %s from %s", u, tostring(want), tostring(src)))
     if not want then return end
     -- own gun / muzzle wear the host's value does not have yet (sdc_wear)
     local okm, minus = pcall(wear.own_minus, u)
     if okm and type(minus) == "number" and minus > 0 then want = math.max(0, want - minus) end
     local ok, err = pcall(function() out_p:set(want) end)
     dur_fixes = dur_fixes + 1
-    if dur_fixes <= 3 then
+    if uid_slot[u] then last_dur[u] = want end
+    local from_src = (dur_fixes_by[src] or 0) + 1
+    dur_fixes_by[src] = from_src
+    if from_src <= 2 then
         local okr, back = pcall(function() return out_p:get() end)
-        log.info("items: durability of %s fixed to %.1f (set ok=%s%s, reads %s)", u, want, tostring(ok),
+        log.info("items: durability of %s fixed to %.1f from %s (set ok=%s%s, reads %s)", u, want, src, tostring(ok),
             ok and "" or (" " .. tostring(err)), tostring(okr and back))
     end
 end
 
 local dur_hooked = false
+-- A RegisterHook of a Blueprint class that is not loaded yet fails after ~22 ms (14.11: c:items up to 70 ms
+-- in one client tick). A failed one is tried again after 2 s, then 4 s; one failure ends
+-- the pass of that tick (the rest follows at the next tick).
+local hook_gate = { next = {}, wait = {} }
+function hook_gate.due(k) return (hook_gate.next[k] or 0) <= os.clock() end
+function hook_gate.failed(k)
+    local w = math.min(4, (hook_gate.wait[k] or 1) * 2)
+    hook_gate.wait[k] = w
+    hook_gate.next[k] = os.clock() + w
+end
+
 local function try_hook_durability()
-    if dur_hooked then return end
+    if dur_hooked or not hook_gate.due("dur") then return end
     local ok, err = pcall(RegisterHook,
         "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:GetDurability", fix_durability)
+    if not ok then hook_gate.failed("dur") end
     if ok then
         dur_hooked = true
         log.info("items: durability hook ok")
     else
         log.debug("items: durability hook not ready (%s)", tostring(err))
+    end
+end
+
+local uid_hooked = false
+local function try_hook_equip_uid()
+    if uid_hooked or not hook_gate.due("equipuid") then return end
+    local ok, err = pcall(RegisterHook, HELPER_FN .. "GetEquipmentUID", fix_equipment_uid)
+    if not ok then hook_gate.failed("equipuid") end
+    if ok then
+        uid_hooked = true
+        log.info("items: equipment UID hook ok")
+    else
+        log.debug("items: equipment UID hook not ready (%s)", tostring(err))
     end
 end
 
@@ -646,12 +951,13 @@ end
 
 local battery_hooked = false
 local function try_hook_battery()
-    if battery_hooked then return end
+    if battery_hooked or not hook_gate.due("battery") then return end
     local ok1, e1 = pcall(RegisterHook, BATTERY .. "CheckBatteryLevel", function(c, jig, uid_p, ok_p, value_p)
         local ok, err = pcall(fix_check_battery, c, jig, uid_p, ok_p, value_p)
         if not ok then log.err_throttled("items.battery-check", "items: battery check hook: %s", tostring(err)) end
     end)
     if not ok1 then
+        hook_gate.failed("battery")
         log.debug("items: battery hook not ready (%s)", tostring(e1))
         return
     end
@@ -898,6 +1204,7 @@ function M.host_tick(remote_pcs)
     end
     for k in pairs(uids_sent) do if not live[k] then uids_sent[k] = nil end end
     for k in pairs(items_sent) do if not live[k] then items_sent[k] = nil end end
+    for k in pairs(sent_at) do if not live[tonumber(k:sub(2)) or k:sub(2)] then sent_at[k] = nil end end
     sub("h:items.consume", consume.host_tick, remote_pcs, true)
     sub("h:items.stations", stations.host_tick)
     consume_tick(tools.host_begin)
@@ -1285,7 +1592,7 @@ local EVENT_FN = {
 local function try_hook_events()
     for _, h in ipairs(EVENT_HOOKS) do
         local path, kind = h[1], h[2]
-        if not event_hooked[path] then
+        if not event_hooked[path] and hook_gate.due(path) then
             local fn = EVENT_FN[kind]
             local ok = pcall(RegisterHook, path, function(c)
                 if S.role ~= "client" then return end
@@ -1295,6 +1602,9 @@ local function try_hook_events()
             if ok then
                 event_hooked[path] = true
                 log.info("items: event hook ok (%s)", path:match(":([%w_%?]+)$") or path)
+            else
+                hook_gate.failed(path)
+                return
             end
         end
     end
@@ -1434,6 +1744,7 @@ function M.client_tick()
     consume_tick(wear.client_tick)
     consume_tick(containers.client_tick)
     try_hook_durability()
+    try_hook_equip_uid()
     try_hook_battery()
     try_hook_events()
     apply_uids()
@@ -1619,10 +1930,16 @@ end
 function M.reset()
     equip_sig = {}
     reattach, reattach_said = {}, {}
+    hook_gate.next, hook_gate.wait = {}, {}   -- (a new world: failed hooks are tried at once)
     pending, recent, inert, caught = {}, {}, {}, {}
     hotbar_last = nil
+    sent_at = {}
+    no_uids = {}
     uids_sent, client_uids = {}, { text = nil, applied = nil, dur = {} }
     items_sent, client_items = {}, { dur = {}, bat = {}, n = 0 }
+    own_dur = { at = -1000, dur = {}, n = 0, forced = -1000 }
+    ui_dur = { at = -1000, dur = {}, n = 0 }
+    slot_uid, uid_slot, last_dur = {}, {}, {}
     -- (delayed player parts and level slices of the old session stop)
     pass_gen = pass_gen + 1
     lvl.known, lvl.cand, lvl.pass, lvl.dirty, lvl.gen = {}, {}, nil, true, lvl.gen + 1
@@ -1648,10 +1965,9 @@ function M.own_slot_uid(tag)
     if client_uids.slots_of ~= s then
         local slots = {}
         for entry in s:gmatch("[^;]+") do
-            local t, a, b, c, d = entry:match("^([^=]+)=(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)")
-            if t and not (a == "0" and b == "0" and c == "0" and d == "0") then
-                slots[t] = string.format("%s:%s:%s:%s", a, b, c, d)
-            end
+            local t, code = entry:match("^([^=]+)=([%w_%-]+)")
+            local u = code and wire.uid_dec(code)
+            if t and u and u ~= "0:0:0:0" then slots[t] = u end
         end
         client_uids.slots, client_uids.slots_of = slots, s
     end
@@ -1681,13 +1997,13 @@ function M.recent_pickups(since)
 end
 
 function M.register_handlers()
-    -- host -> client: UIDS|<slot tag>=A:B:C:D;...   (the client's own equipment)
+    -- host -> client: UIDS|<slot tag>=<uid, short>[@<durability>];...   (the client's own equipment)
     net.on("UIDS", function(f)
         client_uids.text = f[1] or ""
         client_uids.applied = nil
         apply_uids()
     end)
-    -- host -> client: ITEMS|<uid>=<durability>[/<battery>];...   (the client's own inventory)
+    -- host -> client: ITEMS|<uid, short>=<durability>[/<battery>];...   (the client's own inventory)
     net.on("ITEMS", function(f) apply_items(f[1]) end)
     consume.register_handlers()
     stations.register_handlers()
@@ -1726,5 +2042,11 @@ function M.install()
     -- native function: hookable at start, before the client's first map load
     hook_loot_spawns()
 end
+
+-- Test access (mock harness).
+M._t = { try_hook_events = try_hook_events, try_hook_durability = try_hook_durability,
+         try_hook_equip_uid = try_hook_equip_uid, try_hook_battery = try_hook_battery,
+         hook_gate = hook_gate, event_hooked = event_hooked, fix_durability = fix_durability,
+         fix_equipment_uid = fix_equipment_uid, slot_dur = slot_dur }
 
 return M

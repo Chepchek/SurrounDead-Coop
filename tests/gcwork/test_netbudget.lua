@@ -110,22 +110,24 @@ check(pc.got[#pc.got]:find("^SDC1|LOOK|late"), "the later bulk message came last
 check(log_has("%[NET%] send budget: queue to BP_PlayerController_C_1 drained: 253 message%(s%)"), "drained line with counts")
 check(log_has("WLOOT 252, LOOK 1"), "drained line lists the kinds")
 
--- 4. the other game stands still: queueable messages wait, NOW ones still go
+-- 4. the other game stands still: queueable messages wait, NOW events still go;
+-- a NOW snapshot (MYSTATE: only the newest matters) waits too and goes when heard again
 -- (in play the host sends PSTATE / VSTATE every second: the lane is in use)
 tick(40, 0.05)
-net.send_to(pc, "PSTATE", "keep")
+net.send_to(pc, "PSTATE", "1", "keep")
 pc.frozen = true
 tick(20, 0.05)             -- 1 s without a packet
 local b3 = #pc.got
-net.send_to(pc, "ITEMS", "x"); net.send_to(pc, "MYSTATE", "y")
+net.send_to(pc, "ITEMS", "x"); net.send_to(pc, "MYSTATE", "y"); net.send_to(pc, "VSEAT", "passenger", "Host")
 local k3 = kinds(pc, b3 + 1)
-check(#k3 == 1 and k3[1] == "MYSTATE", "frozen receiver: ITEMS waits, MYSTATE goes")
+check(#k3 == 1 and k3[1] == "VSEAT", "frozen receiver: ITEMS and MYSTATE (snapshots) wait, VSEAT (an event) goes")
 check(log_has("nothing received from it for"), "queue start says why (nothing received)")
 tick(40, 0.05)
-check(net.queued_count() == 1, "still waiting while nothing is received")
+check(net.queued_count() == 2, "still waiting while nothing is received")
 pc.frozen = false
 tick(4, 0.05)
-check(net.queued_count() == 0 and pc.got[#pc.got]:find("^SDC1|ITEMS|x"), "sent once the receiver is heard again")
+check(net.queued_count() == 0 and pc.got[#pc.got]:find("^SDC1|ITEMS|x") or pc.got[#pc.got - 1]:find("^SDC1|ITEMS|x"),
+    "sent once the receiver is heard again")
 
 -- 5. the player leaves: its queue is dropped with a line
 tick(40, 0.05)

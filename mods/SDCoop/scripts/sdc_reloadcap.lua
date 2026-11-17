@@ -102,6 +102,7 @@
 local log = require("sdc_log")
 local ue = require("sdc_ue")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 local cfg = require("sdc_config")
 local ctx = require("sdc_ctx")
 
@@ -910,7 +911,7 @@ local function expire_tick()
                 apply(jig, G, true, gone)
                 for u, b in pairs(before) do
                     if b.pending <= 0 and b.auth and b.auth > 0 and not find_slot(jig, b.g) then
-                        net.send_to_host("RESEND", u)
+                        net.send_to_host("RESEND", wire.uid_enc(u))
                         M.stats.resent = M.stats.resent + 1
                         log.info("reloadcap: ammo stack %s (%d left on the host) is gone from this screen after an unanswered request: asked the host for it again (RESEND)",
                             u, b.auth)

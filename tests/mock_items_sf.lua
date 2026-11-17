@@ -21,6 +21,7 @@
 -- usage: lua mock_items_sf.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -319,7 +320,7 @@ comp_move(C(guest.jig), P(zombie), P(guest.jig), P(G(60)), P(false), P(0), P(G(1
 run_delayed("containers-jmc")
 local rm = false
 for _, m in ipairs(msgs(guest.pc, "JMC")) do
-  for i = 3, #m.args do if m.args[i] == "rm,60:0:0:0" then rm = true end end
+  for i = 3, #m.args do if m.args[i] == "rm," .. wire.uid_enc("60:0:0:0") then rm = true end end
 end
 t = guest.jig.__told[#guest.jig.__told]
 check(rm, "from a zombie guest has open: JMC rm of the item to guest")
@@ -361,7 +362,7 @@ items.host_tick({ guest.pc })
 check(#msgs(guest.pc, "ITEMS") == items_before, "unchanged inventory: no ITEMS")
 logs = {}
 local told3 = #guest.jig.__told
-handlers.GHOSTQ({ "66:0:0:0;30:0:0:0" }, guest.pc)
+handlers.GHOSTQ({ "AAAAQgAAAAAAAAAAAAAAAA;AAAAHgAAAAAAAAAAAAAAAA" }, guest.pc)
 t = guest.jig.__told[#guest.jig.__told]
 check(#guest.jig.__told == told3 + 1 and t.a == 66 and t.n == 0 and t.target == guest.jig, "GHOSTQ: the item the host lacks is ended (CLIENT_UpdateCount 0)")
 check(has_log("guest's screen showed 1 item(s) their inventory here does not have", "warn") ~= nil, "GHOSTQ: WARN on the host")
@@ -369,12 +370,12 @@ check(has_log("guest asked about 1 item(s) that their inventory here has: the it
 T = T + 1
 items.host_tick({ guest.pc })
 check(#msgs(guest.pc, "ITEMS") == items_before + 1, "GHOSTQ: ITEMS sent again although unchanged")
-handlers.GHOSTQ({ "67:0:0:0" }, guest.pc)
+handlers.GHOSTQ({ "AAAAQwAAAAAAAAAAAAAAAA" }, guest.pc)
 check(#guest.jig.__told == told3 + 1, "GHOSTQ: one answer per player in 3 s")
 -- a read error in the walk: nothing ended (a missing item could be a real one)
 T = T + 5
 guest.jig.__broken = true
-handlers.GHOSTQ({ "68:0:0:0" }, guest.pc)
+handlers.GHOSTQ({ "AAAARAAAAAAAAAAAAAAAAA" }, guest.pc)
 guest.jig.__broken = nil
 check(#guest.jig.__told == told3 + 1 and has_log("could not be read in full", "warn") ~= nil, "GHOSTQ with a read error: nothing ended")
 -- garbage: ignored
@@ -383,7 +384,7 @@ handlers.GHOSTQ({ "not-a-uid;;" }, guest.pc)
 check(#guest.jig.__told == told3 + 1, "GHOSTQ with no UID: nothing")
 -- a non-player sender: ignored
 T = T + 5
-handlers.GHOSTQ({ "69:0:0:0" }, { __name = "PC_none" })
+handlers.GHOSTQ({ "AAAARQAAAAAAAAAAAAAAAA" }, { __name = "PC_none" })
 check(#guest.jig.__told == told3 + 1, "GHOSTQ from no character: nothing")
 
 -- client side
@@ -404,7 +405,7 @@ local mycomp = { __name = "MyJig", GetOwner = function() return me end, LocalJSI
 me.BP_JigMultiplayer = mycomp
 slot(10, "DA_Bandage", 1, 1)
 slot(66, "DA_Rags", 2, 0)
-handlers.ITEMS({ "10:0:0:0=100.0" })   -- the host's list: only the bandage
+handlers.ITEMS({ "AAAACgAAAAAAAAAAAAAAAA=100.0" })   -- the host's list: only the bandage
 to_host, logs = {}, {}
 T = T + 100
 consume.client_tick()
@@ -412,7 +413,7 @@ check(#to_host == 0, "first check: not asked yet (an answer may be on its way)")
 T = T + 6
 consume.client_tick()
 local q = to_host[#to_host]
-check(q and q.kind == "GHOSTQ" and q.args[1] == "66:0:0:0", "second check, the same item: GHOSTQ with its UID")
+check(q and q.kind == "GHOSTQ" and wire.uid_dec(q.args[1]) == "66:0:0:0", "second check, the same item: GHOSTQ with its UID")
 check(has_log("not in the host's copy (they cannot be used or moved; the host is asked about them): Rags x2 (uid 66:0:0:0, JSIContainer_Pockets slot 0)", "warn") ~= nil,
   "the WARN names the item and its slot")
 check(has_log("asked the host about 1 item(s) shown only in this inventory: 66:0:0:0") ~= nil, "the question logged")
@@ -421,7 +422,7 @@ consume.client_tick()
 check(#to_host == 1, "the same item 6 s later: not asked again yet")
 T = T + 30
 consume.client_tick()
-check(#to_host == 2 and to_host[2].args[1] == "66:0:0:0", "asked again after 30 s")
+check(#to_host == 2 and wire.uid_dec(to_host[2].args[1]) == "66:0:0:0", "asked again after 30 s")
 -- the host's answer removed the slot: nothing more
 table.remove(view, 2)
 T = T + 40
@@ -476,7 +477,7 @@ inv_ms = {}
 T = T + 1
 items.host_tick({ ann.pc })
 local it2 = msgs(ann.pc, "ITEMS")
-check(#it2 == 2 and it2[2].args[1]:find("2003:0:0:0=50.0", 1, true) ~= nil, "the next tick sends ITEMS from the finished walk")
+check(#it2 == 2 and it2[2].args[1]:find(wire.uid_enc("2003:0:0:0") .. "=50", 1, true) ~= nil, "the next tick sends ITEMS from the finished walk")
 -- (skeptic, 0.9.x) the inventory changes between two slices: the walk starts over
 local function all_in(inv, list)
   local miss, n = {}, 0
@@ -529,8 +530,8 @@ items.host_tick({ ann.pc })
 local it3 = msgs(ann.pc, "ITEMS")[1]
 local s3 = it3 and (";" .. it3.args[1]) or ""
 local n3 = 0
-for _ in s3:gmatch(";%d+:0:0:0=") do n3 = n3 + 1 end
-check(n3 == 195 and not s3:find(";201:0:0:0=", 1, true), "ITEMS of the next tick: 195 items, not the gone ones (" .. n3 .. ")")
+for _ in s3:gmatch(";[%w_%-]+=") do n3 = n3 + 1 end
+check(n3 == 195 and not s3:find(";" .. wire.uid_enc("201:0:0:0") .. "=", 1, true), "ITEMS of the next tick: 195 items, not the gone ones (" .. n3 .. ")")
 -- the player keeps changing it (a container more before every slice): after
 -- MAX_RESTARTS the walk is read whole in one frame (as before the slices)
 while pending("consume-walk") > 0 do run_delayed("consume-walk") end

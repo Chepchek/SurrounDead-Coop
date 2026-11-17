@@ -505,7 +505,7 @@ local alpha, how = join("Alpha", GA)
 check(how == "fresh", "Alpha: a new character")
 local ap = alpha.pc._p.Pawn
 check(ap ~= nil and inv_count(ap) == 1, "Alpha spawned with the starting kit")
-deliver("PSPROG", { pa().gen, "L.CurrentLevel=2;L.CurrentXP=10", "-", "?" }, alpha.pc)
+deliver("PSPROG", { pa().gen, progress.wire_encode(progress.flat_of("L.CurrentLevel=2;L.CurrentXP=10")), "-", "?" }, alpha.pc)
 add_item(ap, "DA_Bandage", 2)
 ap._p.__loc = { X = 1000, Y = 2000, Z = 300 }
 QUEST[alpha.pc._short] = "quests@save1"
@@ -535,7 +535,7 @@ check(logged("persist: committed 1 client record(s) to slot CoopA (game save", m
 print("3. after the save: Alpha goes on (live changes), Bravo comes for the first time")
 add_item(ap, "DA_Rifle", 1)
 ap._p.__loc = { X = 9000, Y = 9000, Z = 500 }
-deliver("PSPROG", { pa().gen, "L.CurrentLevel=5;L.CurrentXP=10", "-", "?" }, alpha.pc)
+deliver("PSPROG", { pa().gen, progress.wire_encode(progress.flat_of("L.CurrentLevel=5;L.CurrentXP=10")), "-", "?" }, alpha.pc)
 QUEST[alpha.pc._short] = "quests@later"
 quests.persist_save(alpha.pc)
 advance(16); host_tick()
@@ -801,7 +801,7 @@ local items15, gen15 = c15.players[KA].inv.items, c15.gen
 add_item(alpha15.pc._p.Pawn, "DA_Rifle", 1)
 add_item(alpha15.pc._p.Pawn, "DA_Rifle", 1)
 alpha15.pc._p.Pawn._p.__loc = { X = 60000, Y = 60000, Z = 100 }
-deliver("PSPROG", { pa().gen, "L.CurrentLevel=9;L.CurrentXP=1", "-", "?" }, alpha15.pc)
+deliver("PSPROG", { pa().gen, progress.wire_encode(progress.flat_of("L.CurrentLevel=9;L.CurrentXP=1")), "-", "?" }, alpha15.pc)
 local charlie15 = join("Charlie", GC)
 advance(16); host_tick()
 leave(charlie15)

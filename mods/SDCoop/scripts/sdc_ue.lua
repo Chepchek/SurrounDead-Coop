@@ -695,7 +695,7 @@ M.last_task = { label = nil, at = 0 }
 -- the last task that finished (label, os.clock() at its end, its ms): what
 -- sdc_diag's [HITCH] names (last_task is the one running now - diag itself)
 M.last_done = { label = nil, at = 0, ms = 0 }
-M.task_stats = {}   -- label -> { calls, ms } (sdc_perf)
+M.task_stats = {}   -- label -> { calls, ms, wmax, over } (sdc_perf)
 local function guarded(label, fn)
     return function(...)
         local t0 = os.clock()
@@ -718,8 +718,10 @@ local function guarded(label, fn)
         local ld = M.last_done
         ld.label, ld.at, ld.ms = label, t1, ms
         local ts = M.task_stats[label]
-        if not ts then ts = { calls = 0, ms = 0 }; M.task_stats[label] = ts end
+        if not ts then ts = { calls = 0, ms = 0, wmax = 0, over = 0 }; M.task_stats[label] = ts end
         ts.calls, ts.ms = ts.calls + 1, ts.ms + ms
+        -- the window's worst call, calls >= SPIKE_MS, the frame's mod work (sdc_perf)
+        if perf and perf.note_task then perf.note_task(ts, ms, prev_task ~= nil) end
         if ms > worst_task.ms then worst_task.ms, worst_task.label = ms, label end
         if ms >= SLOW_MS and (ms > (M.slow[label] or 0) * 1.5 or ms >= 1000) then
             M.slow[label] = math.max(ms, M.slow[label] or 0)
@@ -923,6 +925,7 @@ function M.hook_native(path, key, fn)
             r.calls = r.calls + 1
             r.ms = r.ms + ms
             if not ok then log.err_throttled("hook." .. s.key, "hook %s on %s: %s", s.key, path, tostring(err)) end
+            if pm and pm.note_call then pm.note_call(r, ms, prev ~= nil) end
             if ms >= 50 and pm and pm.note_hook then pcall(pm.note_hook, r, ms, log_ms() - w0) end
         end
         if pm then pm.current = prev end
@@ -943,6 +946,66 @@ function M.hook_native(path, key, fn)
     end
     log.info("hook: %s (shared engine hook, pre only) for %s", path:match("([%w_]+:[%w_]+)$") or path, key)
     return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Why a hook does not register: one look at the class
+-- ---------------------------------------------------------------------------
+-- In a shipping build a Blueprint function may keep its name while its
+-- UFunction carries no body ("UFunction::Func: 0x0" in the UE4SS error): there
+-- is nothing to hook, and retrying cannot help. Once per class this writes
+-- what the class really offers and what the wanted function looks like, so the
+-- next step is a working anchor (an event that has a body, a native call, an
+-- object watch), not another attempt.
+local probed = {}   -- [path] = true
+M.probed = probed
+
+local function func_addr(fn)
+    local ok, v = pcall(function() return M.prop(fn, "Func") end)
+    if not ok or v == nil then return "?" end
+    if type(v) == "number" then return string.format("0x%x", v) end
+    return tostring(v)
+end
+
+-- path = "Class path:Function", tag names the module in the log
+function M.probe_hook(path, tag)
+    if type(path) ~= "string" or probed[path] then return end
+    probed[path] = true
+    tag = tostring(tag or "?")
+    local cls_path, want = path:match("^(.-):([%w_]+)$")
+    local cls = cls_path and M.find_object(cls_path)
+    if not cls then
+        log.info("hook probe %s: %s is not loaded (nothing to look at yet)", tag, path)
+        return
+    end
+    local names, total = {}, 0
+    pcall(function()
+        cls:ForEachFunction(function(fn)
+            total = total + 1
+            if #names < 40 then
+                local ok, n = pcall(function() return M.short(fn) end)
+                if ok and n then names[#names + 1] = tostring(n) end
+            end
+        end)
+    end)
+    local found = want and M.find_object(cls_path .. ":" .. tostring(want)) or nil
+    log.info("hook probe %s: %s has %d function(s); wanted %s: %s (Func %s)", tag, cls_path, total,
+        tostring(want), found and "the name exists" or "no such function",
+        found and func_addr(found) or "-")
+    -- the candidates a new anchor would come from: events and calls the class
+    -- really declares (the list is short by design, it is a diagnostic)
+    local cands = {}
+    for _, n in ipairs(names) do
+        if n:find("Event_", 1, true) or n:find("Damage", 1, true) or n:find("Spawn", 1, true)
+            or n:find("Notify", 1, true) or n:find("Area", 1, true) or n:find("Save", 1, true) then
+            local f = M.find_object(cls_path .. ":" .. n)
+            cands[#cands + 1] = n .. "=" .. (f and func_addr(f) or "?")
+        end
+    end
+    if #cands > 0 then
+        log.info("hook probe %s: candidates %s", tag, table.concat(cands, " "))
+    end
+    log.debug("hook probe %s: functions %s", tag, table.concat(names, " "))
 end
 
 return M

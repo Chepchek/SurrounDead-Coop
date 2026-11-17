@@ -254,6 +254,73 @@ function M.decode_values(s)
     return out
 end
 
+-- PSPROG (client -> host) carries the same values with short field ids and, between two
+-- full reports, only the fields that changed since the last one sent. flat =
+-- { ["L.CurrentLevel"] = "3", ... } (the texts encode_values makes); ids are the
+-- field's number in M.FIELDS' order in base 36 ("0" .. "2k"): both sides run the
+-- same table (no older version is supported).
+local WIRE_ID, WIRE_KEY, WIRE_ORDER = {}, {}, {}
+do
+    local B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+    local function b36(n)
+        local t = ""
+        repeat
+            local r = n % 36
+            t = B36:sub(r + 1, r + 1) .. t
+            n = n // 36
+        until n == 0
+        return t
+    end
+    local i = 0
+    for _, g in ipairs(M.FIELDS) do
+        for _, name in ipairs(g[3]) do
+            local k = g[1] .. "." .. name
+            local id = b36(i)
+            WIRE_ORDER[#WIRE_ORDER + 1] = k
+            WIRE_ID[k], WIRE_KEY[id] = id, k
+            i = i + 1
+        end
+    end
+end
+
+-- encode_values' text -> { [key] = value text } (known keys only)
+function M.flat_of(text)
+    local out = {}
+    for k, v in tostring(text or ""):gmatch("([^;=]+)=([^;]*)") do
+        if WIRE_ID[k] then out[k] = v end
+    end
+    return out
+end
+
+-- "id=value;..." of the fields of `flat` that differ from `base` (nil: all of them)
+function M.wire_encode(flat, base)
+    local parts = {}
+    for _, k in ipairs(WIRE_ORDER) do
+        local v = flat[k]
+        if v ~= nil and (base == nil or base[k] ~= v) then parts[#parts + 1] = WIRE_ID[k] .. "=" .. v end
+    end
+    return table.concat(parts, ";")
+end
+
+-- the other way: { [key] = value text }
+function M.wire_decode(body)
+    local out = {}
+    for id, v in tostring(body or ""):gmatch("([^;=]+)=([^;]*)") do
+        local k = WIRE_KEY[id]
+        if k then out[k] = v end
+    end
+    return out
+end
+
+-- flat -> encode_values' text (stable order): decode_values / major_key read it
+function M.flat_text(flat)
+    local parts = {}
+    for _, k in ipairs(WIRE_ORDER) do
+        if flat[k] ~= nil then parts[#parts + 1] = k .. "=" .. flat[k] end
+    end
+    return table.concat(parts, ";")
+end
+
 -- The fields whose change is reported at once, from an encoded string.
 function M.major_key(encoded)
     local parts = {}

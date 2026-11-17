@@ -90,7 +90,7 @@ world.BP_PlayerCharacter_C = { proxy }
 local handlers = {}
 package.loaded["sdc_net"].on = function(k, f) handlers[k] = f end
 pawnstate.register_handlers()
-handlers.PSTATE({ "9", "fl=1" })
+handlers.PSTATE({ "9", "1", "0" })
 assert(light.Intensity == 0, "direct light before the game's grace time")
 print("backstop: waits for the game's path")
 for _, l in ipairs(logs) do print("LOG", l) end

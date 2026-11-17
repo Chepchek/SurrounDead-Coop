@@ -98,8 +98,8 @@ quests.status_lines(lines)
 local n = 0
 for path in pairs(hooks) do if not path:find("#", 1, true) then n = n + 1 end end
 -- sdc_dialogue: 4 native + 5 Blueprint; sdc_quests: 3 native (CompleteNarrativeDataTask:
--- client hook removed, it never fires there) + 6 Blueprint
-assert(n == 18, "18 engine hooks, got " .. n)
+-- client hook removed, it never fires there) + 7 Blueprint (17.11.2026: the SpawnMarker event became _AI + _Object)
+assert(n == 19, "19 engine hooks, got " .. n)
 assert(hooks["/Script/Engine.GameplayStatics:BeginDeferredActorSpawnFromClass#dlg.trader-spawn"], "spawn subscriber")
 local bad = 0
 for _, l in ipairs(logs) do if l:find("^err") then print(l); bad = bad + 1 end end

@@ -71,6 +71,12 @@
 --                sdc_savecheck).
 --   markers      the host's copy of a client's quest marker is removed, the
 --                client gets QM; the host's own quests' markers stay its own.
+--                Since the game's 17.11.2026 update the SpawnMarker event (now
+--                _AI / _Object: it only has an ActorTag) makes the level's quest
+--                spawner place the marker (Quest_SpawnMarker: at the spawner, with
+--                a random offset inside the discoverable radius); its look is the
+--                marker's MarkerData (sdc_markerdata). The post-hook reads the
+--                marker the host just got and sends what it holds.
 --   journal      "Forget quest" on a client (absorbed there) -> QQ -> the
 --                host forgets it on that client's component.
 --   save         M.persist_bind / persist_save / persist_delete (sdc_persist
@@ -85,7 +91,8 @@
 --                           QC|x|y|z   QB   QQ|forget|<quest class path>
 --           host -> client  QS|<quest>|<quest>...   quest = name~task~task,
 --                                                   task = desc^cur^req^flags
---                           QM|a|tag|x|y|z|texture|text|r|g|b|a|underground   QM|d|tag
+--                           QM|a|tag|x|y|z|texture|text|r|g|b|a|underground|radius|
+--                              size x|size y|text size x|text size y   QM|d|tag
 --                           QX|<xp>|<quest name>   QN|<code>
 --
 -- Hook callbacks are wrapped in pcall and return nothing. Engine objects are
@@ -100,6 +107,7 @@ local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 local dialogue = require("sdc_dialogue")
 local consume = require("sdc_consume")   -- shared helpers (param)
+local MD = require("sdc_markerdata")     -- the marker's S_MarkerData (the game's 17.11 layout)
 
 -- counters of the F7 panel lines (status_lines)
 local M = {
@@ -115,7 +123,9 @@ local function own() return cfg.get("quest_own") ~= false end
 -- ---------------------------------------------------------------------------
 
 local LIB_CDO = "/Script/Narrative.Default__NarrativeFunctionLibrary"
-local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker.Quest_Event_SpawnMarker_C"
+-- 17.11.2026: Quest_Event_SpawnMarker is gone; one event per spawner kind, same ActorTag
+local SPAWN_MARKER_AI = "/Game/Quests/Events/Quest_Event_SpawnMarker_AI.Quest_Event_SpawnMarker_AI_C"
+local SPAWN_MARKER_OBJECT = "/Game/Quests/Events/Quest_Event_SpawnMarker_Object.Quest_Event_SpawnMarker_Object_C"
 local REMOVE_MARKER = "/Game/Quests/Events/Quest_Event_RemoveMarker.Quest_Event_RemoveMarker_C"
 local REWARD_XP = "/Game/Quests/Events/Reward/Quest_Event_RewardPlayerXP.Quest_Event_RewardPlayerXP_C"
 local CRATE = "/Game/Quests/Blueprints/Objects/BP_GuaranteedSpawner.BP_GuaranteedSpawner_C"
@@ -444,12 +454,17 @@ local function color_fields(c)
     return 1, 1, 1, 1
 end
 
-local function marker_fields(tag, loc, tex, text, color, ug)
-    local r, g, b, a = color_fields(color)
+local function coord(v) return type(v) == "number" and string.format("%.3f", v) or "" end
+
+-- md: sdc_markerdata.read of the host's marker actor (nil: a bare marker)
+local function marker_fields(tag, loc, md)
+    md = md or {}
+    local r, g, b, a = color_fields(md.color)
+    local sz, ts = md.size or {}, md.text_size or {}
     return "a", clean(tag), string.format("%.0f", loc.X), string.format("%.0f", loc.Y), string.format("%.0f", loc.Z),
-        ue.valid(tex) and ue.path(tex) or "", clean(text),
+        md.tex and ue.path(md.tex) or "", clean(md.title or ""),
         string.format("%.3f", r), string.format("%.3f", g), string.format("%.3f", b), string.format("%.3f", a),
-        ug and "1" or "0"
+        md.ug and "1" or "0", string.format("%.0f", md.radius or 0), coord(sz.X), coord(sz.Y), coord(ts.X), coord(ts.Y)
 end
 
 local function first_tag(actor)
@@ -492,8 +507,7 @@ local function send_all_markers(pc)
         if ue.valid(a) and ue.is_runtime_spawned(a) then
             local tag, loc = first_tag(a), not marker_gone(a) and ue.location(a)
             if tag and tag ~= "" and loc then
-                net.send_to(pc, "QM", marker_fields(tag, loc, ue.prop(a, "Marker Texture"), ue.str(ue.prop(a, "Text")),
-                    ue.prop(a, "Color"), ue.prop(a, "Underground?") == true))
+                net.send_to(pc, "QM", marker_fields(tag, loc, MD.read(a)))
                 n = n + 1
             end
         end
@@ -501,9 +515,9 @@ local function send_all_markers(pc)
     if n > 0 then log.info("quests: host: %d quest marker(s) sent to %s", n, ue.short(pc)) end
 end
 
--- The marker a client's quest just placed in the host's world (the newest
--- runtime-spawned BP_QuestMarker with that tag: names count down) goes.
-local function drop_host_marker(tag)
+-- The marker a client's quest just placed in the host's world: the newest
+-- runtime-spawned BP_QuestMarker with that tag (names count down).
+local function host_marker(tag)
     local best, best_n = nil, math.huge
     for _, a in ipairs(ue.find_all(MARKER_SHORT)) do
         if ue.valid(a) and ue.is_runtime_spawned(a) and not marker_gone(a) and first_tag(a) == tag then
@@ -511,18 +525,31 @@ local function drop_host_marker(tag)
             if n < best_n then best, best_n = a, n end
         end
     end
-    if not best then return false end
-    return destroy_marker_actor(best)
+    return best
 end
 
+-- It goes (the client gets its own).
+local function drop_host_marker(tag, marker)
+    marker = marker or host_marker(tag)
+    if not marker then return false end
+    return destroy_marker_actor(marker)
+end
+
+-- The post-hook of Quest_Event_SpawnMarker_AI / _Object: the event's own work (the level's quest spawner
+-- placing the BP_QuestMarker) is done, so the host's marker is there: its place and look are what the
+-- client's copy gets. No marker (the spawner's MarkerOnSpawn? is off): nothing to share.
 local function on_spawn_marker(ev_p, _, ctl_p)
     if role() ~= "host" or not cfg.get("quest_markers") then return end
     local ev = pget(ev_p)
     local tag = ue.str(ue.prop(ev, "ActorTag"))
-    local loc = vec(ue.prop(ev, "Location"))
-    if tag == "" or not loc then return end
-    local fields = table.pack(marker_fields(tag, loc, ue.prop(ev, "Marker Texture"), ue.str(ue.prop(ev, "Text")),
-        ue.prop(ev, "Color"), ue.prop(ev, "Underground?") == true))
+    if tag == "" then return end
+    local mk = host_marker(tag)
+    local loc = mk and ue.location(mk)
+    if not (mk and loc) then
+        log.info("quests: host: quest marker event for '%s': the spawner placed no marker (Marker On Spawn off, or no spawner with that tag here)", tag)
+        return
+    end
+    local fields = table.pack(marker_fields(tag, loc, MD.read(mk)))
     if own() then
         local pc = remote_owner(pget(ctl_p))
         if bounty_event(ev) then
@@ -544,7 +571,7 @@ local function on_spawn_marker(ev_p, _, ctl_p)
         end
         log.info("quests: host: quest marker '%s' of %s's quest: sent to them; the copy in the host's world goes", tag, ue.short(pc))
         ue.game_thread("quests-qm-own", function()
-            local gone = drop_host_marker(tag)
+            local gone = drop_host_marker(tag, mk)
             if ue.valid(pc) then net.send_to(pc, "QM", table.unpack(fields, 1, fields.n)) end
             if not gone then log.debug("quests: host: no host copy of marker '%s' found", tag) end
         end)
@@ -1428,13 +1455,16 @@ local function spawn_marker(tag)
     -- the path came over the network: a texture only
     local tex = r.tex ~= "" and load_obj(r.tex) or nil
     if tex and not ue.class_name(tex):find("Texture", 1, true) then tex = nil end
-    if tex then ue.set_prop(a, "Marker Texture", tex) end
-    ue.set_prop(a, "Color", r.color)
-    ue.set_prop(a, "Text", r.text)
-    ue.set_prop(a, "Underground?", r.ug)
+    -- the look is the marker's MarkerData (set before it finishes spawning: its BeginPlay builds the map marker from it)
+    local okw, how = MD.write(a, { tex = tex, title = r.text, color = r.color, ug = r.ug, radius = r.radius,
+        size = r.size, text_size = r.text_size })
+    if not okw then
+        log.err_throttled("quests.marker.data", "quests: client: quest marker '%s': %s", tag, tostring(how))
+    end
     local okf, done = pcall(function() return gs:FinishSpawningActor(a, tf, 0) end)
     m.actor = (okf and marker_ok(done)) and done or (marker_ok(a) and a or nil)
-    log.info("quests: client: quest marker '%s' placed (texture %s, finish ok=%s)", tag, tostring(tex ~= nil), tostring(okf))
+    log.info("quests: client: quest marker '%s' placed (texture %s, data %s, finish ok=%s)", tag, tostring(tex ~= nil),
+        okw and how or "NOT set", tostring(okf))
 end
 
 local function on_marker(f)
@@ -1454,10 +1484,25 @@ local function on_marker(f)
         cl.markers[tag] = { rec = {
             loc = { X = x, Y = y, Z = z }, tex = f[6] or "", text = f[7] or "",
             color = { R = tonumber(f[8]) or 1, G = tonumber(f[9]) or 1, B = tonumber(f[10]) or 1, A = tonumber(f[11]) or 1 },
-            ug = f[12] == "1",
+            ug = f[12] == "1", radius = tonumber(f[13]),
+            size = tonumber(f[14]) and tonumber(f[15]) and { X = tonumber(f[14]), Y = tonumber(f[15]) } or nil,
+            text_size = tonumber(f[16]) and tonumber(f[17]) and { X = tonumber(f[16]), Y = tonumber(f[17]) } or nil,
         } }
         spawn_marker(tag)
     end)
+end
+
+-- Self test (sdc_selftest C.markers): a quest marker placed the way a QM from the host places it, and its removal.
+function M.selftest_marker(tag, rec)
+    cl.markers[tag] = { rec = rec }
+    spawn_marker(tag)
+    local m = cl.markers[tag]
+    return m and m.actor or nil
+end
+
+function M.selftest_marker_drop(tag)
+    destroy_marker(tag)
+    cl.markers[tag] = nil
 end
 
 -- QN|<code>: what the game shows the player at the host's (player 0's) HUD.
@@ -1483,7 +1528,8 @@ end
 -- second callback; they stack). Post-hooks. The journal's class is not
 -- loaded for it (it comes with the game's UI).
 local BP_HOOKS = {
-    { cls = SPAWN_MARKER, fn = SPAWN_MARKER .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_spawn_marker(ev_p, t_p, c_p) end },
+    { cls = SPAWN_MARKER_AI, fn = SPAWN_MARKER_AI .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_spawn_marker(ev_p, t_p, c_p) end },
+    { cls = SPAWN_MARKER_OBJECT, fn = SPAWN_MARKER_OBJECT .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_spawn_marker(ev_p, t_p, c_p) end },
     { cls = REMOVE_MARKER, fn = REMOVE_MARKER .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_remove_marker(ev_p, t_p, c_p) end },
     { cls = REWARD_XP, fn = REWARD_XP .. ":ExecuteEvent", cb = function(ev_p, t_p, c_p) on_reward_xp(ev_p, t_p, c_p) end },
     { cls = CRATE, fn = CRATE .. ":OpenContainer", cb = function(c_p) on_open_container(c_p) end },
@@ -1599,8 +1645,7 @@ local function shared_markers_to(pc)
         if ue.valid(a) and ue.is_runtime_spawned(a) then
             local tag, loc = first_tag(a), not marker_gone(a) and ue.location(a)
             if tag and loc and not sent[tag] and is_bounty_class(tag) then
-                net.send_to(pc, "QM", marker_fields(tag, loc, ue.prop(a, "Marker Texture"), ue.str(ue.prop(a, "Text")),
-                    ue.prop(a, "Color"), ue.prop(a, "Underground?") == true))
+                net.send_to(pc, "QM", marker_fields(tag, loc, MD.read(a)))
                 sent[tag], n = true, n + 1
             end
         end

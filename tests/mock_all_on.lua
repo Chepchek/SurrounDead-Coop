@@ -382,8 +382,18 @@ fire(HW, ZM .. "Archetype_Crawler", "bp", param(hz))
 fire(HW, ZM .. "SelectArchetype", "bp", param(hz))
 local app = msgs(HW, "|AIAPP|")
 check(#app == 1, "AIAPP sent at the host's roll")
-check(app[1] and app[1]:find("|c|/Game/AI/Zombies/SK_A.SK_A|/Game/AI/Zombies/M_A.M_A|calf_l,Foot_R|Undead Crawler|"
-    .. "/Game/AI/Zombies/CrawlerAILocomotion.CrawlerAILocomotion|40,-3,0,-32,-90|0", 1, true) ~= nil, "AIAPP payload: " .. tostring(app[1]))
+-- AIAPP|arch|mesh|material|bones|name|blendspace|body|age|name form|definitions: long strings as tokens
+do
+    local m = app[1] or ""
+    local f = {}
+    for part in (m .. "|"):gmatch("([^|]*)|") do f[#f + 1] = part end
+    local d = require("sdc_dict").decoder("t")
+    d:receive(f[12])
+    check(f[3] == "c" and d:get(f[4]) == "/Game/AI/Zombies/SK_A.SK_A" and d:get(f[5]) == "/Game/AI/Zombies/M_A.M_A"
+        and d:get(f[6]) == "calf_l,Foot_R" and d:get(f[7]) == "Undead Crawler"
+        and d:get(f[8]) == "/Game/AI/Zombies/CrawlerAILocomotion.CrawlerAILocomotion" and f[9] == "40,-3,0,-32,-90" and f[10] == "0",
+        "AIAPP payload decodes to the old strings: " .. m)
+end
 deliver()
 check(cz._cap._p.CapsuleHalfHeight == 40, "copy capsule half height 40 at once")
 check(cz._p.BaseTranslationOffset.Z == -32 and cz._p.BaseTranslationOffset.X == -3 and cz._cached.Yaw == -90,

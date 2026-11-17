@@ -109,7 +109,7 @@ hooks[CHECK](C(cook), P(true))
 hooks[JIG .. "JigTryAddGetPendingRef"](C(mycomp), P({}), P(true), P({ __name = "pend" }), P(false))
 hooks[JIG .. "CLIENT_ItemCraftedResponse"](C(mycomp), P(G(5)),
   P({ [F_USID] = G(77), [F_INFO] = { [F_ITEMID] = { __name = "DA_Bandage" }, [F_COUNT] = 1 } }), P(true), P(arr({})), P(arr({})))
-assert(removed and to_host[#to_host][1] == "RESEND" and to_host[#to_host][2] == "77:0:0:0", "mismatch not fixed")
+assert(removed and to_host[#to_host][1] == "RESEND" and require("sdc_wire").uid_dec(to_host[#to_host][2]) == "77:0:0:0", "mismatch not fixed")
 assert(has_log("the host made Bandage (uid 77:0:0:0), this inventory showed CookedMeat there", "warn"), "mismatch log")
 print("client: a slot showing the wrong item is replaced")
 
@@ -157,9 +157,9 @@ assert(#taken == 1 and taken[1].a == 9 and has_log("wrong recipe, nothing consum
 -- RESEND: the host sends the item as it has it
 local sent_item
 rawset(djig, "CLIENT_AddNewItem", function(_, item, content, comp, pend) sent_item = item end)
-handlers.RESEND({ "1:0:0:0" }, pc)
+handlers.RESEND({ "AAAAAQAAAAAAAAAAAAAAAA" }, pc)
 assert(sent_item and sent_item[F_USID].A == 1 and has_log("Meat (uid 1:0:0:0) sent to guest again"), "resend failed")
-handlers.RESEND({ "55:0:0:0" }, pc)
+handlers.RESEND({ "AAAANwAAAAAAAAAAAAAAAA" }, pc)
 assert(has_log("asked for item 55:0:0:0 again, which is not in their inventory here", "warn"), "unknown resend")
 -- drop report
 local before_n = inv[1].n

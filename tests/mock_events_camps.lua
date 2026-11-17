@@ -132,6 +132,7 @@ end
 
 -- ---------------------------------------------------------------- paths
 local SPAWN_FN = "/Script/Engine.GameplayStatics:BeginDeferredActorSpawnFromClass"
+local MDF = require("sdc_markerdata").F   -- S_MarkerData member names (BP_Marker keeps its look there since 17.11.2026)
 local MARKER_FN = "/Game/Prefabs/BP_PrefabSpawner.BP_PrefabSpawner_C:SpawnMarker"
 local EVENT_FN = "/Game/Prefabs/BP_PrefabSpawner.BP_PrefabSpawner_C:SpawnRandomEvent"
 local MARKER_P = "/Game/Blueprints/MinimapSystem/Blueprints/Marker/BP_Marker.BP_Marker_C"
@@ -206,7 +207,7 @@ local function engine(w)
             if not c or not c._actor then return nil end
             local t = tf.Translation
             local a = new(w, { c._name, "Actor" }, c._name .. "_" .. (2147400000 + #w.spawned),
-                { _loc = { X = t.X, Y = t.Y, Z = t.Z }, Role = 3 }, {})
+                { _loc = { X = t.X, Y = t.Y, Z = t.Z }, Role = 3, MarkerData = {} }, {})
             w.spawned[#w.spawned + 1] = a
             return a
         end,
@@ -354,9 +355,9 @@ local function spawn_camp(w, sp, opts)
     local mp = param(w.marker_cls)
     fire(w, SPAWN_FN, param(w.gps), param(sp), mp, param(tf))
     local m = new(w, { "BP_Marker_C", "Actor" }, "BP_Marker_C_" .. (2147430000 + #w.objects), {
-        _loc = sp._p._loc, MarkerTexture = sp._p["Marker Texture"], MarkerTitle = sp._p["Marker Title"],
-        MarkerDescription = sp._p["Marker Description"], ["Texture Size"] = { X = 3.5, Y = 3.5 },
-        Color = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, ["AddMarkerToCompass?"] = false })
+        _loc = sp._p._loc, MarkerDescription = sp._p["Marker Description"], MarkerData = {
+            [MDF.title] = sp._p["Marker Title"], [MDF.texture] = sp._p["Marker Texture"], [MDF.tex_size] = { X = 3.5, Y = 3.5 },
+            [MDF.color] = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, [MDF.compass] = false } })
     sp._p.Marker = m
     if opts.unfindable then w.paths[LVL .. m._name] = nil end
     fire(w, MARKER_FN, param(sp))
@@ -401,7 +402,7 @@ check(c_conv.findable == true, "the marker is found by its path")
 local sp_heli = new(HW, { "BP_PrefabSpawner_Dynamic_C", "BP_PrefabSpawner_C", "Actor" }, "BP_PrefabSpawner_Dynamic_C_17", {
     _loc = HELI, Role = 3, ["DynamicEvent?"] = true, ["Spawned?"] = true, Prefab = HW.apache })
 local m_heli = new(HW, { "BP_Marker_C", "Actor" }, "BP_Marker_C_2147439000", { _loc = HELI,
-    MarkerTitle = FText("Crashed Military Apache"), MarkerDescription = FText("y"), MarkerTexture = HW.lab_tex })
+    MarkerDescription = FText("y"), MarkerData = { [MDF.title] = FText("Crashed Military Apache"), [MDF.texture] = HW.lab_tex } })
 sp_heli._p.Marker = m_heli
 local hw_heli = register(HW, HW.map, m_heli)
 bind(HW); fire(HW, EVENT_FN, param(sp_heli))

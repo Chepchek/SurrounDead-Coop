@@ -273,6 +273,30 @@ T = T + 1; pm.tick()
 pp = 0
 for _, m in ipairs(sent) do if m.kind == "PPOS" and m.f[1] == 256 then pp = pp + 1 end end
 check(pp == 1, "PPOS of host sent to far client")
+-- the position goes again only when it moved 5 m or after 3 s
+local function ppos_n()
+  local n = 0
+  for _, m in ipairs(sent) do if m.kind == "PPOS" and m.f[1] == 256 then n = n + 1 end end
+  return n
+end
+sent = {}
+T = T + 1; pm.tick()
+check(ppos_n() == 0, "PPOS: the host stands still: nothing the next second")
+host_me.loc = { X = 300, Y = 0, Z = 100 }
+sent = {}
+T = T + 0.5; pm.tick()
+check(ppos_n() == 0, "PPOS: moved 3 m: still nothing")
+host_me.loc = { X = 700, Y = 0, Z = 100 }
+sent = {}
+T = T + 0.5; pm.tick()   -- (2 s after the last one: not the 3 s beat)
+check(ppos_n() == 1, "PPOS: moved 7 m since the last one sent: at once")
+sent = {}
+T = T + 1; pm.tick()
+T = T + 1; pm.tick()
+check(ppos_n() == 0, "PPOS: standing again, 2 s: nothing")
+T = T + 1.5; pm.tick()
+check(ppos_n() == 1, "PPOS: every 3 s even when it stands still (the client's copy would expire)")
+host_me.loc = { X = 0, Y = 0, Z = 100 }
 -- client unequips
 net.handlers.MYGPS({ "0" }, cpc)
 T = T + 1; pm.tick()
@@ -337,7 +361,7 @@ T = T + 1; pm.tick()
 check(W.actors[1].parent == hp.Mesh, "attached to host mesh when replicated")
 -- host leaves range (destroyed) and relay stale -> removed
 hp._valid = false
-T = T + 5; pm.tick()
+T = T + 9; pm.tick()   -- (a relayed position lives 8 s: the host repeats it every 3 s)
 check(W.actors[1]._valid == false, "marker removed when no pawn and no fresh relay")
 -- PEQUIP: compass slot -> written + HUD compass shown; GPS slot empty
 net.handlers.PEQUIP({ "", "/Game/Items/DA_Compass.DA_Compass" })

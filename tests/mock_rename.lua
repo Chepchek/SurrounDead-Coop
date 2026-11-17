@@ -275,7 +275,7 @@ check(#take("RNOPEN") == 0, "the host's own Rename: nothing sent (the game's win
 fire(F_SERVER, param(hbox1), param(OPT2), param(rpawn_h), param({}))
 local opens = take("RNOPEN")
 check(#opens == 1 and opens[1].to == rpc_h, "client's Rename: RNOPEN to that client")
-check(opens[1].msg == "SDC1|RNOPEN|Buildable_StorageCrate_C|100,200,300|11:22:-33:44", "RNOPEN names class, place, UID: " .. opens[1].msg)
+check(opens[1].msg == "SDC1|RNOPEN|Buildable_StorageCrate_C|100,200,300|AAAACwAAABb____fAAAALA", "RNOPEN names class, place, UID: " .. opens[1].msg)
 check(#host_hud_calls == 0, "host HUD untouched (the scope sent the game's window nowhere)")
 
 -- a window the host's HUD opened for that request (no scope) is closed
@@ -309,7 +309,7 @@ m0 = mark()
 cbox1:OverrideBuildName("My|Box 100%")   -- the window's Confirm
 local reqs = take("RNREQ")
 check(#reqs == 1 and reqs[1].to == "host", "client: its rename goes to the host (RNREQ)")
-check(reqs[1].msg == "SDC1|RNREQ|Buildable_StorageCrate_C|100,200,300|11:22:-33:44|My%7CBox 100%25",
+check(reqs[1].msg == "SDC1|RNREQ|Buildable_StorageCrate_C|100,200,300|AAAACwAAABb____fAAAALA|My%7CBox 100%25",
     "name escaped on the wire: " .. tostring(reqs[1] and reqs[1].msg))
 check(logged("renamed here to 'My|Box 100%'", m0) ~= nil, "client logs its rename")
 local ho = override_calls.host
@@ -364,14 +364,14 @@ m0 = mark()
 on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "7000,0,0", "", "X" }, rpc_h)
 check(logged("has no such container", m0) ~= nil and #take() == 0, "host: a container it does not have: nothing renamed")
 T = T + 0.1
-on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "11:22:-33:44", "Spam" }, rpc_h)
+on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "AAAACwAAABb____fAAAALA", "Spam" }, rpc_h)
 check(hbox1.ContainerName == cut, "host: a second request within 0.5 s is ignored")
 -- a grant (window opened for it) is enough from farther than REACH
 T = T + 1
 rpawn_h._p.__loc = { X = 9000, Y = 0, Z = 0 }
 on("host"); fire(F_SERVER, param(hbox1), param(OPT2), param(rpawn_h), param({}))
 take("RNOPEN")
-on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "11:22:-33:44", "Granted" }, rpc_h)
+on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "AAAACwAAABb____fAAAALA", "Granted" }, rpc_h)
 check(hbox1.ContainerName == "Granted", "host: the player it opened the window for may rename")
 deliver(take("RNAME"))
 check(cbox1.ContainerName == "Granted", "client: copy follows")
@@ -381,7 +381,7 @@ rpawn_h._p.__loc = { X = 150, Y = 200, Z = 300 }
 on("host")
 hbox3:OverrideBuildName("Ammo")   -- the host's window Confirm
 local hn = take("RNAME")
-check(#hn == 1 and hn[1].msg == "SDC1|RNAME|Buildable_StorageCrate_C|1000,0,0|3:3:3:3|Ammo", "host's rename: RNAME " .. tostring(hn[1] and hn[1].msg))
+check(#hn == 1 and hn[1].msg == "SDC1|RNAME|Buildable_StorageCrate_C|1000,0,0|AAAAAwAAAAMAAAADAAAAAw|Ammo", "host's rename: RNAME " .. tostring(hn[1] and hn[1].msg))
 deliver(hn)
 check(#take() == 0, "client: not here yet: kept, nothing sent")
 -- its copy replicates in later
@@ -439,7 +439,7 @@ deliver(snap)
 check(cbox2.ContainerName == "Guns", "client: copy without UID found by class and place")
 check(cbox1.ContainerName == "Granted" and cbox3b.ContainerName == "Ammo", "client: copies already named stay")
 -- a crate picked up and placed again at a named place (another UID) keeps its own name
-on("client"); client_handlers.RNAME({ "Buildable_StorageCrate_C", "3000,0,0", "4:4:4:4", "Old" }, client_pc)
+on("client"); client_handlers.RNAME({ "Buildable_StorageCrate_C", "3000,0,0", "AAAABAAAAAQAAAAEAAAABA", "Old" }, client_pc)
 check(cbox4.ContainerName == "Ящик", "client: another crate (other UID) at a named place keeps its name")
 T = T + 3.5
 tick("client", fresh)
@@ -457,7 +457,7 @@ on("host"); fire(F_SERVER, param(hbox1), param(OPT2), param(rpawn_h), param({}))
 check(#take() == 0, "off: no rename window sent")
 T = T + 1
 m0 = mark()
-on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "11:22:-33:44", "Off" }, rpc_h)
+on("host"); host_handlers.RNREQ({ "Buildable_StorageCrate_C", "100,200,300", "AAAACwAAABb____fAAAALA", "Off" }, rpc_h)
 check(hbox1.ContainerName == "Granted" and logged("world_rename or world_sync off", m0) ~= nil, "off: the host ignores a rename")
 on("client"); cbox1:OverrideBuildName("Local")
 check(#take() == 0, "off: the client sends nothing")

@@ -145,6 +145,7 @@ local function make_pc(local_player, loc)
         { Pawn = pawn, Player = player, NetConnection = (not local_player) and player or nil }, {
             ClientMessage = function(self, msg) W.out[#W.out + 1] = { pc = self, msg = msg } end,
             ClientRepObjRef = function(self, o) W.out[#W.out + 1] = { pc = self, obj = o } end,
+            ServerExecRPC = function(self, msg) W.out[#W.out + 1] = { pc = self, msg = msg, up = true } end,
         })
     return pc, pawn
 end
@@ -215,10 +216,26 @@ local function msgs(kind)
 end
 
 local function fresh_modules()
-    for _, m in ipairs({ "sdc_npc", "sdc_net", "sdc_ue", "sdc_config", "sdc_log" }) do package.loaded[m] = nil end
+    for _, m in ipairs({ "sdc_npc", "sdc_net", "sdc_ue", "sdc_config", "sdc_log", "sdc_dict", "sdc_netsync" }) do package.loaded[m] = nil end
     local cfg = require("sdc_config")
     cfg.values = {}
     return require("sdc_npc"), require("sdc_net")
+end
+
+-- NPCSET on the wire: NPCSET|defs|class|max|packed look[|name]
+local function decode_set(msg)
+    local _, f = require("sdc_net").decode(msg)
+    local d = require("sdc_dict").decoder("T")
+    d:receive(f[1])
+    return { cls = d:get(f[2]), max = f[3], look = require("sdc_npc").unpack_look(d, f[4] or ""), name = f[5], wire = #msg }
+end
+-- a client-phase message as the host would have sent it (its own encoder, definitions every time)
+local function wire_set(cls, max, look, name)
+    local dict = require("sdc_dict")
+    local e = dict.encoder("tester", "n")
+    local packed = require("sdc_npc").pack_look(e, look)
+    local c = e:ref(cls)
+    return "SDC1|NPCSET|" .. e:defs() .. "|" .. c .. "|" .. max .. "|" .. packed .. (name and ("|" .. name) or "")
 end
 
 -- ============================================================== host
@@ -230,6 +247,7 @@ local rpc, rpawn = make_pc(false, { X = 100000, Y = 0, Z = 0 })   -- the client,
 local S = { role = "host", remote_pcs = { rpc } }
 npc.install(S)
 npc.tick()
+check(net.PAIRED.NPCHP == true and net.NOW.NPCHP == true and net.PAIRED.NPCSET == true, "host: NPCHP is a PAIRED (and NOW) kind like NPCSET (its ClientRepObjRef must follow it directly)")
 check(W.hooks[BOSS .. ":MeleeAttack"] ~= nil, "host: boss MeleeAttack hook installed")
 check(W.hooks[ROCK .. ":Launch"] ~= nil, "host: rock Launch hook installed")
 check(W.hooks[BANDIT .. ":SetBurning"] ~= nil, "host: bandit SetBurning hook installed")
@@ -284,9 +302,12 @@ check(#msgs("NPCSET") == 0, "host: no NPCSET before the NPC was near for 1.5 s")
 advance(1.6); npc.tick()
 local sets = msgs("NPCSET")
 check(#sets == 1 and sets[1].obj == bandit, "host: NPCSET + objref after 1.5 s")
-local f = {}
-for part in (sets[1].msg .. "|"):gmatch("([^|]*)|") do f[#f + 1] = part end
-check(f[3] == "BP_Bandit_Ranged_Boss_C" and f[4] == "237" and f[5] == "200", "host: NPCSET class / max / health")
+local f = decode_set(sets[1].msg)
+check(f.cls == "BP_Bandit_Ranged_Boss_C" and f.max == "237", "host: NPCSET class / max")
+local hps = msgs("NPCHP")
+check(#hps == 1 and hps[1].msg == "SDC1|NPCHP|200" and hps[1].obj == bandit, "host: NPCHP|health + objref, right after the look")
+check(sets[1].msg:find("SK_Bandit_A", 1, true) ~= nil, "host: the first NPCSET carries the definitions of the paths")
+f[6] = f.look
 check(f[6]:find("Mesh=AI/Humans/Meshes/SK_Bandit_A.SK_Bandit_A,", 1, true) == 1, "host: look starts with the body mesh")
 check(f[6]:find("HairMesh=AI/Humans/Meshes/SM_Hair_1.SM_Hair_1,Polygon/Mat_04_C_Inst.Mat_04_C_Inst,", 1, true) ~= nil, "host: look has hair + material")
 check(f[6]:find("BackpackMesh=AI/Humans/Meshes/SM_Pack_1.SM_Pack_1,,1.0,-12.5,30.0,0.0,90.0,0.0,1.000,1.000,1.000", 1, true) ~= nil,
@@ -296,6 +317,10 @@ advance(1.0); npc.tick()
 check(#msgs("NPCSET") == 1, "host: not re-sent within 30 s")
 advance(30.0); npc.tick()
 check(#msgs("NPCSET") == 2, "host: in the first 2 minutes the NPC is re-sent every 30 s (its look may wait for an asset on the client)")
+check(msgs("NPCSET")[2].msg:find("SK_Bandit_A", 1, true) == nil and #msgs("NPCSET")[2].msg < #msgs("NPCSET")[1].msg // 2,
+    "host: the second NPCSET has no paths any more, only tokens (" .. #msgs("NPCSET")[2].msg .. " bytes instead of " .. #msgs("NPCSET")[1].msg .. ")")
+local again = decode_set(msgs("NPCSET")[2].msg)
+check(again.look == f.look and again.cls == f.cls and again.max == f.max, "host: the second NPCSET decodes to the very same look")
 advance(100.0); npc.tick()
 check(#msgs("NPCSET") == 2, "host: later the same NPCSET is not re-sent after 30 s")
 advance(100.0); npc.tick()
@@ -306,10 +331,10 @@ do
     for _ = 1, 360 do advance(1.0); npc.tick() end
     for i = keep_n + 1, #W.out do
         local e = W.out[i]
-        if e.msg and e.msg:find("^SDC1|NPCSET|") then n = n + 1; bytes = bytes + #e.msg end
+        if e.msg and (e.msg:find("^SDC1|NPCSET|") or e.msg:find("^SDC1|NPCHP|")) then n = n + 1; bytes = bytes + #e.msg end
     end
     for i = #W.out, keep_n + 1, -1 do W.out[i] = nil end
-    io.write(string.format("NETQ NPCSET idle (1 NPC near 1 client) msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
+    io.write(string.format("NETQ NPCSET+NPCHP idle (1 NPC near 1 client) msgs/min=%.1f bytes/min=%.0f", n / 6, bytes / 6), string.char(10))
 end
 -- client goes away -> restored; comes back -> sent again after 1.5 s
 rpawn._p._loc = { X = 300000, Y = 0, Z = 0 }
@@ -320,6 +345,64 @@ advance(1.0); npc.tick()
 check(#msgs("NPCSET") == 3, "host: back in range: waits 1.5 s")
 advance(1.6); npc.tick()
 check(#msgs("NPCSET") == 4, "host: back in range: sent again")
+-- the health on its own: under fire, one short NPCHP per pass while it moves, nothing while it stands
+do
+    local ai_c = bandit._p.BP_AIComponent
+    local hp0 = #msgs("NPCHP")
+    advance(1.0); npc.tick()
+    local base = #msgs("NPCHP")
+    check(base - hp0 <= 1, "host: health unchanged: no NPCHP spam")
+    advance(1.0); npc.tick()
+    check(#msgs("NPCHP") == base, "host: health still the same: nothing")
+    ai_c._p.Health = 150
+    advance(1.0); npc.tick()
+    local m = msgs("NPCHP")
+    check(#m == base + 1 and m[#m].msg == "SDC1|NPCHP|150" and m[#m].obj == bandit, "host: health 200 -> 150: NPCHP|150 alone, no look")
+    check(#msgs("NPCSET") == 4, "host: a hit does not resend the look")
+    ai_c._p.Health = 120
+    advance(1.0); npc.tick()
+    check(msgs("NPCHP")[#msgs("NPCHP")].msg == "SDC1|NPCHP|120", "host: next hit: NPCHP|120")
+    ai_c._p.Health = 200
+    -- a congested peer (silent / many bunches in flight): the health waits, the latest goes later
+    do
+        local real_congested = net.congested
+        local flag = true
+        net.congested = function() return flag end
+        advance(1.0); npc.tick()
+        local base = #msgs("NPCHP")
+        ai_c._p.Health = 160
+        advance(1.0); npc.tick(); advance(1.0); npc.tick()
+        check(#msgs("NPCHP") == base, "host: NPCHP to a congested peer is skipped")
+        flag = false
+        advance(1.0); npc.tick()
+        local m = msgs("NPCHP")
+        check(#m == base + 1 and m[#m].msg == "SDC1|NPCHP|160", "host: the peer is free again: the health skipped meanwhile (160) goes")
+        net.congested = real_congested
+        ai_c._p.Health = 200
+        advance(1.0); npc.tick()
+    end
+    -- a client that could not read an NPCSET (a token it has no definition for) asks (DICTQ); the host answers
+    -- (DICT) and tells that viewer about the NPC again
+    local before = #msgs("NPCSET")
+    advance(1.0); npc.tick()
+    local sets_before_heal, hps_before_heal = #msgs("NPCSET"), #msgs("NPCHP")
+    -- (a DICTQ from a LOOK, channel q: answered with DICT but no NPC is sent again)
+    net.handlers.DICTQ({ "q", "1" }, rpc)
+    advance(1.0); npc.tick()
+    check(#msgs("NPCSET") == sets_before_heal and #msgs("NPCHP") == hps_before_heal, "host: a DICTQ for a LOOK (q) does not resend any NPC")
+    before = #msgs("NPCSET")
+    net.handlers.DICTQ({ "n", "1" }, rpc)
+    local answered = {}
+    for _, m in ipairs(msgs("DICT")) do answered[#answered + 1] = m end
+    answered = { answered[#answered] }
+    check(#answered == 1 and answered[1].pc == rpc and answered[1].msg:find("^SDC1|DICT|1=") ~= nil, "host: DICTQ answered with DICT|1=<definition>")
+    advance(1.0); npc.tick()
+    check(#msgs("NPCSET") == before + 1, "host: after the DICTQ the NPC's look is sent again to that viewer")
+    check(msgs("NPCSET")[#msgs("NPCSET")].msg:find("|1=BP_Bandit_Ranged_Boss_C|", 1, true) ~= nil,
+        "host: ... with its own definition of the asked id (the DICTQ forgot what that viewer was thought to know)")
+    check(#msgs("NPCHP") > hps_before_heal and msgs("NPCHP")[#msgs("NPCHP")].obj == bandit,
+        "host: ... and its health again right after (heal reset sig and hp of that viewer's record)")
+end
 
 -- death roar once
 fire(BOSS .. ":DeathEvent", param(boss), param(nil))
@@ -353,7 +436,8 @@ local function deliver(msg, obj)
     net.handlers[kind](fields, cpc)
     if obj ~= false then fire(OBJREF, param(cpc), param(obj)) end
 end
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|237|200|" .. look, copy)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "237", look), copy)
+deliver("SDC1|NPCHP|200", copy)
 local ai = copy._p.BP_AIComponent
 check(ai._p.MaxHealth == 237 and ai._p.Health == 200, "client: MaxHealth / Health of the host")
 check(called(copy._p.Mesh, "SetSkinnedAssetAndUpdate") ~= nil and copy._p.Mesh._p.SkeletalMeshAsset == W.paths["/Game/AI/Humans/Meshes/SK_Bandit_A.SK_Bandit_A"],
@@ -363,19 +447,43 @@ check(copy._p.BackpackMesh._p.StaticMesh == W.paths["/Game/AI/Humans/Meshes/SM_P
 local rel = copy._p.BackpackMesh._p.RelativeLocation
 check(rel.Y == -12.5 and copy._p.BackpackMesh._p.RelativeRotation.Yaw == 90, "client: backpack transform of the host")
 local n_calls = #copy._p.Mesh._calls
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|237|180|" .. look, copy)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "237", look), copy)
+deliver("SDC1|NPCHP|180", copy)
 check(#copy._p.Mesh._calls == n_calls and ai._p.Health == 180, "client: same look not applied twice; health updated")
 -- wrong class / stale / nil
 local other = make_bandit({ X = 0, Y = 0, Z = 0 }, 1)
 other._chain = { "BP_Bandit_Melee_C", "BP_MasterBandit_C", "BP_MasterAICharacter_C" }
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|999|999|", other)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "999", ""), other)
 check(other._p.BP_AIComponent._p.MaxHealth ~= 999, "client: object of another class ignored")
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|999|999|", false)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "999", ""), false)
 advance(3.0)
 fire(OBJREF, param(cpc), param(copy))
 check(ai._p.MaxHealth == 237, "client: stale payload ignored")
-deliver("SDC1|NPCSET|BP_Bandit_Ranged_Boss_C|999|999|", nil)
+deliver(wire_set("BP_Bandit_Ranged_Boss_C", "999", ""), nil)
 check(ai._p.MaxHealth == 237, "client: no copy here: nothing")
+-- health before look: kept, applied when the look arrives
+do
+    local c2 = make_bandit({ X = 101500, Y = 0, Z = 0 }, 1, { max = 120, hp = 120 })
+    deliver("SDC1|NPCHP|77", c2)
+    check(c2._p.BP_AIComponent._p.Health == 120 and npc.stats.hp_held == 1, "client: NPCHP before the NPCSET: kept, not applied")
+    deliver("SDC1|NPCHP|70", c2)
+    deliver(wire_set("BP_Bandit_Ranged_Boss_C", "237", look), c2)
+    check(c2._p.BP_AIComponent._p.MaxHealth == 237 and c2._p.BP_AIComponent._p.Health == 70,
+        "client: the NPCSET arrives: MaxHealth, then the latest kept health (70, not 77)")
+    deliver("SDC1|NPCHP|50", c2)
+    check(c2._p.BP_AIComponent._p.Health == 50, "client: NPCHP after the NPCSET: applied at once")
+    -- an NPCSET with a token this client has no definition for: not applied, DICTQ asked, nothing else breaks
+    local c3 = make_bandit({ X = 101600, Y = 0, Z = 0 }, 1, { max = 120, hp = 120 })
+    local e = require("sdc_dict").encoder("tester-unknown", "n")
+    local packed = npc.pack_look(e, "Mesh=AI/Humans/Meshes/SK_Bandit_Q.SK_Bandit_Q,")
+    local cls_tok = e:ref("BP_Bandit_Ranged_Boss_C")
+    local out_n = #W.out
+    deliver("SDC1|NPCSET||" .. cls_tok .. "|237|" .. packed, c3)   -- the definitions were lost
+    check(npc.stats.set_unreadable == 1 and c3._p.BP_AIComponent._p.MaxHealth == 120, "client: unreadable NPCSET: nothing applied")
+    local asked = false
+    for i = out_n + 1, #W.out do if W.out[i].msg and W.out[i].msg:find("^SDC1|DICTQ|") then asked = true end end
+    check(asked, "client: ... and the host is asked for the definitions (DICTQ)")
+end
 -- fire
 deliver("SDC1|NPCFIRE|BP_Bandit_Ranged_Boss_C|1", copy)
 local sb = called(copy, "SetBurning")

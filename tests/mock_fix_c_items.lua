@@ -9,6 +9,7 @@
 -- usage: lua mock_fix_c_items.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -147,11 +148,11 @@ local to1, to2 = {}, {}
 for _, x in ipairs(m) do if x.pc == pc1 then to1[#to1 + 1] = x elseif x.pc == pc2 then to2[#to2 + 1] = x end end
 check(#m == 3 and #to1 == 2 and #to2 == 1, "B6: 3 messages for 4 ops x viewers (0.7.3: 5)")
 local a = to1[1] and to1[1].f or {}
-check(a[1] == "*" and a[2] == "500:0:0:0" and a[3] == "rm,7:0:0:0" and a[4] == "add,8:0:0:0" and a[5] == "cnt,9:0:0:0,4"
+check(a[1] == "*" and a[2] == "AAAB9AAAAAAAAAAAAAAAAA" and a[3] == "rm,AAAABwAAAAAAAAAAAAAAAA" and a[4] == "add,AAAACAAAAAAAAAAAAAAAAA" and a[5] == "cnt,AAAACQAAAAAAAAAAAAAAAA,4"
   and #a == 5, "B6: guest's message for crate 1: its three ops in their order")
 local b = to1[2] and to1[2].f or {}
-check(b[1] == "*" and b[2] == "700:0:0:0" and b[3] == "rm,5:0:0:0", "B6: guest's message for crate 2")
-check(to2[1] and to2[1].f[2] == "500:0:0:0" and #to2[1].f == 5, "B6: bob's message for crate 1 (he has only that one open)")
+check(b[1] == "*" and b[2] == "AAACvAAAAAAAAAAAAAAAAA" and b[3] == "rm,AAAABQAAAAAAAAAAAAAAAA", "B6: guest's message for crate 2")
+check(to2[1] and to2[1].f[2] == "AAAB9AAAAAAAAAAAAAAAAA" and #to2[1].f == 5, "B6: bob's message for crate 1 (he has only that one open)")
 sent = {}
 hooks[JIG .. "MC_ItemRemoved"](C(ch1), P(G(10)))
 delayed = {}   -- the delayed send never runs
@@ -199,7 +200,7 @@ items.client_tick()
 check(hooks[JIG .. "Jig_UnhandledEvent"] ~= nil and hooks[PFN .. "RequestServerData"] ~= nil, "B2: hooked once debug is on")
 log.debug_enabled = false
 
-print("B6c. the client applies a packed JMC in order; the single form still")
+print("B6c. the client applies a packed JMC in order")
 local jsi = { __name = "Crate_W", ContainerID = G(500) }
 local ops = {}
 local cchest = { __name = "CChestJig", __cls = "BP_JigComponent_C",
@@ -209,10 +210,10 @@ local cchest = { __name = "CChestJig", __cls = "BP_JigComponent_C",
   HandleClientMoveItemToIndex = function(_, g, to, idx, rot) ops[#ops + 1] = string.format("mv %d %d %d %s", g.A, to.A, idx, tostring(rot)) end,
   ClientUpdateCount = function(_, g, n) ops[#ops + 1] = string.format("cnt %d %d", g.A, n) end }
 hooks[JIG .. "CLIENT_ContainerDataResponse"](C(mycomp), P(arr({ G(500) })), P(arr({})), P(cchest), P(arr({})))
-handlers.JMC({ "*", "500:0:0:0", "mv,7:0:0:0,500:0:0:0,4,0", "cnt,9:0:0:0,3", "mv,8:0:0:0,500:0:0:0,2,1" })
+handlers.JMC({ "*", "AAAB9AAAAAAAAAAAAAAAAA", "mv,AAAABwAAAAAAAAAAAAAAAA,AAAB9AAAAAAAAAAAAAAAAA,4,0", "cnt,AAAACQAAAAAAAAAAAAAAAA,3", "mv,AAAACAAAAAAAAAAAAAAAAA,AAAB9AAAAAAAAAAAAAAAAA,2,1" })
 check(table.concat(ops, "; ") == "mv 7 500 4 false; cnt 9 3; mv 8 500 2 true", "B6c: three ops applied in order: " .. table.concat(ops, "; "))
 handlers.JMC({ "cnt", "500:0:0:0", "9:0:0:0", "2" })
-check(ops[4] == "cnt 9 2", "B6c: the single form (older host) applied")
+check(#ops == 3, "B6c: the old single form is not read any more")
 
 print("A4. death boxes on a client: names and paths, no engine objects kept")
 world.Container_DeadPlayerLoot_C = {}

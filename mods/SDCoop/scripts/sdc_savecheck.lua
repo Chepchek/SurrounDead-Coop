@@ -1432,7 +1432,7 @@ function M.prune_backups(keep)
 end
 
 -- After sdc_session copied SaveGames: check the copy, then prune.
-function M.after_backup(dst, code)
+function M.after_backup(dst, code, defer_prune)
     local ok = type(code) == "number" and code < 8
     local cur = ue.ems_current_slot()
     local dir = saves_dir()
@@ -1445,8 +1445,15 @@ function M.after_backup(dst, code)
     end
     log.info("[SAVE] backup %s: %s (robocopy exit %s, %s)", tostring(dst), ok and "ok" or "FAILED", tostring(code), verified)
     if ok then
-        local okp, err = pcall(M.prune_backups)
-        if not okp then log.err("[SAVE] backups: prune failed: %s", tostring(err)) end
+        local function prune()
+            local okp, err = pcall(M.prune_backups)
+            if not okp then log.err("[SAVE] backups: prune failed: %s", tostring(err)) end
+        end
+        -- defer_prune: the shells that list and remove old backups (~450 ms) run in a frame of their own
+        if defer_prune and type(ue.delay) == "function" and ue.delay("saves-prune", 3000, prune) ~= false then
+            return ok
+        end
+        prune()
     else
         log.warn("[SAVE] backups: old backups kept (this one did not succeed)")
     end

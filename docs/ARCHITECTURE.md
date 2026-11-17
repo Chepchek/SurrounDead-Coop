@@ -6,7 +6,7 @@ Every module starts with a header comment that explains the game mechanics it re
 ## The idea in one paragraph
 
 SurrounDead is a single-player Unreal Engine 5.6 game, but its Blueprints already contain listen-server RPCs (`Svr_*`, `MC_*`, `Client_*`), so movement, shooting and most of the inventory replicate by themselves once the world is opened with `?listen`.
-SDCoop is a UE4SS 3.0.1 Lua mod that turns the host's world into a listen server and then fixes everything the game does not replicate, or does only for "player 0".
+SDCoop is a UE4SS 4.0.0 Lua mod that turns the host's world into a listen server and then fixes everything the game does not replicate, or does only for "player 0".
 The host is authoritative: the client asks, the host runs the game's own function for the right player, and the result replicates (or is sent through the mod's message channel).
 The mod never ships game assets and never edits `.pak` files; it only calls the game's own functions.
 

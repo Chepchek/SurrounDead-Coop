@@ -11,7 +11,7 @@
   <a href="../../actions/workflows/check.yml"><img alt="check" src="https://img.shields.io/github/actions/workflow/status/Chepchek/SurrounDead-Coop/check.yml?style=flat-square&label=check"></a>
   <img alt="SurrounDead v0.8.0" src="https://img.shields.io/badge/SurrounDead-v0.8.0-2c3a28?style=flat-square">
   <img alt="Unreal Engine 5.6" src="https://img.shields.io/badge/Unreal%20Engine-5.6-2c3a28?style=flat-square&logo=unrealengine">
-  <img alt="UE4SS 3.0.1" src="https://img.shields.io/badge/UE4SS-3.0.1%20experimental-2c3a28?style=flat-square">
+  <img alt="UE4SS 4.0.0" src="https://img.shields.io/badge/UE4SS-4.0.0-2c3a28?style=flat-square">
   <img alt="Lua 5.4" src="https://img.shields.io/badge/Lua-5.4-2c3a28?style=flat-square&logo=lua">
   <img alt="Windows" src="https://img.shields.io/badge/platform-Windows-2c3a28?style=flat-square">
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-2c3a28?style=flat-square"></a>
@@ -165,7 +165,7 @@ Do not install it together with other mods that bring their own UE4SS: their ins
 
 Uninstall: delete `dwmapi.dll` and the `ue4ss` folder from `SurrounDead\Binaries\Win64`.
 
-**From source:** you need a UE4SS build that supports UE 5.6 (the mod was tested on v3.0.1 Experimental, build `4fb9b615`). Copy the `mods/SDCoop` folder into `SurrounDead\Binaries\Win64\ue4ss\Mods\` — the `enabled.txt` file enables the mod. The Steam helper is built from `tools/steamlink` with `powershell -ExecutionPolicy Bypass -File tools\steamlink\build.ps1 -Out <game folder>\SurrounDead\Binaries\Win64\ue4ss\Mods\SDCoop\steamlink` (it only needs .NET Framework 4, which comes with Windows).
+**From source:** you need a UE4SS build that supports UE 5.6 (the mod was tested on v4.0.0). Copy the `mods/SDCoop` folder into `SurrounDead\Binaries\Win64\ue4ss\Mods\` — the `enabled.txt` file enables the mod. The Steam helper is built from `tools/steamlink` with `powershell -ExecutionPolicy Bypass -File tools\steamlink\build.ps1 -Out <game folder>\SurrounDead\Binaries\Win64\ue4ss\Mods\SDCoop\steamlink` (it only needs .NET Framework 4, which comes with Windows).
 
 ## How to play
 

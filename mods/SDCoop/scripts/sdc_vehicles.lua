@@ -5184,6 +5184,8 @@ local function install_hooks()
                 log.info("vehicles: hook %s (post) ok%s%s", name, h.debug and " (debug)" or "",
                     n > 1 and string.format(" (try %d)", n) or "")
             elseif n == 1 then
+                -- what the class offers and why the function cannot be hooked
+                if ue.probe_hook then ue.probe_hook(h.path, "vehicles") end
                 log.warn("vehicles: hook %s (post) FAILED %s; tried again each tick (up to %d tries)", name, tostring(err),
                     HOOKS.MAX_TRIES)
             elseif n >= HOOKS.MAX_TRIES then

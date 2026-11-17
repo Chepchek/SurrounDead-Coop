@@ -10,6 +10,7 @@
 -- usage: lua mock_disasm_output.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -272,16 +273,16 @@ local function items_of(rc)
   table.sort(out)
   return table.concat(out, ",")
 end
--- (0.7.3: JMC|*|<key>|<op,args>|...: one entry per op, as the single form JMC|<op>|<key>|<args> was;
--- number-like args as numbers, as the host passed them before)
+-- (JMC|*|<key>|<op,args>|...: one entry per op; key and UIDs decoded from the short form;
+-- number-like args as numbers)
 local function sends(kind, op)
   local out = {}
   for _, s in ipairs(sent) do
     if s.kind == "JMC" and s.args[1] == "*" then
       for i = 3, #s.args do
         local one = {}
-        for part in (s.args[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = tonumber(part) or part end
-        table.insert(one, 2, s.args[2])
+        for part in (s.args[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = wire.uid_dec(part) or tonumber(part) or part end
+        table.insert(one, 2, wire.uid_dec(s.args[2]))
         if kind == "JMC" and (op == nil or one[1] == op) then out[#out + 1] = { pc = s.pc, kind = "JMC", args = one } end
       end
     elseif s.kind == kind and (op == nil or s.args[1] == op) then out[#out + 1] = s end
@@ -391,12 +392,12 @@ ccomp.GetOwner = function(self) return self.__owner end
 ccomp.LocalJSIContainers = arr({ { ContainerID = G1 }, { ContainerID = G2 } })
 ccomp.DeepSearchForItem = function(_, gg, out) if gs(gg) == "555:0:0:0" then out.ItemFound = cslot end end
 containers.note_open(ccomp, { G1, G2 })
-handlers.JMC({ "add", gs(G1), "555:0:0:0" })
+handlers.JMC({ "*", wire.uid_enc(gs(G1)), "add," .. wire.uid_enc("555:0:0:0") })
 T = T + 1
 run_delays()
 check(has_log("info", "555:0:0:0 added on the host is shown here in grid 2 of 2") ~= nil,
   "client log: the added result is shown in grid 2 of 2")
-handlers.JMC({ "add", gs(G1), "556:0:0:0" })
+handlers.JMC({ "*", wire.uid_enc(gs(G1)), "add," .. wire.uid_enc("556:0:0:0") })
 T = T + 1
 run_delays()
 check(#to_host == 1 and to_host[1].kind == "JADD", "a result not shown here is asked for (JADD)")
@@ -405,6 +406,168 @@ T = T + 2
 run_delays()
 check(has_log("info", "556:0:0:0 added on the host is shown here in grid 2 of 2 of Buildable_DisassemblyWorkbench_C_c (after asking)") ~= nil,
   "client log after the host's CLIENT_AddNewItem: grid 2 of 2")
+
+-- ============================================================ 6. a big station is worked in slices
+print("-- 6: six stacks, 10 ms each: the run goes on over several frames, not in one")
+S.role = "host"   -- (section 5 made it a client)
+T = T + 5
+calls, sent, dropped, logs = {}, {}, {}, {}
+local st6, comp6, IN6, OUT6 = new_station({ X = 0, Y = 0, Z = 0 })
+st6.CurrentActor = pawn
+world[#world + 1] = st6
+for i = 1, 6 do put(IN6, item(KNIFE, 1, IN6, 60 + i)) end
+containers.note_view(pawn, comp6)
+local plain_consume = comp6.SERVER_RequestConsumeItem
+comp6.SERVER_RequestConsumeItem = function(self, a, g, n)
+  T = T + 0.010
+  return plain_consume(self, a, g, n)
+end
+-- the other stations of the world are out of the player's reach now
+for i = #world, 1, -1 do if world[i] ~= st6 and world[i].__cls == "Buildable_DisassemblyWorkbench_C" then table.remove(world, i) end end
+local function consumed_n() local k = 0 for _, c in ipairs(calls) do if c[1] == "consume" then k = k + 1 end end return k end
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+check(consumed_n() >= 1 and consumed_n() < 6, "the first frame runs only a part of the stacks (" .. consumed_n() .. " of 6)")
+check(#sends("DISASMR") == 0, "no result message yet: the run is not finished")
+T = T + 1
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+check(has_log("warn", "still running") ~= nil and consumed_n() < 6, "a second click while it runs is refused")
+local frames, guard = 1, 0
+while consumed_n() < 6 and guard < 50 do
+  guard = guard + 1
+  local before = consumed_n()
+  T = T + 0.016
+  run_delays()
+  frames = frames + 1
+  check(consumed_n() - before <= 1, "frame " .. frames .. ": at most one 10 ms stack per frame (" .. (consumed_n() - before) .. ")")
+end
+T = T + 0.016
+run_delays()
+check(consumed_n() == 6 and #sends("DISASMR") == 1, "all six consumed, one DISASMR at the end (" .. consumed_n() .. ", " .. #sends("DISASMR") .. ")")
+check(frames >= 6, "it took " .. frames .. " frames")
+-- the station gone between two slices: the run stops, the lock is released
+T = T + 5
+calls, sent, logs = {}, {}, {}
+for i = 1, 4 do put(IN6, item(KNIFE, 1, IN6, 80 + i)) end
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local part_done = consumed_n()
+st6.__gone = true
+local real_valid = ue.valid
+ue.valid = function(o) if type(o) == "table" and o.__gone then return false end return real_valid(o) end
+T = T + 0.016
+run_delays()
+check(has_log("warn", "stopped half way") ~= nil and consumed_n() == part_done, "the station gone: the run stops (" .. consumed_n() .. " = " .. part_done .. ")")
+ue.valid = real_valid
+T = T + 5
+st6.__gone = nil
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+check(consumed_n() > part_done, "the lock was released: the next disassembly runs")
+
+-- ============================================================ 6b. the player acts between two slices
+print("-- 6b: an item taken out of the station between two slices is not paid for; sources go first; busy / gone")
+S.role = "host"
+do local g0 = 0 while #delayed > 0 and g0 < 80 do g0 = g0 + 1; T = T + 0.016; run_delays() end end   -- (section 6 left a run going)
+T = T + 5
+calls, sent, dropped, logs, notes_shown = {}, {}, {}, {}, {}
+local st8, comp8, IN8, OUT8 = new_station({ X = 0, Y = 0, Z = 0 })
+st8.CurrentActor = pawn
+for i = #world, 1, -1 do if world[i].__cls == "Buildable_DisassemblyWorkbench_C" then table.remove(world, i) end end
+world[#world + 1] = st8
+local its = {}
+for i = 1, 4 do its[i] = put(IN8, item(KNIFE, 1, IN8, 70 + i)) end
+containers.note_view(pawn, comp8)
+local plain8 = comp8.SERVER_RequestConsumeItem
+comp8.SERVER_RequestConsumeItem = function(self, a, g, n) T = T + 0.010; return plain8(self, a, g, n) end
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+check(calls[1] and calls[1][1] == "consume", "the source is consumed first, its outputs come after (" .. tostring(calls[1] and calls[1][1]) .. ")")
+T = T + 1
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local told = false
+for _, t in ipairs(notes_shown) do if t:find("busy", 1, true) then told = true end end
+check(told, "the second click is told that the station is busy (on its screen)")
+-- the player pulls item 3 out of the station now
+for i, it in ipairs(IN8[F_ITEMS].items) do if it == its[3] then table.remove(IN8[F_ITEMS].items, i) break end end
+local g8 = 0
+while #delayed > 0 and g8 < 60 do g8 = g8 + 1; T = T + 0.016; run_delays() end
+local c8 = 0
+for _, c in ipairs(calls) do if c[1] == "consume" then c8 = c8 + 1 end end
+check(c8 == 3, "three consumed, the one taken out is not (" .. c8 .. ")")
+local scrap = 0
+for _, it in ipairs(OUT8[F_ITEMS].items) do if it[F_INFO][F_ITEMID] == SCRAP then scrap = scrap + it[F_INFO][F_COUNT] end end
+check(scrap == 3, "ScrapMetal x3 given, not x4 (" .. scrap .. ")")
+check(has_log("info", "no longer in the station") ~= nil, "logged as skipped")
+check(#sends("DISASMR") == 1, "the result message still goes out")
+-- the player leaves between two slices: stopped, finish logged, no message to a gone player
+T = T + 5
+calls, sent, logs = {}, {}, {}
+for i = 1, 4 do put(IN8, item(KNIFE, 1, IN8, 80 + i)) end
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local c9 = 0
+for _, c in ipairs(calls) do if c[1] == "consume" then c9 = c9 + 1 end end
+pawn.Controller = nil   -- disconnected: the pawn object is still "valid"
+T = T + 0.016
+run_delays()
+pawn.Controller = pc
+check(has_log("warn", "stopped half way") ~= nil, "a player who is gone: stopped (the actor itself was still valid)")
+check(has_log("info", "disassembled at") ~= nil, "the finish line is still logged")
+check(#sends("DISASMR") == 0, "no DISASMR to the gone player")
+local g9 = 0
+while #delayed > 0 and g9 < 20 do g9 = g9 + 1; T = T + 0.016; run_delays() end
+-- a lost timer: the lock is cleared after 10 s
+T = T + 5
+calls, logs = {}, {}
+for i = 1, 4 do put(IN8, item(KNIFE, 1, IN8, 90 + i)) end
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local c10 = 0
+for _, c in ipairs(calls) do if c[1] == "consume" then c10 = c10 + 1 end end
+delayed = {}   -- the slice timer is lost
+T = T + 1
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local c11 = 0
+for _, c in ipairs(calls) do if c[1] == "consume" then c11 = c11 + 1 end end
+check(c11 == c10, "within 10 s the lock still refuses")
+T = T + 11
+handlers.DISASM({ "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc)
+local c12 = 0
+for _, c in ipairs(calls) do if c[1] == "consume" then c12 = c12 + 1 end end
+check(c12 > c11 and has_log("warn", "its lock is cleared") ~= nil, "after 10 s the lock is cleared and the next disassembly runs")
+do local g1 = 0 while #delayed > 0 and g1 < 80 do g1 = g1 + 1; T = T + 0.016; run_delays() end end
+
+-- ============================================================ 7. STABLE: the recipe table is set once
+print("-- 7: a client's recipe table message sets the list on the host once, not at every window / craft check")
+S.role = "host"
+T = T + 5
+local sets, finds = {}, 0
+local GFL_PATH = "/Game/Blueprints/GameFunctionLibrary.Default__GameFunctionLibrary_C"
+local gfl = { SetItemsToCraft = function(_, t, c)
+  sets[#sets + 1] = t
+  c.ItemsToCraft = arr({ 1, 2, 3, 4, 5 })
+end }
+local plain_find_object, plain_find_all = ue.find_object, ue.find_all
+ue.find_object = function(path) if path == GFL_PATH then return gfl end return nil end
+ue.find_all = function(cls) finds = finds + 1; return plain_find_all(cls) end
+local st7, comp7 = new_station({ X = 0, Y = 0, Z = 0 })
+st7.CurrentActor = pawn
+for i = #world, 1, -1 do if world[i].__cls == "Buildable_DisassemblyWorkbench_C" then table.remove(world, i) end end
+world[#world + 1] = st7
+comp7.ItemsToCraft = arr({})
+local function stable(t) handlers.STABLE({ tostring(t), "/Game/Maps/Station7", "Buildable_DisassemblyWorkbench_C", "0", "0", "0" }, pc) end
+stable(2)
+check(#sets == 1 and sets[1] == 2, "the first message sets table 2 on the host")
+check(finds == 1, "the station was looked for once (" .. finds .. ")")
+stable(2)
+stable(2)
+check(#sets == 1, "the same table again (window opened, craft checked): SetItemsToCraft is not run again (" .. #sets .. ")")
+check(finds == 1, "the station is remembered by its path: no second search (" .. finds .. ")")
+check(stations.stats.table_skipped == 2, "two skipped")
+stable(1)
+check(#sets == 2 and sets[2] == 1, "another table (the bench switched): set")
+comp7.ItemsToCraft = arr({})
+stable(1)
+check(#sets == 3, "the list was emptied on the host: set again")
+st7.__valid = false
+stable(1)
+check(finds == 2, "the station is gone: looked for again (" .. finds .. ")")
+ue.find_object, ue.find_all = plain_find_object, plain_find_all
 
 print(string.format("disassembly output: %d passed, %d failed", checks - fails, fails))
 print(fails == 0 and "ALL OK" or "FAILED")

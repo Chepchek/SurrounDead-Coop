@@ -98,7 +98,8 @@
 --                                                    (on change, to a client after its HI,
 --                                                    to everybody every 10 s)
 --   host -> client : PPOS|<player id>|<x>|<y>|<z>    any player more than 100 m away
---                                                    from that client (1 Hz)
+--                                                    from that client (on a move of 5 m, else every 3 s;
+--                                                    a joiner gets it at once)
 --   host -> client : PEQUIP|<GPS item>|<compass item> the client's own GPS / compass slot
 --                                                    (data asset paths, "" = empty;
 --                                                    on change and every 10 s)
@@ -114,6 +115,8 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local netsync = require("sdc_netsync")
+local wire = require("sdc_wire")
 
 local M = {
     stats = { tags = 0, markers = 0, proxies = 0, relayed = 0 },
@@ -171,7 +174,9 @@ local PALETTE = {
 local GPS_RESEND_S = 60    -- the verify (a change goes at once)
 local INFO_RESYNC_S = 60   -- the verify (a change of a name / GPS / slot goes at once, a joiner gets the table after its HI)
 local RELAY_FAR_CM = 10000      -- relay positions to clients farther than 100 m
-local RELAY_MAX_AGE_S = 4.0
+local RELAY_MAX_AGE_S = 8.0     -- a relayed position this old is dropped (the host repeats it every PPOS_BEAT_S)
+local PPOS_BEAT_S = 3           -- host: a far player's position goes again at least this often ...
+local PPOS_MOVE_CM = 500        -- ... and at once when it moved this far since the last one sent (5 m)
 local NAME_LINGER_S = 0.75
 local MAP_MARKER_SCALE = 1.0    -- on-screen size of a map marker (its design size = 1)
 local DEFAULT_NAME = "Игрок"
@@ -200,7 +205,7 @@ local warned = {}
 -- [remote player key] tables; hud_warned = the character last warned about
 local function new_host_state()
     return { client_gps = {}, synced = {}, sig = {}, equip_sent = {}, equip_at = {}, hud_warned = {}, cvars = {},
-             last_resync = -1000 }
+             last_resync = -1000, ppos = {} }
 end
 host = new_host_state()
 
@@ -732,6 +737,7 @@ local function host_tick(now)
         if not (S.remote or {})[key] then
             host.synced[key], host.client_gps[key], host.sig[key] = nil, nil, nil
             host.equip_sent[key], host.equip_at[key], host.hud_warned[key] = nil, nil, nil
+            host.ppos[key] = nil
         end
     end
 
@@ -746,9 +752,19 @@ local function host_tick(now)
                     local cp = ue.pawn_of(pc)
                     local cl = cp and ue.location(cp)
                     if not cl or dist(cl, loc) > RELAY_FAR_CM then
-                        net.send_to(pc, "PPOS", id, string.format("%.0f", loc.X),
-                            string.format("%.0f", loc.Y), string.format("%.0f", loc.Z))
-                        M.stats.relayed = M.stats.relayed + 1
+                        -- on a move of PPOS_MOVE_CM, else every PPOS_BEAT_S; a new peer (a joiner, a
+                        -- reconnect: sdc_netsync has no record of it) gets it at once
+                        local peer = ue.name(pc)
+                        local told = host.ppos[peer]
+                        if not told then told = {}; host.ppos[peer] = told end
+                        local last = told[id]
+                        local nk = "PPOS:" .. id
+                        if (not last or dist(last, loc) > PPOS_MOVE_CM or netsync.due(peer, nk, "1", PPOS_BEAT_S))
+                            and net.send_to(pc, "PPOS", id, wire.num(loc.X, 0), wire.num(loc.Y, 0), wire.num(loc.Z, 0)) then
+                            netsync.mark(peer, nk, "1")
+                            told[id] = { X = loc.X, Y = loc.Y, Z = loc.Z }
+                            M.stats.relayed = M.stats.relayed + 1
+                        end
                     end
                 end
             end
@@ -1819,6 +1835,19 @@ function MK.on_req(f, pc)
     local x, y, z = tonumber(f[1]), tonumber(f[2]), tonumber(f[3])
     if not (x and y) then return end
     local id = pc_id(pc)
+    -- The same click comes in a burst (the client's retries and the game's own repeat): one answer
+    -- is enough and every request costs a full scan here.
+    MK.req_at = MK.req_at or {}
+    local key = string.format("%s|%.0f,%.0f,%s", tostring(id), x, y, z and string.format("%.0f", z) or "-")
+    local seen = MK.req_at[key]
+    if seen and now - seen < 2 then return end
+    if seen then
+        MK.req_at[key] = now
+    else
+        local n = 0
+        for _ in pairs(MK.req_at) do n = n + 1 end
+        if n >= 200 then MK.req_at = { [key] = now } else MK.req_at[key] = now end
+    end
     local r = MK.remote_of(pc)
     local name = MK.name_for(id, r and r.name)
     local p = ue.pawn_of(pc)

@@ -552,8 +552,14 @@ function M.host_tick(remote_pcs)
     end
     for _, f in ipairs(FEATURES) do
         if f.on and f.mod.host_tick then
-            local ok, err = pcall(f.mod.host_tick, now)
-            if not ok then log.err_throttled("ai.tick." .. f.id, "ai: %s host tick: %s", f.id, tostring(err)) end
+            -- timed as its own part (h:ai.<feature>: the worst call shows in [PERF] "parts")
+            local ok, err
+            if ue.sub_time then
+                ok = ue.sub_time("h:ai." .. f.id, f.mod.host_tick, now)
+            else
+                ok, err = pcall(f.mod.host_tick, now)
+                if not ok then log.err_throttled("ai.tick." .. f.id, "ai: %s host tick: %s", f.id, tostring(err)) end
+            end
         end
     end
 end

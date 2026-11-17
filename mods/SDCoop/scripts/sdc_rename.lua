@@ -59,6 +59,7 @@
 -- first UID of its main containers (BP_JigMultiplayer.MainContainersIDs,
 -- replicated and saved; sdc_containers' key) when this machine knows it.
 -- Messages:
+--   (uid: the short form of sdc_wire, "" = unknown)
 --   RNOPEN|class|x,y,z|uid            host -> client
 --   RNREQ|class|x,y,z|uid|name        client -> host
 --   RNAME|class|x,y,z|uid|name        host -> client(s)
@@ -76,6 +77,7 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- container UIDs on the wire: 22 characters, not 43
 local ctx = require("sdc_ctx")
 
 local M = {
@@ -300,7 +302,7 @@ local function broadcast(box, why)
     if not cls then return end
     local name = clean(name_of(box))
     local pcs = S.remote_pcs or {}
-    if #pcs > 0 then net.broadcast(pcs, "RNAME", cls, loc, uid, esc(name)) end
+    if #pcs > 0 then net.broadcast(pcs, "RNAME", cls, loc, wire.uid_enc(uid), esc(name)) end
     M.stats.names_sent = M.stats.names_sent + #pcs
     log.info("rename: host: %s (%s at %s) is now '%s' (%s): RNAME to %d client(s)", ue.short(box), cls, loc, name,
         why, #pcs)
@@ -329,7 +331,7 @@ local function on_server_interact(c, opt_p, by_p)
             ue.short(box), ue.short(by))
     end
     st.grants[addr(pc) or -1] = { cls = cls, loc = parse_loc(loc), at = clock() }
-    net.send_to(pc, "RNOPEN", cls, loc, uid)
+    net.send_to(pc, "RNOPEN", cls, loc, wire.uid_enc(uid))
     M.stats.opens_sent = M.stats.opens_sent + 1
     log.info("rename: host: %s chose Rename on %s (%s at %s, '%s'): the game's window opens on that player's screen (RNOPEN)",
         ue.short(by), ue.short(box), cls, loc, name_of(box))
@@ -343,7 +345,7 @@ local function req_msg(f, pc)
         log.info("rename: host: rename from %s ignored (world_rename or world_sync off)", who)
         return
     end
-    local cls, loc, uid, name = f[1], parse_loc(f[2]), f[3] or "", clean(unesc(f[4]))
+    local cls, loc, uid, name = f[1], parse_loc(f[2]), wire.uid_dec(f[3]) or "", clean(unesc(f[4]))
     if type(cls) ~= "string" or cls == "" or not loc then return end
     local k = addr(pc) or -1
     local now = clock()
@@ -366,7 +368,7 @@ local function req_msg(f, pc)
         M.stats.req_refused = M.stats.req_refused + 1
         local bc, bl, bu = wire_of(box)
         local cur = clean(name_of(box))
-        if bc then net.send_to(pc, "RNAME", bc, bl, bu, esc(cur)) end
+        if bc then net.send_to(pc, "RNAME", bc, bl, wire.uid_enc(bu), esc(cur)) end
         log.warn("rename: host: %s's rename of %s to '%s' refused (%s): it keeps '%s'", who, ue.short(box), name,
             name == "" and "empty name" or "not near it and no window opened for it", cur)
         return
@@ -388,7 +390,7 @@ local function snap_msg(_, pc)
             local name, def = clean(name_of(box)), default_name(box)
             if name ~= "" and def ~= nil and name ~= clean(def) then
                 local cls, loc, uid = wire_of(box)
-                if cls then items[#items + 1] = table.concat({ cls, loc, uid, esc(name) }, "!") end
+                if cls then items[#items + 1] = table.concat({ cls, loc, wire.uid_enc(uid), esc(name) }, "!") end
             end
         end
     end
@@ -432,7 +434,7 @@ end
 -- RNOPEN|class|x,y,z|uid (host -> client): the game's rename window here.
 local function open_msg(f)
     if not S or S.role ~= "client" or not on() then return end
-    local cls, loc, uid = f[1], parse_loc(f[2]), f[3] or ""
+    local cls, loc, uid = f[1], parse_loc(f[2]), wire.uid_dec(f[3]) or ""
     if type(cls) ~= "string" or cls == "" or not loc then return end
     local box = find_box(cls, loc, uid)
     if not box then
@@ -477,10 +479,10 @@ end
 -- client): the host's names.
 local function name_msg(f)
     if not S or S.role ~= "client" or not on() then return end
-    if f[2] ~= nil then return name_one(f[1], f[2], f[3] or "", clean(unesc(f[4]))) end
+    if f[2] ~= nil then return name_one(f[1], f[2], wire.uid_dec(f[3]) or "", clean(unesc(f[4]))) end
     for e in tostring(f[1] or ""):gmatch("[^;]+") do
         local cls, at, uid, name = e:match("^([^!]+)!([^!]+)!([^!]*)!(.*)$")
-        if cls then name_one(cls, at, uid, clean(unesc(name))) end
+        if cls then name_one(cls, at, wire.uid_dec(uid) or "", clean(unesc(name))) end
     end
 end
 
@@ -536,7 +538,7 @@ local function on_override(c)
         local name = clean(name_of(box))
         if name == "" then return end
         remember(cls, parse_loc(loc), uid, name)
-        net.send_to_host("RNREQ", cls, loc, uid, esc(name))
+        net.send_to_host("RNREQ", cls, loc, wire.uid_enc(uid), esc(name))
         M.stats.req_sent = M.stats.req_sent + 1
         log.info("rename: %s (%s at %s) renamed here to '%s': the host renames its copy (RNREQ)", ue.short(box), cls,
             loc, name)

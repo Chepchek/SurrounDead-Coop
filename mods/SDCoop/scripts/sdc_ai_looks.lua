@@ -65,7 +65,9 @@
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
+local cfg = require("sdc_config")
 local net = require("sdc_net")
+local dict = require("sdc_dict")
 local zi = require("sdc_ai_zombie")
 
 local M = {
@@ -125,12 +127,17 @@ local NO_ROLL_S = 5             -- client: a copy this old that never rolled is 
 local APPLY_WINDOW_S = 0.1      -- event path: at most APPLY_PER_WINDOW full applies per 100 ms
 local APPLY_PER_WINDOW = 2
 local PASS_APPLY_MAX = 4        -- deferred / retried applies per client pass
-local PASS_BUDGET_S = 0.025     -- ... and no further one once the pass ran this long (the rest: next pass)
+local PASS_BUDGET_S = 0.008     -- ... and no further apply or visit once the pass ran this long (the rest: next pass;
+                                -- 14.11: 0.025 s of applies and 64 visits made a tick of 103 / 166 ms)
+local SPLIT_S = 0.02            -- an apply that has run this long after its mesh / material (bones, blendspace, body)
+                                -- leaves the rest to the next pass (the steps are idempotent), at most twice
 local CPASS_BUSY_S = 1.0        -- client pass interval while applies wait
 local RETRY_S = 2.0             -- a part whose asset is not in memory here is looked for again after this
 local RETRY_FOR_S = 600         -- ... for this long (0.8.1: 120 s)
 local DEFER_TTL = 30
-local SLOW_APPLY_S = 0.05       -- an apply longer than this is logged
+local SLOW_APPLY_S = 0.02       -- an apply longer than this is logged
+local DONE_KEEP_S = 30          -- a look found equal to the host's is not looked at again this long
+local SLOW_WARN_MS = 100        -- ... and a repeat that changed nothing is a debug line below this
 -- client: mesh / material paths applied in this game process (the slow-apply
 -- line tells a first use - render resources, shaders built on that PC - from
 -- a repeat; the friend's 65-89 ms per zombie, cause unknown); strings only
@@ -148,6 +155,7 @@ local asked_by = {}    -- host: [pc full name] = { t = window start, n = questio
 local rolled = {}      -- client: [copy full name] = clock (own SelectArchetype seen)
 local pend = {}        -- client: [copy full name] = { snap, t }
 local applied = {}     -- client: [copy full name] = snapshot
+local look_done = {}   -- client: [copy full name] = { k = a look found equal here, t = clock }
 local born = {}        -- client: [copy full name] = clock (BeginPlay or first seen)
 local zeroed = {}      -- client: [copy full name] = true
 local asks = {}        -- client: [copy full name] = { n, t }
@@ -203,9 +211,16 @@ local function snapshot(z, key)
     return s
 end
 
+-- AIAPP|arch|mesh|material|bones|name|blendspace|body|age|name form|defs: the
+-- long strings (asset paths, bones, name) as sdc_dict tokens, <defs> the
+-- definitions this client lacks (a horde of 30: the first look has them, the
+-- others only ids).
 local function send_look(pc, z, snap)
-    return core.send_with_obj(pc, z, "AIAPP", snap.arch, snap.mesh, snap.mat, snap.bones, snap.name, snap.bs,
-        snap.body, snap.age, snap.nf or "?")
+    local e = dict.encoder(ue.name(pc), "n")
+    local ok = core.send_with_obj(pc, z, "AIAPP", snap.arch, e:ref(snap.mesh), e:ref(snap.mat), e:ref(snap.bones),
+        e:ref(snap.name), e:ref(snap.bs), snap.body, snap.age, snap.nf or "?", e:defs())
+    if ok then e:commit() end
+    return ok
 end
 
 -- BP_MasterZombie.Archetype_*, post (host)
@@ -584,7 +599,57 @@ local function stop_emerge(z, mesh, snap, changed)
     end
 end
 
-local function apply(z, snap, why)
+-- The slow-apply line: which steps, and whether a mesh / material is a first use on this PC.
+local function fresh_assets(snap)
+    local fresh = {}
+    for _, p in ipairs({ snap.mesh or "", snap.mat or "" }) do
+        if p ~= "" and not used_assets.t[p] then
+            fresh[#fresh + 1] = zi.short_asset(p)
+            if used_assets.n >= USED_MAX then used_assets.t, used_assets.n = {}, 0 end
+            used_assets.t[p], used_assets.n = true, used_assets.n + 1
+        end
+    end
+    return fresh
+end
+
+local function slow_note(z, snap, why, dt, changed, steps, fresh, tail)
+    M.stats.slow = M.stats.slow + 1
+    if cfg.get("ai_looks_slow_log") == false then return end
+    -- a repeat that found nothing to change and did not hold the game: one debug line
+    if #changed == 0 and dt * 1000 < SLOW_WARN_MS then
+        log.debug("ai: looks: %s: the host's look read again in %.0f ms, nothing to change (%s)", ue.short(z),
+            dt * 1000, why)
+        return
+    end
+    log.warn("ai: looks: applying the host's look to %s took %.0f ms (%s; mesh=%s mat=%s; changed: %s; ms: %s;"
+        .. " first use here: %s%s)", ue.short(z), dt * 1000, why, zi.short_asset(snap.mesh), zi.short_asset(snap.mat),
+        #changed > 0 and table.concat(changed, " ") or "nothing", table.concat(steps, ", "),
+        #fresh > 0 and table.concat(fresh, " ") or "none", tail and ("; " .. tail) or "")
+end
+
+-- What is compared for "the same look": everything the apply sets, no seq / age
+-- (those change with every message and with the clock).
+local function look_key(snap)
+    return table.concat({ snap.mesh or "", snap.mat or "", snap.bones or "", snap.name or "", snap.bs or "",
+                          snap.body or "", snap.arch or "", snap.nf or "" }, "|")
+end
+
+local function apply(z, snap, why, carry)
+    -- The same look, already found equal on this copy: the reads below (two asset
+    -- paths, ~20 ms each on some PCs) tell nothing new. A roll, a deferred pass or
+    -- a horde copy (its emerge montage) always runs; after DONE_KEEP_S one full
+    -- check happens again, so a look the game replaced on its own comes back.
+    if not carry and why == "look" and ue.class_name(z) ~= HORDE then
+        local dk0 = ue.name(z)
+        local done = look_done[dk0]
+        if done and done.k == look_key(snap) and clock() - done.t < DONE_KEEP_S then
+            M.stats.same_skipped = (M.stats.same_skipped or 0) + 1
+            return
+        end
+    end
+    -- carry: { parts, ms, steps } of the earlier runs of this apply that were cut (the slow-apply line adds them up)
+    local parts = carry and carry.parts or 0
+    local spent = carry and carry.ms or 0
     local mesh = ue.prop(z, "Mesh")
     if not ue.valid(mesh) then return end
     local dkey = ue.name(z)
@@ -593,12 +658,30 @@ local function apply(z, snap, why)
     local t0 = clock()
     -- step times for the slow-apply line (which part of it is slow on a PC)
     local tl, steps = t0, {}
+    if carry then for i, x in ipairs(carry.steps) do steps[i] = x end end
     local function step(n)
         local t = clock()
         steps[#steps + 1] = string.format("%s %.0f", n, (t - tl) * 1000)
         tl = t
     end
     local changed, miss = {}, {}
+    if carry then for i, x in ipairs(carry.changed) do changed[i] = x end end
+    -- a long apply goes on in a later pass: what is done stays done, the next run finds it equal and skips it
+    local function cut(where)
+        local cur = deferred[dkey]
+        if cur and (cur.snap.seq or 0) > (snap.seq or 0) then return false end   -- a newer look waits already
+        if parts >= 2 or clock() - t0 < SPLIT_S then return false end
+        local fresh = fresh_assets(snap)
+        if carry then for _, x in ipairs(carry.fresh) do table.insert(fresh, 1, x) end end
+        deferred[dkey] = { snap = snap, why = (why:gsub(", deferred.*$", "")), t = clock(),
+                           carry = { parts = parts + 1, ms = spent + (clock() - t0), steps = steps, changed = changed,
+                                     fresh = fresh } }
+        M.stats.cut = (M.stats.cut or 0) + 1
+        if clock() - t0 > SLOW_APPLY_S then
+            slow_note(z, snap, why, clock() - t0, changed, steps, fresh, "cut after " .. where .. ", the rest in the next pass")
+        end
+        return true
+    end
     local own_name = ue.str(ue.prop(z, "Name"))
     if snap.mesh ~= "" and zi.obj_path(zi.mesh_asset(mesh)) ~= snap.mesh then
         local a = asset(snap.mesh, "SkeletalMesh")
@@ -627,6 +710,7 @@ local function apply(z, snap, why)
         end
     end
     step("mat")
+    if cut("mat") then return end
     if snap.bones ~= "?" then
         local want = {}
         for b in snap.bones:gmatch("[^,]+") do want[b] = true end
@@ -657,6 +741,7 @@ local function apply(z, snap, why)
     local body = apply_body(z, mesh, snap.b)
     if body then changed[#changed + 1] = "body hh=" .. tostring(snap.b.hh) end
     step("body")
+    if cut("body") then return end
     fix_armour(z, mesh, own_name, snap, changed)
     remove_leftovers(z, zi.arch_of(z, own_name), snap.arch, changed)
     add_effects(z, mesh, snap.arch, changed, miss)
@@ -683,6 +768,12 @@ local function apply(z, snap, why)
     applied[key] = snap
     M.stats.applied = M.stats.applied + 1
     local now = clock()
+    -- (found equal and nothing missing: a repeat of this look is not read again)
+    if #miss == 0 and #changed == 0 then
+        look_done[key] = { k = look_key(snap), t = now }
+    else
+        look_done[key] = nil
+    end
     if #miss > 0 then
         local w = waiting[key]
         local same = w and w.text == snap.text
@@ -704,21 +795,11 @@ local function apply(z, snap, why)
         say("ai: looks: %s looks like the host's (%s, arch=%s, changed: %s)", ue.short(z), why, snap.arch,
             #changed > 0 and table.concat(changed, " ") or "nothing")
     end
-    local dt = now - t0
-    local fresh = {}
-    for _, p in ipairs({ snap.mesh or "", snap.mat or "" }) do
-        if p ~= "" and not used_assets.t[p] then
-            fresh[#fresh + 1] = zi.short_asset(p)
-            if used_assets.n >= USED_MAX then used_assets.t, used_assets.n = {}, 0 end
-            used_assets.t[p], used_assets.n = true, used_assets.n + 1
-        end
-    end
-    if dt > SLOW_APPLY_S then
-        M.stats.slow = M.stats.slow + 1
-        log.warn("ai: looks: applying the host's look to %s took %.0f ms (%s; mesh=%s mat=%s; changed: %s; ms: %s;"
-            .. " first use here: %s)", ue.short(z), dt * 1000, why, zi.short_asset(snap.mesh), zi.short_asset(snap.mat),
-            #changed > 0 and table.concat(changed, " ") or "nothing", table.concat(steps, ", "),
-            #fresh > 0 and table.concat(fresh, " ") or "none")
+    -- (a cut apply reported its slow first part when it was cut; its total only when this run is slow too)
+    local fresh = fresh_assets(snap)
+    if carry then for _, x in ipairs(carry.fresh) do table.insert(fresh, 1, x) end end
+    if now - t0 > SLOW_APPLY_S then
+        slow_note(z, snap, why, now - t0 + spent, changed, steps, fresh)
     end
 end
 
@@ -791,8 +872,18 @@ end
 -- for its zombie. The name form ("?" unknown; absent from an older host).
 local function on_aiapp(f)
     if core.S.role ~= "client" then return end
-    local snap = { arch = f[1] or "-", mesh = f[2] or "", mat = f[3] or "", bones = f[4] or "?", name = f[5] or "",
-                   bs = f[6] or "", body = f[7] or "", age = f[8] or "" }
+    local d = dict.decoder("host", nil, "n")
+    d:receive(f[10])
+    local mesh, mat, bones, name, bs = d:get(f[2] or ""), d:get(f[3] or ""), d:get(f[4] or "?"), d:get(f[5] or ""),
+        d:get(f[6] or "")
+    if d:incomplete() then
+        -- an id this machine does not know: the definitions are asked for and the host
+        -- sends the look again (dict.on_heal); the object reference that follows finds nothing pending
+        d:ask()
+        return
+    end
+    local snap = { arch = f[1] or "-", mesh = mesh, mat = mat, bones = bones, name = name,
+                   bs = bs, body = f[7] or "", age = f[8] or "" }
     if f[9] ~= nil and f[9] ~= "?" then snap.nf = f[9] end
     snap.b = zi.parse_body(snap.body)
     snap.text = table.concat({ snap.arch, snap.mesh, snap.mat, snap.bones, snap.name, snap.bs, snap.body,
@@ -843,7 +934,7 @@ local function client_visit(z, now, left)
     if d then
         if take_apply(left) then
             deferred[key] = nil
-            apply(z, d.snap, d.why .. ", deferred")
+            apply(z, d.snap, d.why .. ", deferred", d.carry)
         end
         return
     end
@@ -902,22 +993,45 @@ end
 
 local function client_pass(now)
     local busy = next(deferred) ~= nil or waiting_due(now)
-    if cpass.broken or now - cpass.last < (busy and CPASS_BUSY_S or CPASS_S) then return end
-    cpass.last = now
-    local out, err = actors_of(core.ZOMBIE_CLASS)
-    if out == false then
-        cpass.broken = true
-        log.warn("ai: looks: client GetAllActorsOfClass failed (%s); looks only as the host sends them", tostring(err))
-        return
+    -- a pass cut short by its budget goes on at the next tick with the same list of copies
+    local more = cpass.more
+    if more and now - (cpass.at or 0) > 0.5 then more, cpass.more, cpass.out = nil, nil, nil end   -- (an old list of copies)
+    if cpass.broken or (not more and now - cpass.last < (busy and CPASS_BUSY_S or CPASS_S)) then return end
+    local out, err
+    if more then
+        out = cpass.out
+    else
+        cpass.last = now
+        out, err = actors_of(core.ZOMBIE_CLASS)
+        if out == false then
+            cpass.broken = true
+            log.warn("ai: looks: client GetAllActorsOfClass failed (%s); looks only as the host sends them", tostring(err))
+            return
+        end
     end
+    cpass.more, cpass.out = nil, nil
     if not out then return end
     local n = #out
     if n == 0 then return end
-    local left = { asks = ASK_PER_PASS, applies = PASS_APPLY_MAX, t0 = clock(), done = 0 }
-    for _ = 1, math.min(CSLICE, n) do
+    local t0 = clock()
+    local left = { asks = ASK_PER_PASS, applies = PASS_APPLY_MAX, t0 = t0, done = 0 }
+    local todo = more and cpass.todo or math.min(CSLICE, n)
+    local visited = 0
+    for i = 1, todo do
         cpass.cursor = cpass.cursor % n + 1
         local z = elem(out[cpass.cursor])
         if ue.valid(z) and ue.role(z) ~= ue.ROLE_AUTHORITY then client_visit(z, now, left) end
+        visited = i
+        if i < todo and clock() - t0 >= PASS_BUDGET_S then
+            cpass.more, cpass.out, cpass.todo, cpass.at = true, out, todo - i, now
+            M.stats.cut_visits = (M.stats.cut_visits or 0) + 1
+            break
+        end
+    end
+    local ms = (clock() - t0) * 1000
+    if ms >= 40 then
+        log.info("ai: looks: client pass took %.0f ms (%d of %d copies visited, %d applies%s)", ms, visited, n, left.done,
+            cpass.more and ", the rest at the next tick" or "")
     end
 end
 
@@ -927,6 +1041,11 @@ end
 
 function M.init(c)
     core = c
+    dict.install(c.S)
+    -- a client could not read an AIAPP: every zombie goes to that client again (the pass)
+    dict.on_heal(function(peer)
+        for _, k in pairs(known) do k.sent[peer] = nil end
+    end)
     -- client tables keyed by copy full name: entries of copies that are gone
     -- are dropped once a minute (sdc_ai core)
     if core.forget_gone then
@@ -989,6 +1108,9 @@ function M.client_tick(now)
     local n = 0
     for _ in pairs(applied) do n = n + 1 end
     if n > 4000 then applied = {} end
+    for k, d in pairs(look_done) do
+        if now - d.t > DONE_KEEP_S then look_done[k] = nil end
+    end
     client_pass(now)
 end
 
@@ -1004,6 +1126,7 @@ function M.reset()
     known, letters, asked_by = {}, {}, {}
     pass = { cursor = 0, last = -1000, broken = false }
     rolled, pend, applied, born, zeroed, asks = {}, {}, {}, {}, {}, {}
+    look_done = {}
     deferred, waiting = {}, {}
     budget = { t = -1000, n = 0 }
     cpass = { cursor = 0, last = -1000, broken = false }
@@ -1019,5 +1142,9 @@ function M.status_line()
         s.spread) .. (#never.list > 0 and string.format(" | never came into memory here: %s%s", table.concat(never.list, ", "),
         never.more > 0 and string.format(" +%d more", never.more) or "") or "")
 end
+
+-- Test access (mock harness).
+M._t = { deferred = function() return deferred end, client_pass = client_pass, apply = apply,
+         cpass = function() return cpass end }
 
 return M

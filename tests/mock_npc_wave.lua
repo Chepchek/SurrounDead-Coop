@@ -195,8 +195,23 @@ local function msgs(kind)
     return out
 end
 
+-- NPCSET on the wire: NPCSET|defs|class|max|packed look[|name]
+local function decode_set(msg)
+    local _, f = require("sdc_net").decode(msg)
+    local d = require("sdc_dict").decoder("T")
+    d:receive(f[1])
+    return { cls = d:get(f[2]), max = f[3], look = require("sdc_npc").unpack_look(d, f[4] or ""), name = f[5] }
+end
+local function wire_set(cls, max, look, name)
+    local dict = require("sdc_dict")
+    local e = dict.encoder("tester", "n")
+    local packed = require("sdc_npc").pack_look(e, look)
+    local c = e:ref(cls)
+    return "SDC1|NPCSET|" .. e:defs() .. "|" .. c .. "|" .. max .. "|" .. packed .. (name and ("|" .. name) or "")
+end
+
 local function fresh_modules()
-    for _, m in ipairs({ "sdc_npc", "sdc_net", "sdc_ue", "sdc_config", "sdc_log" }) do package.loaded[m] = nil end
+    for _, m in ipairs({ "sdc_npc", "sdc_net", "sdc_ue", "sdc_config", "sdc_log", "sdc_dict", "sdc_netsync" }) do package.loaded[m] = nil end
     local cfg = require("sdc_config")
     cfg.values = {}
     return require("sdc_npc"), require("sdc_net")
@@ -291,19 +306,18 @@ check(#sets == 2, "host: 3 s later: NPCSET for the civilian and the dog (" .. #s
 local by_obj = {}
 for _, s in ipairs(sets) do by_obj[s.obj] = s end
 local cs = by_obj[civ]
-local f = {}
-for part in ((cs and cs.msg or "") .. "|"):gmatch("([^|]*)|") do f[#f + 1] = part end
-check(cs ~= nil and f[3] == "BP_RandomCivilian_Male_C" and f[4] == "" and f[5] == "", "host: civilian NPCSET: class, no health")
-check(f[6] and f[6]:find("Mesh=AI/SafeZoneAndCivilians/Meshes/SK_Civ_A.SK_Civ_A,", 1, true) == 1
-    and f[6]:find("BeardMesh=AI/Humans/Meshes/SM_Beard_2.SM_Beard_2,", 1, true) ~= nil, "host: its look (body, beard)")
-check(f[7] == "John Smith", "host: its name plate's text: " .. tostring(f[7]))
-local civ_look = f[6]
+local f = cs and decode_set(cs.msg) or {}
+check(cs ~= nil and f.cls == "BP_RandomCivilian_Male_C" and f.max == "", "host: civilian NPCSET: class, no health")
+check(#msgs("NPCHP") == 0, "host: no NPCHP for a civilian or a dog (no health component)")
+check(f.look and f.look:find("Mesh=AI/SafeZoneAndCivilians/Meshes/SK_Civ_A.SK_Civ_A,", 1, true) == 1
+    and f.look:find("BeardMesh=AI/Humans/Meshes/SM_Beard_2.SM_Beard_2,", 1, true) ~= nil, "host: its look (body, beard)")
+check(f.name == "John Smith", "host: its name plate's text: " .. tostring(f.name))
+local civ_look = f.look
 local ds = by_obj[dog]
-local g = {}
-for part in ((ds and ds.msg or "") .. "|"):gmatch("([^|]*)|") do g[#g + 1] = part end
-check(ds ~= nil and g[6] == "Mesh=AI/Animals/Dog/SK_Dog_Husky.SK_Dog_Husky,AI/Animals/Dog/MI_Dog_Black.MI_Dog_Black"
-    and g[7] == nil, "host: the dog's model and material, no name: " .. tostring(g[6]))
-local dog_look = g[6]
+local g = ds and decode_set(ds.msg) or {}
+check(ds ~= nil and g.look == "Mesh=AI/Animals/Dog/SK_Dog_Husky.SK_Dog_Husky,AI/Animals/Dog/MI_Dog_Black.MI_Dog_Black"
+    and g.name == nil, "host: the dog's model and material, no name: " .. tostring(g.look))
+local dog_look = g.look
 check(by_obj[far] == nil, "host: a civilian 2 km from the client: nothing")
 advance(3.1); npc.tick()
 check(#msgs("NPCSET") == 2, "host: not again within 30 s")
@@ -337,19 +351,19 @@ local function deliver(msg, obj)
     if obj ~= false then fire(OBJREF, param(cpc), param(obj)) end
 end
 local ccopy, ctext, ctxt = make_civilian({ X = 101000, Y = 0, Z = 0 }, 1, "/Game/AI/SafeZoneAndCivilians/Meshes/SK_Civ_B.SK_Civ_B", "Bob Brown")
-deliver("SDC1|NPCSET|BP_RandomCivilian_Male_C|||" .. civ_look .. "|John Smith", ccopy)
+deliver(wire_set("BP_RandomCivilian_Male_C", "", civ_look, "John Smith"), ccopy)
 check(ccopy._p.Mesh._p.SkeletalMeshAsset == W.paths["/Game/AI/SafeZoneAndCivilians/Meshes/SK_Civ_A.SK_Civ_A"], "client: civilian body as on the host")
 check(ccopy._p.BeardMesh._p.StaticMesh == W.paths["/Game/AI/Humans/Meshes/SM_Beard_2.SM_Beard_2"], "client: civilian beard as on the host")
 check(ctext.v == "John Smith", "client: name plate 'John Smith' (its own roll was 'Bob Brown')")
 local n_set = 0
 for _, c in ipairs(ctxt._calls) do if c[1] == "SetText" then n_set = n_set + 1 end end
-deliver("SDC1|NPCSET|BP_RandomCivilian_Male_C|||" .. civ_look .. "|John Smith", ccopy)
+deliver(wire_set("BP_RandomCivilian_Male_C", "", civ_look, "John Smith"), ccopy)
 local n_set2 = 0
 for _, c in ipairs(ctxt._calls) do if c[1] == "SetText" then n_set2 = n_set2 + 1 end end
 check(n_set == 1 and n_set2 == 1, "client: the same name not set again")
 local dcopy = make_dog({ X = 100500, Y = 0, Z = 0 }, 1, "/Game/AI/Animals/Dog/SK_Dog_Husky.SK_Dog_Husky",
     "/Game/AI/Animals/Dog/MI_Dog_White.MI_Dog_White")
-deliver("SDC1|NPCSET|BP_AnimalDog_C|||" .. dog_look, dcopy)
+deliver(wire_set("BP_AnimalDog_C", "", dog_look), dcopy)
 check(dcopy._p.Mesh._p._mat == W.paths["/Game/AI/Animals/Dog/MI_Dog_Black.MI_Dog_Black"], "client: the dog's material as on the host")
 
 -- a slow apply is named in the log
@@ -357,12 +371,12 @@ local slow = make_civilian({ X = 101000, Y = 0, Z = 0 }, 1, "/Game/AI/SafeZoneAn
 slow._p.Mesh._m.SetSkinnedAssetAndUpdate = function(self, a) advance(0.04); self._p.SkeletalMeshAsset = a end
 local LOGS = {}
 print = function(s) LOGS[#LOGS + 1] = tostring(s) end
-deliver("SDC1|NPCSET|BP_RandomCivilian_Male_C|||" .. civ_look .. "|John Smith", slow)
+deliver(wire_set("BP_RandomCivilian_Male_C", "", civ_look, "John Smith"), slow)
 local slow_line
 for _, l in ipairs(LOGS) do if l:find("[SLOW] set on", 1, true) then slow_line = l end end
 check(slow_line ~= nil and slow_line:find("took 40 ms", 1, true) ~= nil, "client: a 40 ms apply: [SLOW] line: " .. tostring(slow_line))
 LOGS = {}
-deliver("SDC1|NPCSET|BP_RandomCivilian_Male_C|||" .. civ_look .. "|John Smith", ccopy)
+deliver(wire_set("BP_RandomCivilian_Male_C", "", civ_look, "John Smith"), ccopy)
 slow_line = nil
 for _, l in ipairs(LOGS) do if l:find("[SLOW]", 1, true) then slow_line = l end end
 check(slow_line == nil, "client: a fast apply: no [SLOW] line")

@@ -29,6 +29,7 @@ local ue = require("sdc_ue")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 local netsync = require("sdc_netsync")
+local dict = require("sdc_dict")
 
 local M = {}
 local S
@@ -482,16 +483,63 @@ local function apply_look(pawn, s, skip)
 end
 
 local looks = {}        -- [player id] = look string (known on this machine)
+local gen = {}          -- [player id] = number of the last LOOK / MYLOOK that arrived
 local published = nil   -- own look last sent
 local published_at = -1000
 local LOOK_VERIFY_S = 300   -- a look is told again this often when it did not change (a lost message heals)
 
+-- The look on the wire: "<token>,<flags>;..." - the "<component>=<mesh>,<material>"
+-- part of each entry is one sdc_dict token (its definition goes once per
+-- peer; only the flags change with a scope / first-person camera), a short
+-- one stays as it is. Decoded it is exactly the string look_string made.
+local ENTRY = "^([^=]+=[^,]*,[^,]*),(.*)$"
+
+function M.pack_look(e, s)
+    local out = {}
+    for entry in (s .. ";"):gmatch("(.-);") do
+        local head, flags = entry:match(ENTRY)
+        local t = head and e:ref(head)
+        if t and t:sub(1, 1) == "~" then
+            out[#out + 1] = t .. "," .. flags
+        else
+            out[#out + 1] = entry
+        end
+    end
+    return table.concat(out, ";")
+end
+
+-- nil when a token is not known (yet)
+function M.unpack_look(d, packed)
+    local out = {}
+    for entry in (packed .. ";"):gmatch("(.-);") do
+        local id, flags = entry:match("^(~%w+),(.*)$")
+        if id then
+            local head = d:get(id)
+            if head == nil then return nil end
+            out[#out + 1] = head .. "," .. flags
+        else
+            out[#out + 1] = entry
+        end
+    end
+    return table.concat(out, ";")
+end
+
 -- Host: a look to one client when that client has not got this text yet (a
 -- changed look, a new client) or as the verify (sdc_netsync).
+-- the look this machine knows of a player (tests)
+function M.known_look(id) return looks[id] end
+
 local function send_look(pc, id, s, forced)
     local peer, key = ue.name(pc), "LOOK:" .. id
     if not forced and not netsync.due(peer, key, s, LOOK_VERIFY_S) then return end
-    if net.send_to(pc, "LOOK", id, s) then netsync.mark(peer, key, s) end   -- only a sent look counts as told
+    local e = dict.encoder(peer, "q")
+    local packed = M.pack_look(e, s)
+    -- only a sent look counts as told
+    -- the definitions count as known only when the message really left the queue (on_out):
+    -- while it waits, the next look carries its own
+    if net.send_to_cb(pc, function() e:commit() end, "LOOK", id, e:defs(), packed) then
+        netsync.mark(peer, key, s)
+    end
 end
 
 -- A client's own character whose co-op look (sdc_charcreate) is not on it
@@ -523,7 +571,9 @@ function M.tick(remote_pcs)
             published, published_at = s, os.clock()
             looks[id] = s
             if S.role == "client" then
-                net.send_to_host("MYLOOK", s)
+                local e = dict.encoder("host", "q")
+                local packed = M.pack_look(e, s)
+                net.send_to_host_cb(function() e:commit() end, "MYLOOK", e:defs(), packed)
             end
             if changed then log.debug("look: own look published (%d bytes)", #s) end
         end
@@ -567,28 +617,57 @@ function M.send_all(pc)
 end
 
 function M.reset()
-    looks, published, tp_flags, bad_paths, own_view, leak_noted = {}, nil, {}, {}, "", {}
+    looks, published, tp_flags, bad_paths, own_view, leak_noted, gen = {}, nil, {}, {}, "", {}, {}
 end
 
 function M.register_handlers()
-    -- host -> clients: LOOK|player id|look
-    net.on("LOOK", function(f)
+    dict.install(S)
+    -- host -> clients: LOOK|player id|definitions|look
+    -- gen[id]: the number of the last LOOK / MYLOOK of that player that arrived; a look waiting for its
+    -- definitions is replayed only when no newer one came meanwhile (an old look never replaces a newer one)
+    local function on_look(f, replay)
         local id = tonumber(f[1])
-        if id and f[2] then looks[math.floor(id)] = f[2] end
-    end)
-    -- client -> host: MYLOOK|look   (its own character)
-    net.on("MYLOOK", function(f, pc)
+        if not id or not f[3] then return end
+        id = math.floor(id)
+        if replay and gen[id] ~= replay then return end
+        if not replay then gen[id] = (gen[id] or 0) + 1 end
+        local g = gen[id]
+        local d = dict.decoder("host")
+        d:receive(f[2])
+        local s = M.unpack_look(d, f[3])
+        if s then
+            looks[id] = s
+        else
+            d:ask()
+            d:retry(function() on_look(f, g) end)
+        end
+    end
+    net.on("LOOK", on_look)
+    -- client -> host: MYLOOK|definitions|look   (its own character)
+    local function on_mylook(f, pc, replay)
         local pawn = ue.pawn_of(pc)
         local id = pawn and player_id(pawn)
-        if not id or not f[1] then return end
-        looks[id] = f[1]
+        if not id or not f[2] then return end
+        if replay and gen[id] ~= replay then return end
+        if not replay then gen[id] = (gen[id] or 0) + 1 end
+        local g = gen[id]
+        local d = dict.decoder(ue.name(pc), pc)
+        d:receive(f[1])
+        local s = M.unpack_look(d, f[2])
+        if not s then
+            d:ask()
+            d:retry(function() on_mylook(f, pc, g) end)
+            return
+        end
+        looks[id] = s
         local others = {}
         for _, other in ipairs(S.remote_pcs or {}) do
             if addr(other) ~= addr(pc) then others[#others + 1] = other end
         end
-        for _, other in ipairs(others) do send_look(other, id, f[1]) end
-        apply_look(pawn, f[1])
-    end)
+        for _, other in ipairs(others) do send_look(other, id, s) end
+        apply_look(pawn, s)
+    end
+    net.on("MYLOOK", on_mylook)
 end
 
 return M

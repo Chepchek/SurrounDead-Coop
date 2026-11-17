@@ -53,7 +53,36 @@
 --
 -- Fields: fl flashlight lit, hf HoldingFirearm?, hm HoldingMelee?, sp Sprinting?,
 --         cs CrouchSprinting?, hip HipFire?, ln Lean, bs BlendSpaceInt,
---         hy head yaw (degrees, rounded), ads IsADS? / ms InMeleeStance? (host only)
+--         hy head yaw (degrees, 4-degree steps), ads IsADS? / ms InMeleeStance? (host only)
+--
+-- Wire format (traffic, 0.12.2): the flags are ONE bitmask number, the rest
+-- short numbers; an empty field = "not sent, keep what you have":
+--     MYSTATE|mask|bs|ln|hy            client -> host
+--     PSTATE|player id|mask|bs|ln|hy   host -> client
+--   mask bits: fl 1, hf 2, hm 4, sp 8, cs 16, hip 32, ads 64, ms 128,
+--   hc 256 (PSTATE only: this is the host's own character); ln = Lean
+--   (the game sets 45 / -65 / 0 on the Q / E input, so a whole number) and
+--   hy = head yaw in steps of 4 degrees (-15..15), both as small signed integers.
+-- Who needs what:
+--   * CORE (mask, bs, ln): the host's own logic needs the flags (speed from
+--     HoldingFirearm? / IsADS? / Sprinting?, the replicated ads / ms, the pose
+--     check) and other machines' copies need them too (speed, flashlight
+--     backstop, late-joiner pose): always sent, on change only. Lean (ln) is core:
+--     it is a plain local variable the owner sets on its input, nothing
+--     replicates it, and the host's copy of the client needs it for the anim BP
+--     (it changes only on a key press: rare and tiny).
+--   * VISUAL (hy): head turn is animation only. The host does
+--     not use it (its anim BP turns the heads by itself), so it matters only
+--     to other CLIENTS that can see the character: a client sends it only
+--     while another client's character is within VIS_CM of it (the host does
+--     not count as a viewer), and the host relays / sends them only to the
+--     clients within VIS_CM of the character. A client that comes into range
+--     gets the full current state at once. A message to somebody in range
+--     always carries every field (a queue that keeps only the newest message
+--     per peer, sdc_net, must not lose a head angle); only messages to peers
+--     out of range leave hy empty.
+--   * at most 4 visual updates a second (HY_MIN_INTERVAL), head in 4-degree
+--     steps; the receiving side eases the head towards the value.
 
 local log = require("sdc_log")
 local ue = require("sdc_ue")
@@ -101,21 +130,31 @@ local function norm180(a)
     return a
 end
 
--- rounded to steps of 2 degrees: small mouse moves do not resend
-local function step2(v) return math.floor(v / 2 + 0.5) * 2 end
+-- head yaw in steps of HY_STEP degrees, lean in whole numbers: small moves do not resend
+local HY_STEP = 4
+local function step_hy(v) return math.floor(v / HY_STEP + 0.5) * HY_STEP end
+local function step_ln(v) return math.floor(v + 0.5) end
 
+-- Relevance (see the header). Hysteresis: in at VIS_CM, out at VIS_STAY_CM.
+local VIS_CM = 6000            -- 60 m: head detail
+local VIS_STAY_CM = 7000
+local VIS_CHECK = 0.5          -- s between range checks
+local HY_MIN_INTERVAL = 0.25   -- s between visual updates (4 / s)
+M.VIS_CM, M.HY_MIN_INTERVAL = VIS_CM, HY_MIN_INTERVAL
+
+-- Own state as decoded strings (the same shape as states[id]).
 local function own_state(pawn)
-    local parts = { "fl=" .. (light_on(pawn) and "1" or "0") }
+    local t = { fl = light_on(pawn) and "1" or "0" }
     for _, b in ipairs(BOOLS) do
-        parts[#parts + 1] = b[1] .. "=" .. (ue.prop(pawn, b[2]) == true and "1" or "0")
+        t[b[1]] = ue.prop(pawn, b[2]) == true and "1" or "0"
     end
     for _, b in ipairs(HOST_BOOLS) do
-        parts[#parts + 1] = b[1] .. "=" .. (ue.prop(pawn, b[2]) == true and "1" or "0")
+        t[b[1]] = ue.prop(pawn, b[2]) == true and "1" or "0"
     end
     local lean = ue.prop(pawn, "Lean")
-    parts[#parts + 1] = string.format("ln=%.2f", type(lean) == "number" and lean or 0)
+    t.ln = string.format("%.2f", step_ln(type(lean) == "number" and lean or 0) + 0)
     local bs = ue.prop(anim_of(pawn), "BlendSpaceInt")
-    parts[#parts + 1] = "bs=" .. tostring(type(bs) == "number" and math.floor(bs) or 0)
+    t.bs = tostring(type(bs) == "number" and math.floor(bs) or 0)
     local pc = ue.local_pc()
     local cr = pc and ue.try(function() return pc:GetControlRotation() end)
     local ar = ue.rotation(pawn)
@@ -123,29 +162,75 @@ local function own_state(pawn)
         local cy = ue.try(function() return cr.Yaw end)
         if type(cy) == "number" then
             local hy = math.max(-60, math.min(60, norm180(ar.Yaw - cy)))
-            parts[#parts + 1] = string.format("hy=%d", step2(hy))
+            t.hy = string.format("%d", step_hy(hy))
         end
     end
-    return table.concat(parts, ";")
-end
-
-local function decode(s)
-    local t = {}
-    for k, v in (s or ""):gmatch("([%w_]+)=([^;]*)") do t[k] = v end
     return t
 end
 
-local function encode(t)
-    local keys = {}
-    for k in pairs(t) do keys[#keys + 1] = k end
-    table.sort(keys)
-    local parts = {}
-    for _, k in ipairs(keys) do parts[#parts + 1] = k .. "=" .. tostring(t[k]) end
-    return table.concat(parts, ";")
+-- Flag bits of the wire mask.
+local BITS = {
+    { "fl", 1 }, { "hf", 2 }, { "hm", 4 }, { "sp", 8 }, { "cs", 16 },
+    { "hip", 32 }, { "ads", 64 }, { "ms", 128 }, { "hc", 256 },
+}
+local function mask_of(t)
+    local m = 0
+    for _, b in ipairs(BITS) do
+        if t[b[1]] == "1" then m = m + b[2] end
+    end
+    return m
+end
+
+-- { mask, bs, ln, hy } as strings; hy "" without `vis` (or unknown).
+local function wire_of(t, vis)
+    local ln = tonumber(t.ln)
+    local hy = vis and tonumber(t.hy)
+    return {
+        tostring(mask_of(t)), tostring(math.floor(tonumber(t.bs) or 0)),
+        ln and tostring(math.floor(ln + 0.5)) or "",
+        hy and tostring(math.floor(hy / HY_STEP + 0.5)) or "",
+    }
+end
+
+-- Merge the wire fields f[i .. i+3] into the decoded state t (an empty field
+-- keeps what t has). false = not a state.
+local function merge_wire(t, f, i)
+    local mask = tonumber(f[i])
+    if not mask then return false end
+    mask = math.floor(mask)
+    for _, b in ipairs(BITS) do
+        t[b[1]] = (mask % (b[2] * 2) >= b[2]) and "1" or "0"
+    end
+    local bs = tonumber(f[i + 1])
+    if bs then t.bs = tostring(math.floor(bs)) end
+    local ln = tonumber(f[i + 2])
+    if ln then t.ln = string.format("%.2f", ln) end
+    local hy = tonumber(f[i + 3])
+    if hy then t.hy = tostring(math.floor(hy) * HY_STEP) end
+    return true
+end
+
+local function copy_state(t)
+    local c = {}
+    for k, v in pairs(t) do c[k] = v end
+    return c
+end
+
+local function dist2(a, b)
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    return dx * dx + dy * dy + dz * dz
 end
 
 local states = {}    -- [player id] = decoded state
-local published = nil
+local published = nil    -- own state as last published (decoded)
+local pub_vis_at = 0      -- when its visual part last went out
+local pub_vis_sent = false  -- client: the last message carried the visual part
+local near_on, near_at = false, -1e9      -- client: a client that can see us is near
+local host_cid = nil      -- client: player id of the host's character (not a viewer)
+-- host: who is in whose visual range, and what each client was last sent
+local inr = {}            -- [viewer pc address][subject player id] = true / false
+local ranges_at = -1e9
+local sent_core, sent_full = {}, {}   -- [pc address][player id] = key
 
 local function m_is_local(p) return p:IsLocallyControlled() end
 local function is_local(p)
@@ -580,12 +665,126 @@ local function apply_id(id)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Who can see whom (visual range)
+-- ---------------------------------------------------------------------------
+-- Client: is a client's character (not the host's) within range of the own
+-- character? Those are the only machines that can use our head / lean. The
+-- characters come from the engine's own replication (net relevancy 150 m >
+-- VIS_CM). Checked every VIS_CHECK s, with hysteresis.
+local function viewers_near(now, me)
+    if now - near_at < VIS_CHECK then return near_on end
+    near_at = now
+    local ml = ue.location(me)
+    if not ml then
+        near_on = true
+        return true
+    end
+    local lim = near_on and VIS_STAY_CM or VIS_CM
+    lim = lim * lim
+    local on = false
+    for _, p in ipairs(others()) do
+        local id = appearance.player_id(p)
+        if not (host_cid and id == host_cid) then
+            local l = ue.location(p)
+            if not l or dist2(ml, l) <= lim then
+                on = true
+                break
+            end
+        end
+    end
+    near_on = on
+    return on
+end
+
+-- Host: does client `pc` see the character `id`? (unknown = yes)
+local function in_range(pc, id)
+    local row = inr[addr(pc)]
+    local v = row and row[id]
+    return v ~= false
+end
+
+-- Host: recompute who is within VIS_CM of whom (every VIS_CHECK s). Returns
+-- the list of { pc, id } that came into range: they get the full state now.
+local function update_ranges(now, me, my_id)
+    if now - ranges_at < VIS_CHECK then return nil end
+    ranges_at = now
+    local subj = {}
+    local ml = me and ue.location(me)
+    if my_id then subj[#subj + 1] = { id = my_id, loc = ml } end
+    local views = {}
+    for _, pc in ipairs(S.remote_pcs or {}) do
+        if ue.valid(pc) then
+            local pawn = ue.pawn_of(pc)
+            local id = pawn and appearance.player_id(pawn)
+            local v = { pc = pc, id = id, loc = pawn and ue.location(pawn) or nil }
+            views[#views + 1] = v
+            if id then subj[#subj + 1] = v end
+        end
+    end
+    local flips = {}
+    for _, v in ipairs(views) do
+        local k = addr(v.pc)
+        if k then
+            local row = inr[k]
+            if not row then
+                row = {}
+                inr[k] = row
+            end
+            for _, sj in ipairs(subj) do
+                if sj.id ~= v.id then
+                    local prev = row[sj.id]
+                    local lim = prev and VIS_STAY_CM or VIS_CM
+                    local now_in = true
+                    if v.loc and sj.loc then now_in = dist2(v.loc, sj.loc) <= lim * lim end
+                    if now_in and not prev then flips[#flips + 1] = { pc = v.pc, id = sj.id } end
+                    row[sj.id] = now_in
+                end
+            end
+        end
+    end
+    return flips
+end
+
+-- Host: send the state of character `id` to client `pc`: everything when it
+-- is within range, else only the core (mask, bs) and only when that changed.
+local function push(pc, id, t, vis)
+    local k = addr(pc)
+    if not k then return end
+    local f = wire_of(t, vis)
+    local core = f[1] .. "|" .. f[2] .. "|" .. f[3]
+    local sc = sent_core[k]
+    if not sc then
+        sc = {}
+        sent_core[k] = sc
+        sent_full[k] = {}
+    end
+    if vis then
+        local key = core .. "|" .. f[4]
+        if sent_full[k][id] == key then return end
+        sent_full[k][id] = key
+    else
+        if sc[id] == core then return end
+        sent_full[k][id] = nil
+    end
+    sc[id] = core
+    net.send_to(pc, "PSTATE", id, f[1], f[2], f[3], f[4])
+end
+
+local function push_flips(flips)
+    for _, fl in ipairs(flips or {}) do
+        local t = states[fl.id]
+        if t then push(fl.pc, fl.id, t, true) end
+    end
+end
+
 -- Every 100 ms: publish the own state when it changed. A host nobody is
 -- connected to has nobody to tell: nothing is read, and the state goes out
 -- again when somebody is there.
 function M.fast_tick()
     if S.role ~= "host" and S.role ~= "client" then return end
-    if S.role == "host" then
+    local host = S.role == "host"
+    if host then
         if pose_fix_on() then ensure_combat_hook(os.clock()) end
         if #(S.remote_pcs or {}) == 0 then
             published = nil
@@ -596,21 +795,65 @@ function M.fast_tick()
     if not me then return end
     local id = appearance.player_id(me)
     if not id then return end
-    local s = own_state(me)
-    if s == published then return end
-    published = s
-    states[id] = decode(s)
-    if S.role == "host" then
-        net.broadcast(S.remote_pcs or {}, "PSTATE", id, s)
-    else
-        net.send_to_host("MYSTATE", s)
+    local now = os.clock()
+    local flips = host and update_ranges(now, me, id) or nil
+    local new = own_state(me)
+    if host then new.hc = "1" end
+    local vis = host or viewers_near(now, me)
+    local pub = published
+    local core_changed = not pub or mask_of(new) ~= mask_of(pub) or new.bs ~= pub.bs or new.ln ~= pub.ln
+    local vis_changed = not pub or new.hy ~= pub.hy
+    -- a client that was not sending the visual part sends it when somebody
+    -- comes near (its first visual update is not held back)
+    local fresh_vis = not host and vis and not pub_vis_sent
+    -- (a client with nobody near publishes nothing for a visual change)
+    local due = (host or vis) and (vis_changed or fresh_vis) and (fresh_vis or now - pub_vis_at >= HY_MIN_INTERVAL)
+    if host then
+        if core_changed or due then
+            published = new
+            pub_vis_at = vis_changed and now or pub_vis_at
+            states[id] = copy_state(new)
+            for _, pc in ipairs(S.remote_pcs) do push(pc, id, states[id], in_range(pc, id)) end
+        end
+        push_flips(flips)
+        return
+    end
+    if core_changed or due then
+        published = new
+        states[id] = copy_state(new)
+        local f = wire_of(new, vis)
+        if vis then
+            pub_vis_at = now
+        end
+        pub_vis_sent = vis
+        net.send_to_host("MYSTATE", f[1], f[2], f[3], f[4])
+    elseif not vis then
+        pub_vis_sent = false
     end
 end
 
 -- Every second: re-apply (the game's own code may have reset a copy). The
 -- host forgets the states of players who left (send_all).
 function M.tick(remote_pcs)
-    if S.role == "host" and remote_pcs then appearance.drop_left(states, remote_pcs) end
+    if S.role == "host" and remote_pcs then
+        appearance.drop_left(states, remote_pcs)
+        local live = {}
+        for _, pc in ipairs(remote_pcs) do live[addr(pc) or 0] = true end
+        for k in pairs(sent_core) do
+            if not live[k] then sent_core[k], sent_full[k] = nil, nil end
+        end
+        for k in pairs(inr) do
+            if not live[k] then inr[k] = nil end
+        end
+        -- a player id that is gone (respawn under a new id): forget its rows
+        for _, tbl in ipairs({ inr, sent_core, sent_full }) do
+            for _, row in pairs(tbl) do
+                for id in pairs(row) do
+                    if states[id] == nil then row[id] = nil end
+                end
+            end
+        end
+    end
     for _, p in ipairs(others()) do
         local id = appearance.player_id(p)
         local t = id and states[id]
@@ -637,6 +880,7 @@ local REFRESH = 0.25
 -- it comes into view.
 local RENDER_TOL = 0.5
 local LH_EPS = 0.01      -- cm: a LeftHandLoc this close to the last one written is not written again
+local HEAD_EASE = 9       -- 1/s: the head eases towards the (4-degree, 4 / s) target values
 local HEAD_EPS = 0.01    -- degrees: a head turn this small is 0 (the anim BP's own target here)
 local ik_list, ik_list_at = {}, 0   -- recs of characters with a firearm and a LeftHand socket
 local head_list = {}    -- recs (clients)
@@ -775,7 +1019,7 @@ local function heads(dt)
             local cur = head_now[k] or 0
             if hy ~= 0 or cur ~= 0 then
                 if ue.prop(p, "IsADS?") == true then hy = 0 end
-                cur = cur + (hy - cur) * math.min(1, dt * 12)
+                cur = cur + (hy - cur) * math.min(1, dt * HEAD_EASE)
                 if hy == 0 and math.abs(cur) < HEAD_EPS then cur = 0 end
                 head_now[k] = cur
                 local anim = r.anim
@@ -824,9 +1068,13 @@ end
 -- are dropped first).
 function M.send_all(pc)
     if S and S.role == "host" then appearance.drop_left(states, S.remote_pcs) end
-    for id, t in pairs(states) do
-        net.send_to(pc, "PSTATE", id, encode(t))
-    end
+    -- the joiner gets everything once (it is at the spawn, near the others
+    -- at least as often as not); the range checks trim it afterwards
+    -- a repeated HI (the client repeats it until acknowledged) or a client that
+    -- reuses an address must get everything again: forget what was sent
+    local k = addr(pc)
+    if k then sent_core[k], sent_full[k], inr[k] = nil, nil, nil end
+    for id, t in pairs(states) do push(pc, id, t, true) end
 end
 
 -- Role change and level change (sdc_session.reset_world): the cached
@@ -834,6 +1082,8 @@ end
 -- hook stays registered (its callback checks the role).
 function M.reset()
     states, published, ik_list, head_list, head_now = {}, nil, {}, {}, {}
+    pub_vis_at, pub_vis_sent, near_on, near_at, host_cid = 0, false, false, -1e9, nil
+    inr, ranges_at, sent_core, sent_full = {}, -1e9, {}, {}
     recs = {}
     ik_list_at = 0
     fl_tried, fl_failing = {}, {}
@@ -846,20 +1096,25 @@ function M.register_handlers()
     -- from UE4SS's new-object notification; registered once, at load (this
     -- runs from sdc_session.register_handlers in main.lua's main chunk).
     if ue.watch_player_chars then pcall(ue.watch_player_chars) end
-    -- host -> clients: PSTATE|player id|state
+    -- host -> clients: PSTATE|player id|mask|bs|ln|hy
     net.on("PSTATE", function(f)
         local id = tonumber(f[1])
         if not id then return end
         id = math.floor(id)
-        states[id] = decode(f[2])
+        local t = states[id] or {}
+        if not merge_wire(t, f, 2) then return end
+        states[id] = t
+        if t.hc == "1" then host_cid = id end
         apply_id(id)
     end)
-    -- client -> host: MYSTATE|state   (its own character)
+    -- client -> host: MYSTATE|mask|bs|ln|hy   (its own character)
     net.on("MYSTATE", function(f, pc)
         local pawn = ue.pawn_of(pc)
         local id = pawn and appearance.player_id(pawn)
         if not id then return end
-        local t = decode(f[1])
+        local t = states[id] or {}
+        if not merge_wire(t, f, 1) then return end
+        t.hc = "0"
         -- the combat state is the host's call (check_combat): the other
         -- clients get the value of the active slot, not the owner's echo of
         -- a multicast the host may be correcting right now
@@ -869,11 +1124,12 @@ function M.register_handlers()
         end
         states[id] = t
         apply_id(id)
-        local others_pcs = {}
+        local me = ue.local_pawn()
+        local flips = update_ranges(os.clock(), me, me and appearance.player_id(me))
         for _, other in ipairs(S.remote_pcs or {}) do
-            if addr(other) ~= addr(pc) then others_pcs[#others_pcs + 1] = other end
+            if addr(other) ~= addr(pc) then push(other, id, t, in_range(other, id)) end
         end
-        if #others_pcs > 0 then net.broadcast(others_pcs, "PSTATE", id, encode(t)) end
+        push_flips(flips)
     end)
 end
 

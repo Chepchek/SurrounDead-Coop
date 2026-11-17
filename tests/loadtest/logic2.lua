@@ -38,7 +38,7 @@ package.loaded["sdc_ue"] = ue
 package.loaded["sdc_config"] = { get = function() return true end }
 local sent = {}
 package.loaded["sdc_net"] = { send_to = function() end, broadcast = function(_, kind, id, s) sent[#sent + 1] = kind .. " " .. tostring(s) end,
-    send_to_host = function(kind, s) sent[#sent + 1] = kind .. " " .. tostring(s) end, on = function() end }
+    send_to_host = function(kind, ...) sent[#sent + 1] = kind .. " " .. table.concat({ ... }, "|") end, on = function() end }
 package.loaded["sdc_ctx"] = { addr = function(o) return o and (o.__name or tostring(o)) end }
 local hooks = {}
 RegisterHook = function(path, pre) hooks[path] = pre; return 1, 2 end
@@ -87,7 +87,7 @@ print("dress: ok")
 local handlers = {}
 package.loaded["sdc_net"].on = function(k, f) handlers[k] = f end
 pawnstate.register_handlers()
-handlers.PSTATE({ "7", "fl=1;hf=0;hm=0;sp=0;cs=0;hip=0;ln=0.00;bs=0;hy=0" })
+handlers.PSTATE({ "7", "1", "0", "0", "0" })
 assert(toggled == true and proxy["FlashlightOn?"] == true, "backstop did not toggle")
 toggled = nil
 pawnstate.tick()
@@ -102,6 +102,7 @@ ue.__me = me
 ue.__pc = { GetControlRotation = function() return { Pitch = 5, Yaw = 30 } end }
 pawnstate.fast_tick()
 print("published:", sent[#sent])
-assert(sent[#sent]:find("fl=1") and not sent[#sent]:find("cp=") and sent[#sent]:find("hy="), "own state wrong")
+-- mask 1 = flashlight, bs 0, lean 0, head -20 deg = -5 steps (position unknown: treated as seen)
+assert(sent[#sent] == "MYSTATE 1|0|0|-5", "own state wrong")
 for _, l in ipairs(logs) do print("LOG", l) end
 print("ALL OK")

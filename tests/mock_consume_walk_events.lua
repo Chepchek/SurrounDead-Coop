@@ -15,6 +15,7 @@
 -- usage: lua mock_consume_walk_events.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -355,7 +356,7 @@ local function script(W)
   W.tick("nvg off", 2)
   -- a ghost check: the client shows 999 (not here) and 1107 (here)
   base = base + 5
-  handlers.GHOSTQ({ "999:0:0:0;1107:0:0:0" }, big.pc)
+  handlers.GHOSTQ({ "AAAD5wAAAAAAAAAAAAAAAA;AAAEUwAAAAAAAAAAAAAAAA" }, big.pc)
   W.tick("ghost")
   -- the player's own game loads its inventory again
   fire("SERVER_RequestDataFromSave", big.jig)
@@ -425,7 +426,7 @@ do
   local W = session(true, function(W) W.tick("start"); W.tick("idle", 3) end)
   remove_item(W.big.conts, 1001)   -- (no signal: the snapshot still has it)
   base = base + 5
-  handlers.GHOSTQ({ "1001:0:0:0;999:0:0:0" }, W.big.pc)
+  handlers.GHOSTQ({ "AAAD6QAAAAAAAAAAAAAAAA;AAAD5wAAAAAAAAAAAAAAAA" }, W.big.pc)
   check(#cuc == 2, "both unknown items ended (1001 was removed here; an old snapshot would have said 'held'): " .. table.concat(cuc, ","))
 end
 
@@ -486,7 +487,7 @@ do
   run_all_delayed()
   W.tick("after")
   local seen = false
-  for _, m in ipairs(W.record[#W.record].msgs) do if m:find("5100:0:0:0=100.0", 1, true) then seen = true end end
+  for _, m in ipairs(W.record[#W.record].msgs) do if m:find(wire.uid_enc("5100:0:0:0") .. "=100", 1, true) then seen = true end end
   check(seen, "the walk started over: the next ITEMS has the new item, not an old walk's")
   check(W.CM.stats.walk_restarts >= 1, "(restarts: " .. W.CM.stats.walk_restarts .. ")")
 end
@@ -504,8 +505,8 @@ do
     "20 shots in 20 s: no walk, each written into the snapshot (" .. W.CM.stats.dur_patched .. ")")
   check(W.CM.stats.verify_diffs == 0, "and the 10 s check agrees with the patched snapshot")
   local u = nil
-  for _, r in ipairs(W.record) do for _, m in ipairs(r.msgs) do if m:find("PrimaryWeapon=20:0:0:0@", 1, true) then u = m end end end
-  check(u ~= nil and u:find("@50.50", 1, true) ~= nil, "UIDS carries the worn weapon's new durability: " .. tostring(u))
+  for _, r in ipairs(W.record) do for _, m in ipairs(r.msgs) do if m:find("PrimaryWeapon=" .. wire.uid_enc("20:0:0:0") .. "@", 1, true) then u = m end end end
+  check(u ~= nil and u:find("@51", 1, true) ~= nil, "UIDS carries the worn weapon's new durability: " .. tostring(u))
   -- the hook cannot read the new value: a change signal, the walk follows
   local w1 = W.CM.stats.walks_full
   call_hooks(JIG_FN .. "ServerFuncUpdateDurabilityByUID", P(W.big.jig), P({ A = 20, B = 0, C = 0, D = 0 }), P(1), P(false), P(nil))
@@ -636,7 +637,7 @@ do
   W.tick("new stack")   -- (a big inventory is walked in slices after this tick: its ITEMS goes with the next one, as ever)
   local rec = W.tick("new stack 2")
   local seen = false
-  for _, m in ipairs(rec.msgs) do if m:find("8001:0:0:0=100.0", 1, true) then seen = true end end
+  for _, m in ipairs(rec.msgs) do if m:find(wire.uid_enc("8001:0:0:0") .. "=100", 1, true) then seen = true end end
   check(seen, "a new stack (a harvest's wood / rock): in ITEMS a tick later, not 10 s, so the client's craft is not held back")
   -- (2b) the chamber after a reload / shot
   find_item(W.big.conts, 1010).n = 1
@@ -658,11 +659,11 @@ do
   -- the ghost check: items the client lists that the snapshot lacked (no signal): the snapshot is renewed
   table.insert(W.big.conts[14].items, { uid = 8002, n = 1, dur = 100, idx = 9 })
   base = base + 5
-  handlers.GHOSTQ({ "8002:0:0:0" }, W.big.pc)
+  handlers.GHOSTQ({ "AAAfQgAAAAAAAAAAAAAAAA" }, W.big.pc)
   W.tick("ghost held")
   local rec2 = W.tick("ghost held 2")
   local seen2 = false
-  for _, m in ipairs(rec2.msgs) do if m:find("8002:0:0:0=100.0", 1, true) then seen2 = true end end
+  for _, m in ipairs(rec2.msgs) do if m:find(wire.uid_enc("8002:0:0:0") .. "=100", 1, true) then seen2 = true end end
   check(seen2 and #cuc == 0, "the ghost check found it here: the snapshot is walked again (ITEMS has it), nothing ended")
 end
 

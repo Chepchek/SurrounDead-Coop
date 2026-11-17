@@ -3,6 +3,7 @@
 -- client applying them with the game's own handlers, stuck pending slots
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 local logs = {}
 local log = setmetatable({ debug_enabled = false }, { __index = function(_, k)
   return function(a, ...)
@@ -48,12 +49,14 @@ package.loaded["sdc_config"] = { get = function(k) if cfgv[k] ~= nil then return
 -- (0.7.3: JMC|*|<key>|<op,args>|...: one entry per op, as the single form JMC|<op>|<key>|<args> was;
 -- whole numbers as numbers, as the host passed them before)
 local function jmc_ops(pc, f)
-  if f[1] ~= "*" then to_client[#to_client + 1] = { pc = pc, kind = "JMC", f = f }; return end
   for i = 3, #f do
     local one = {}
-    for part in (f[i] .. ","):gmatch("([^,]*),") do one[#one + 1] = part:match("^%-?%d+$") and tonumber(part) or part end
-    table.insert(one, 2, f[2])
-    to_client[#to_client + 1] = { pc = pc, kind = "JMC", f = one }
+    for part in (f[i] .. ","):gmatch("([^,]*),") do
+      part = wire.uid_dec(part) or part   -- (UIDs travel short; the checks below read the A:B:C:D form)
+      one[#one + 1] = part:match("^%-?%d+$") and tonumber(part) or part
+    end
+    table.insert(one, 2, wire.uid_dec(f[2]))
+    to_client[#to_client + 1] = { pc = pc, kind = "JMC", f = one, raw = f[i] }
   end
 end
 package.loaded["sdc_net"] = { broadcast = function() end,
@@ -92,6 +95,15 @@ local S = { role = "host", remote_pcs = {} }
 items.init(S)
 items.register_handlers()
 assert(handlers.JMC and handlers.JADD, "handlers missing")
+-- the old way to write a JMC op in these checks: (op, key, args...) -> the packed message with short UIDs
+local function jmc_old(f)
+  local args = {}
+  for i = 3, #f do
+    local a = tostring(f[i])
+    args[#args + 1] = a:match("^%-?%d+:%-?%d+:%-?%d+:%-?%d+$") and wire.uid_enc(a) or a
+  end
+  handlers.JMC({ "*", wire.uid_enc(f[2]), f[1] .. (#args > 0 and "," or "") .. table.concat(args, ",") })
+end
 
 -- ---------------------------------------------------------------- host
 local pc = { __name = "PC_dag", NetConnection = { __name = "conn" } }
@@ -148,6 +160,11 @@ assert(to_client[#to_client].f[1] == "rm" and to_client[#to_client].f[3] == "7:0
 hooks[JIG .. "MC_AddNewItem"](C(chest), P(rags), P(arr({})))
 assert(to_client[#to_client].f[1] == "add" and to_client[#to_client].f[3] == "7:0:0:0", "add not forwarded")
 hooks[JIG .. "MC_UpdateStack"](C(chest), P(G(7)), P(0), P(G(8)), P(5))
+do -- both UIDs of a stk go in the short form (sender side), and the receiver applies them (jmc_old stk below)
+  local a = {}
+  for part in (to_client[#to_client].raw .. ","):gmatch("([^,]*),") do a[#a + 1] = part end
+  assert(#a == 5 and #a[2] == 22 and #a[4] == 22 and wire.uid_dec(a[2]) == "7:0:0:0" and wire.uid_dec(a[4]) == "8:0:0:0", "stk: both UIDs short on the wire")
+end
 assert(to_client[#to_client].f[1] == "stk" and to_client[#to_client].f[4] == 0 and to_client[#to_client].f[6] == 5, "stk not forwarded")
 hooks[JIG .. "MC_UpdateCount"](C(chest), P(G(7)), P(2), P(G(0)))
 assert(to_client[#to_client].f[1] == "cnt" and to_client[#to_client].f[4] == 2, "cnt not forwarded")
@@ -182,12 +199,12 @@ hooks[JIG .. "SERVER_RequestMoveItemToAnotherComp"](C(djig), P(chest), P(djig), 
 assert(#failed == 2 and has_log("guest moved MedBag x1 (uid 8:0:0:0) from Container_MedicalLoot_MedicalCrate2_C_33 to inventory of guest slot 3: done"), "comp move done")
 table.insert(chest_items, bag)
 -- the client still misses the bag: sent again, with what is inside it
-handlers.JADD({ "500:0:0:0", "8:0:0:0" }, pc)
+handlers.JADD({ "AAAB9AAAAAAAAAAAAAAAAA", "AAAACAAAAAAAAAAAAAAAAA" }, pc)
 assert(#readded == 1 and readded[1].info == bag and readded[1].comp == chest and #readded[1].content == 1
   and readded[1].content[1] == bandage and readded[1].pend.A == 0, "item not sent again")
-handlers.JADD({ "500:0:0:0", "8:0:0:0" }, pc)
+handlers.JADD({ "AAAB9AAAAAAAAAAAAAAAAA", "AAAACAAAAAAAAAAAAAAAAA" }, pc)
 assert(#readded == 1, "asked twice at once")
-handlers.JADD({ "999:0:0:0", "8:0:0:0" }, pc)
+handlers.JADD({ "AAAD5wAAAAAAAAAAAAAAAA", "AAAACAAAAAAAAAAAAAAAAA" }, pc)
 assert(#readded == 1, "unknown container answered")
 print("host: refused moves answered, a missing add sent again with its content")
 
@@ -208,7 +225,7 @@ assert(last_ops(2) == "add|500:0:0:0|13:0:0:0 ; cnt|500:0:0:0|7:0:0:0|1", "new i
 hooks[JIG .. "MC_NewItemAdded"](C(chest), P({}), P(G(14)), P(G(500)), P(8), P(false), P({ [U_UID] = G(0), [U_COUNT] = 1 }), P(arr({})))
 assert(last_ops(1) == "add|500:0:0:0|14:0:0:0", "new item without count: " .. last_ops(1))
 hooks[JIG .. "MC_UpdateDurability"](C(chest), P(G(8)), P({ X = 42.5, Y = 100 }))
-assert(last_ops(1) == "dur|500:0:0:0|8:0:0:0|42.500|100.000", "dur: " .. last_ops(1))
+assert(last_ops(1) == "dur|500:0:0:0|8:0:0:0|42.5|100", "dur: " .. last_ops(1))
 hooks[JIG .. "MC_OnPendingDone"](C(chest), P(arr({ rags })))
 assert(last_ops(1) == "done|500:0:0:0|7:0:0:0", "done: " .. last_ops(1))
 -- a split in the chest: done (a new stack at the slot) / refused (nothing there) -> the failure answer
@@ -264,42 +281,42 @@ cpending[#cpending + 1] = r
 hooks[JIG .. "Jig_UnhandledEvent"](C(cchest), P(jsi), P(jsi), P(4), P(r), P(false), P(1))
 assert(has_log("move of Rags x1 (uid 7:0:0:0) asked: CRATE -> CRATE slot 4 (pending)"), "move asked log")
 -- the plugin's multicast was lost; the reliable copy moves it with the game's handler
-handlers.JMC({ "mv", "500:0:0:0", "7:0:0:0", "500:0:0:0", "4", "0" })
+jmc_old({ "mv", "500:0:0:0", "7:0:0:0", "500:0:0:0", "4", "0" })
 assert(#moved == 1 and moved[1].a == 7 and moved[1].to == 500 and moved[1].idx == 4 and moved[1].rot == false, "move not applied")
 assert(r.SlotIndex == 4 and r.IsPending == false, "still pending")
 -- the same answer again (the multicast after all): already shown, not applied twice
-handlers.JMC({ "mv", "500:0:0:0", "7:0:0:0", "500:0:0:0", "4", "0" })
+jmc_old({ "mv", "500:0:0:0", "7:0:0:0", "500:0:0:0", "4", "0" })
 assert(#moved == 1, "applied twice")
 -- taken by the host / moved out: the copy shown here goes
-handlers.JMC({ "rm", "500:0:0:0", "7:0:0:0" })
+jmc_old({ "rm", "500:0:0:0", "7:0:0:0" })
 assert(r.__valid == false and #shown == 0 and has_log("7:0:0:0 is no longer in Container_MedicalLoot_MedicalCrate2_C_33 on the host"), "stale copy not removed")
-handlers.JMC({ "rm", "500:0:0:0", "7:0:0:0" })
+jmc_old({ "rm", "500:0:0:0", "7:0:0:0" })
 -- an add the multicast did not bring: asked for after a moment; one that arrived: not
-handlers.JMC({ "add", "500:0:0:0", "8:0:0:0" })
+jmc_old({ "add", "500:0:0:0", "8:0:0:0" })
 slot(9, "DA_Bandages", 1, false)
-handlers.JMC({ "add", "500:0:0:0", "9:0:0:0" })
+jmc_old({ "add", "500:0:0:0", "9:0:0:0" })
 for _, f in ipairs(delayed) do f() end
 delayed = {}
-assert(#to_host == 1 and to_host[1][1] == "JADD" and to_host[1][2] == "500:0:0:0" and to_host[1][3] == "8:0:0:0", "missing add not asked for")
+assert(#to_host == 1 and to_host[1][1] == "JADD" and wire.uid_dec(to_host[1][2]) == "500:0:0:0" and wire.uid_dec(to_host[1][3]) == "8:0:0:0", "missing add not asked for")
 -- stack / count with the game's handlers
-handlers.JMC({ "stk", "500:0:0:0", "7:0:0:0", "0", "9:0:0:0", "5" })
-handlers.JMC({ "cnt", "500:0:0:0", "9:0:0:0", "3" })
+jmc_old({ "stk", "500:0:0:0", "7:0:0:0", "0", "9:0:0:0", "5" })
+jmc_old({ "cnt", "500:0:0:0", "9:0:0:0", "3" })
 assert(#stacks == 1 and stacks[1][1] == 7 and stacks[1][2] == 0 and stacks[1][3] == 9 and stacks[1][4] == 5, "stack not applied")
 assert(#counts == 1 and counts[1][1] == 9 and counts[1][2] == 3 and counts[1][3] == true, "count not applied")
 -- durability and a timed craft done, with the game's own handlers
 local durs = {}
 cchest.ClientFunc_UpdateDurability = function(_, g, d) durs[#durs + 1] = { g.A, d.X, d.Y } end
-handlers.JMC({ "dur", "500:0:0:0", "9:0:0:0", "42.500", "100.000" })
+jmc_old({ "dur", "500:0:0:0", "9:0:0:0", "42.500", "100.000" })
 assert(#durs == 1 and durs[1][1] == 9 and durs[1][2] == 42.5 and durs[1][3] == 100, "durability not applied")
 local crafted = slot(15, "DA_Bandages", 7, true)
 crafted.SetPending = function(self, v) self.IsPending = v end
-handlers.JMC({ "done", "500:0:0:0", "15:0:0:0" })
+jmc_old({ "done", "500:0:0:0", "15:0:0:0" })
 assert(crafted.IsPending == false and has_log("15:0:0:0 in Container_MedicalLoot_MedicalCrate2_C_33 is done on the host: it stops blinking"), "done not applied")
-handlers.JMC({ "done", "500:0:0:0", "15:0:0:0" })
+jmc_old({ "done", "500:0:0:0", "15:0:0:0" })
 assert(crafted.IsPending == false, "done twice")
 crafted:RemoveFromJSIParent()
 -- another container (not open here): ignored
-handlers.JMC({ "rm", "777:0:0:0", "9:0:0:0" })
+jmc_old({ "rm", "777:0:0:0", "9:0:0:0" })
 assert(#shown == 1, "other container touched")
 print("client: reliable copies applied with the game's handlers, once")
 
@@ -314,7 +331,7 @@ assert(#unpended >= 1 and unpended[#unpended][1] == 11 and unpended[#unpended][2
 assert(has_log("Rags (uid 11:0:0:0) in Container_MedicalLoot_MedicalCrate2_C_33 waited", "warn"), "stuck log")
 -- switched off: nothing applied
 cfgv.container_moves_reliable = false
-handlers.JMC({ "cnt", "500:0:0:0", "9:0:0:0", "1" })
+jmc_old({ "cnt", "500:0:0:0", "9:0:0:0", "1" })
 assert(#counts == 1, "option ignored")
 cfgv.container_moves_reliable = nil
 print("client: a stuck pending slot stops blinking where it is")

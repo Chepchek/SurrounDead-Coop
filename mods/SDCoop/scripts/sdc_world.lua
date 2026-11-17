@@ -130,6 +130,7 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 local ctx = require("sdc_ctx")
 
 local M = {
@@ -140,6 +141,7 @@ local M = {
         fol_sent = 0, fol_applied = 0, harv_blocked = 0, harv_requests = 0, harv_host = 0, salvage = 0,
         trash = 0, booms = 0, infest = 0, dmg_sent = 0, dmg_host = 0,
         build_modes = 0, builds = 0, build_tails = 0,
+        ground_take_sent = 0, ground_taken = 0, ground_take_miss = 0, ground_take_far = 0,
         scopes = 0, grants = 0, grant_drops = 0, snapshots = 0, pending = 0,
         prefab_blocked = 0, prefab_ai_blocked = 0, prefab_replicated = 0, prefab_removed = 0,
         hits_sent = 0, hits_host = 0, hits_dup = 0, dressed = 0, fol_idx = 0, fol_ovl = 0, fol_miss = 0,
@@ -247,6 +249,12 @@ local CB = {
     nkeys = 0,
     logged = 0,
     scanned = {},          -- host: [class] = clock of its last FindAllOf (a container the watch missed)
+    cls = {},              -- [path] = class of a live entry (kept so that a pass skips the places of other classes
+                           -- without an engine lookup: 14.11, a list with one camp key held the game 334 ms)
+    SLICE_S = 0.003,       -- a sliced pass (apply_all, the 30 s prune) works this long per frame
+    run = nil,             -- client: the sliced apply_all in progress { list, i, n, seen, looked, t0, why, dones }
+    waiting = nil,         -- client: { why, done } asked while a run goes on (they share the next run)
+    pr = nil,              -- the sliced 30 s prune in progress { list, i }
 }
 PATH.HEARING = "/Script/AIModule.Default__AISense_Hearing"
 local NOT_AN_ACTOR = "/Script/CoreUObject.Object"
@@ -1169,11 +1177,17 @@ function CB.box_of(id)
         if d and d <= bestd then best, bestd = o, d end
     end
     for p in pairs(CB.live) do
-        local o = find(p)
-        if not o then
-            CB.live[p] = nil
-        elseif ue.class_name(o) == cls and CB.ours(o) then
-            consider(o)
+        local c = CB.cls[p]
+        if c == nil or c == cls then
+            local o = find(p)
+            if not o then
+                CB.live[p] = nil
+                CB.cls[p] = nil
+            else
+                c = ue.class_name(o)
+                if c ~= "" then CB.cls[p] = c end
+                if c == cls and CB.ours(o) then consider(o) end
+            end
         end
     end
     -- host: its own containers must be here; one the watch missed (made before
@@ -1256,17 +1270,76 @@ function CB.apply_known(o, why)
 end
 
 -- Client: every copy here gets what is known about its place (after a snapshot).
-function CB.apply_all(why)
-    local n = 0
-    for p in pairs(CB.live) do
-        local o = find(p)
-        if not o then
-            CB.live[p] = nil
-        elseif CB.ours(o) and CB.apply_known(o, why) then
-            n = n + 1
+-- Sliced (CB.SLICE_S per frame): CB.live holds every runtime container of the map
+-- and a lookup of each cost 334 ms in one message (14.11). Only the places of a
+-- class the host named a key for are looked at (the class of an entry is kept
+-- when it appears; an entry with none yet is looked at). done(n, seen, looked,
+-- ms) when the pass ended; a call during a run joins the next run.
+function CB.apply_all(why, done)
+    -- a pass whose next slice never came (10 s) is dropped
+    if CB.run and clock() - (CB.run.at or CB.run.t0) > 10 then CB.run, CB.waiting = nil, nil end
+    if CB.run then
+        CB.waiting = CB.waiting or {}
+        CB.waiting[#CB.waiting + 1] = { why = why, done = done }
+        return
+    end
+    local list = {}
+    for p in pairs(CB.live) do list[#list + 1] = p end
+    local R = { list = list, i = 1, n = 0, looked = 0, t0 = clock(), why = why, dones = { done or false } }
+    CB.run = R
+    CB.apply_step(R)
+end
+
+function CB.apply_step(R)
+    if CB.run ~= R then return end
+    R.at = clock()
+    local t0 = clock()
+    local list = R.list
+    local i = R.i
+    local timer = type(ue.delay) == "function"
+    while i <= #list do
+        local p = list[i]
+        i = i + 1
+        local c = CB.cls[p]
+        if CB.live[p] ~= nil and (c == nil or CB.keys[c] ~= nil) then
+            R.looked = R.looked + 1
+            local o = find(p)
+            if not o then
+                CB.live[p] = nil
+                CB.cls[p] = nil
+            else
+                if c == nil then
+                    c = ue.class_name(o)
+                    if c ~= "" then CB.cls[p] = c end
+                end
+                if CB.ours(o) then
+                    local ok, ch = pcall(CB.apply_known, o, R.why)
+                    if ok and ch then R.n = R.n + 1
+                    elseif not ok then log.err_throttled("world.camp-apply", "world: camp apply: %s", tostring(ch)) end
+                end
+            end
+        end
+        if timer and i <= #list and clock() - t0 >= CB.SLICE_S then
+            R.i = i
+            if ue.delay("world-camps", 1, function() CB.apply_step(R) end) ~= false then return end
+            timer = false   -- no timer: the rest now
         end
     end
-    return n
+    CB.run = nil
+    local ms = (clock() - R.t0) * 1000
+    local w = CB.waiting
+    CB.waiting = nil
+    for _, d in ipairs(R.dones) do
+        if d then d(R.n, #list, R.looked, ms) end
+    end
+    if w then
+        local dones = {}
+        for k, e in ipairs(w) do dones[k] = e.done or false end
+        local R2 = { list = {}, i = 1, n = 0, looked = 0, t0 = clock(), why = w[#w].why, dones = dones }
+        for p in pairs(CB.live) do R2.list[#R2.list + 1] = p end
+        CB.run = R2
+        CB.apply_step(R2)
+    end
 end
 
 -- NotifyOnNewObject (BP_LootContainer, picklock and tool containers): a
@@ -1277,6 +1350,8 @@ function CB.on_new(o)
     local p = raw_path(o)
     if not p or p:find("Default__", 1, true) then return end
     CB.live[p] = clock()
+    local c = ue.class_name(o)
+    if c ~= "" then CB.cls[p] = c end
     CB.fresh = true
 end
 
@@ -1292,23 +1367,44 @@ function CB.pass(now)
                     CB.fresh = true
                 else
                     CB.live[p] = 0
-                    if CB.nkeys > 0 then
+                    local c = CB.cls[p]
+                    if CB.nkeys > 0 and (c == nil or CB.keys[c] ~= nil) then
                         local o = find(p)
                         if not o then
                             CB.live[p] = nil
-                        elseif CB.ours(o) then
-                            CB.apply_known(o, "its copy came in range")
+                            CB.cls[p] = nil
+                        else
+                            local c2 = ue.class_name(o)   -- (read again now that its BeginPlay ran)
+                            if c2 ~= "" then CB.cls[p] = c2 end
+                            if CB.ours(o) and (c2 == "" or CB.keys[c2] ~= nil) then
+                                CB.apply_known(o, "its copy came in range")
+                            end
                         end
                     end
                 end
             end
         end
     end
-    if now - CB.prune_at >= 30 then
+    -- every 30 s, in slices of CB.SLICE_S per tick (a lookup of each entry in one go held the game)
+    if not CB.pr and now - CB.prune_at >= 30 then
         CB.prune_at = now
-        for p in pairs(CB.live) do
-            if not find(p) then CB.live[p] = nil end
+        local list = {}
+        for p in pairs(CB.live) do list[#list + 1] = p end
+        CB.pr = { list = list, i = 1 }
+    end
+    local R = CB.pr
+    if R then
+        local t0 = clock()
+        while R.i <= #R.list do
+            local p = R.list[R.i]
+            R.i = R.i + 1
+            if CB.live[p] ~= nil and not find(p) then
+                CB.live[p] = nil
+                CB.cls[p] = nil
+            end
+            if clock() - t0 >= CB.SLICE_S then break end
         end
+        if R.i > #R.list then CB.pr = nil end
     end
 end
 
@@ -1497,10 +1593,12 @@ local function loots_msg(f)
             end
         end
     end
-    local camp_n = camps > 0 and CB.apply_all("the host's list") or 0
     M.stats.loot_applied = M.stats.loot_applied + n
-    log.info("world: host's searched containers: %d applied here, %d not found yet; camp containers: %d, %d of them here now",
-        n, miss, camps, camp_n)
+    local function say(camp_n, seen, looked, ms)
+        log.info("world: host's searched containers: %d applied here, %d not found yet; camp containers: %d, %d of them here now%s",
+            n, miss, camps, camp_n, seen and string.format(" (%d runtime containers here, %d looked at, %.0f ms in slices)", seen, looked, ms) or "")
+    end
+    if camps > 0 then CB.apply_all("the host's list", say) else say(0) end
 end
 
 -- ===========================================================================
@@ -3086,7 +3184,7 @@ local function harvest_kind_of(a)
 end
 
 -- Host: the harvestable of that kind at `loc` (nearest within MATCH).
-function HV.find(kind, loc)
+function HV.find(kind, loc, since)
     local best, bestd = nil, HV.MATCH * HV.MATCH
     local function consider(a)
         local l = ue.location(a)
@@ -3095,8 +3193,20 @@ function HV.find(kind, loc)
             if d <= bestd then best, bestd = a, d end
         end
     end
+    -- `since` (a clock time): the harvestable made by this very call is among
+    -- the entries seen since then; asking the engine about each of the
+    -- thousands seen before took 286 ms in one swing at a rock
+    if since then
+        for p, e in pairs(HV.live) do
+            if e.kind == kind and e.t >= since then
+                local a = find(p)
+                if a then consider(a) else HV.live[p] = nil end
+            end
+        end
+        if best then return best end
+    end
     for p, e in pairs(HV.live) do
-        if e.kind == kind then
+        if e.kind == kind and not (since and e.t >= since) then
             local a = find(p)
             if a then consider(a) else HV.live[p] = nil end
         end
@@ -3592,10 +3702,10 @@ function HV.spot_msg(f, pc)
     local now = clock()
     local h = { kind = kind, t = now }
     if kind == "c" then
-        h.cont = HV.gt(f[3]) and f[3]
+        h.cont = wire.uid_dec(f[3])
         if not h.cont then return end
     elseif kind == "s" then
-        h.uid = HV.gt(f[3]) and f[3]
+        h.uid = wire.uid_dec(f[3])
         if not h.uid then return end
     elseif kind ~= "n" then
         return
@@ -3810,9 +3920,9 @@ function HV.on_try_add(c, _, item_p, count_p, added_p)
     if not is_player_character(owner) or not locally_controlled(owner) then return end
     local ok
     if s.kind == "c" then
-        ok = to_host("WSPOT", name, "c", s.cont)
+        ok = to_host("WSPOT", name, "c", wire.uid_enc(s.cont))
     elseif s.kind == "s" then
-        ok = to_host("WSPOT", name, "s", s.uid)
+        ok = to_host("WSPOT", name, "s", wire.uid_enc(s.uid))
         for u, t in pairs(HV.spot_sent) do if clock() - t > HV.SPOT_S then HV.spot_sent[u] = nil end end
         HV.spot_sent[s.uid] = clock()
     else
@@ -3924,7 +4034,7 @@ local function on_hit_foliage(c, obj_p, at_p, comp_p, inst_p, hits_p)
     local idx = tonumber(get(inst_p))
     local idx_s = idx and string.format("%d", idx) or ""
     if role == "host" then
-        HV.prime_actor(HV.find(ph.kind, ph.loc))
+        HV.prime_actor(HV.find(ph.kind, ph.loc, ph.t - 0.5))
         if host_record_fol(ip, ph.loc) then
             Q.all_now("WFOL", pack(ip), loc_str(ph.loc), idx_s)
             M.stats.fol_sent = M.stats.fol_sent + 1
@@ -5869,7 +5979,7 @@ local function send_build_mode()
     local da = ue.prop(bc, "DARef")
     if not ue.valid(da) then return end
     local moving = ue.prop(bc, "ReplacingObject?") == true
-    if to_host("WBMODE", ue.path(da), moving and "1" or "0", guid_str(ue.prop(bc, "BuildUID"))) then
+    if to_host("WBMODE", ue.path(da), moving and "1" or "0", wire.uid_enc(guid_str(ue.prop(bc, "BuildUID")))) then
         M.stats.build_modes = M.stats.build_modes + 1
         log.info("world: build mode (%s %s) mirrored to the host", moving and "moving" or "placing",
             moving and ue.short(ue.prop(bc, "ReplacingActor")) or ue.short(da))
@@ -5907,7 +6017,7 @@ local function bmode_msg(f, pc)
         b.rep = false
         ue.set_prop(bc, "ReplacingObject?", false)
     end
-    local g = parse_guid(f[3])
+    local g = parse_guid(wire.uid_dec(f[3]))
     if g then ue.set_prop(bc, "BuildUID", g) end
     b.at = clock()
     b.da = ue.short(da)
@@ -6072,6 +6182,100 @@ end
 -- Client: SpawnBuild's own-player tail (@822-1545), which in single player
 -- runs on the builder's machine: pick up the ground pickup it came from,
 -- consume the item, then the next one of the same kind or leave build mode.
+-- The pickup the game spends here is this machine's copy: the host's one
+-- stays where it lay, so the same material could be built twice. The client
+-- names the pickup and the host takes its own copy (GTAKE; config ground_take, on by
+-- default, checked in the game by the self test step C.ground_take).
+local gt_at = {}      -- [pc address] = clock: one ask per second
+local GT_REACH = 350  -- cm: the client's pickup and the host's copy are one actor
+local GT_PAWN_REACH = 1000  -- cm: the spot a client names must be this near its own character
+
+local function ground_take_ask(pr)
+    if cfg.get("ground_take") ~= true then return end
+    local now = os.clock()
+    local lpc = ue.local_pc()
+    local k = lpc and addr(lpc) or 0
+    if now - (gt_at[k] or -100) < 1 then return end
+    local da = ue.prop(ue.prop(pr, "BP_JigPickupComponent"), "ItemDataAsset")
+    if not ue.valid(da) then return end
+    local loc = ue.location(pr)
+    if not loc then return end
+    gt_at[k] = now
+    if net.send_to_host("GTAKE", ue.class_name(pr), loc_str(loc), ue.path(da)) then
+        M.stats.ground_take_sent = M.stats.ground_take_sent + 1
+    end
+end
+
+-- Host: the client's build came from a pickup on the ground. Its own copy is
+-- the one near the spot it named (runtime paths differ, the item asset and the
+-- place are what matches); nothing else is touched.
+local function ground_take_msg(f, pc)
+    if not is_host() or not on("world_build") then return end
+    if cfg.get("ground_take") ~= true then return end
+    local pawn = ue.pawn_of(pc)
+    if not ue.valid(pawn) then return end
+    local k = addr(pc)
+    local now = os.clock()
+    if now - (gt_at[k] or -100) < 0.5 then return end
+    gt_at[k] = now
+    local cls = tostring(f[1] or "")
+    -- pickups come in many subclasses (BP_KnifePickup_C, BP_WeaponPickup_C, ...):
+    -- the item asset, the distance and the live check below are the filter
+    if cls == "" or not cls:find("Pickup", 1, true) then return end
+    local want = tostring(f[3] or "")
+    local x, y, z = tostring(f[2] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
+    if want == "" or not x then return end
+    local px, py, pz = tonumber(x), tonumber(y), tonumber(z)
+    -- The spot comes from the client: it has to be where that client's own character stands (a
+    -- build from a ground pickup happens at its feet), or any pickup of that item could be named
+    -- from afar. A position the host cannot read leaves the check out (nothing to compare with).
+    local ploc = ue.location(pawn)
+    if ploc then
+        local ex, ey, ez = ploc.X - px, ploc.Y - py, ploc.Z - pz
+        local far2 = ex * ex + ey * ey + ez * ez
+        if far2 > GT_PAWN_REACH * GT_PAWN_REACH then
+            M.stats.ground_take_far = M.stats.ground_take_far + 1
+            log.warn("world: %s asked to take a %s pickup at %s, %.0f m from its own character: refused",
+                ue.short(pawn), want, tostring(f[2]), math.sqrt(far2) / 100)
+            return
+        end
+    end
+    local best, bestd = nil, GT_REACH * GT_REACH
+    for _, a in ipairs(ue.find_all(cls) or {}) do
+        if HV.pickup_live(a) then
+            local da = ue.prop(ue.prop(a, "BP_JigPickupComponent"), "ItemDataAsset")
+            if ue.valid(da) and ue.path(da) == want then
+                local l = ue.location(a)
+                if l then
+                    local dx, dy, dz = l.X - px, l.Y - py, l.Z - pz
+                    local d = dx * dx + dy * dy + dz * dz
+                    if d <= bestd then best, bestd = a, d end
+                end
+            end
+        end
+    end
+    if not best then
+        M.stats.ground_take_miss = M.stats.ground_take_miss + 1
+        log.debug("world: %s built from a ground pickup %s: none with that item near %s on the host",
+            ue.short(pawn), want, tostring(f[2]))
+        return
+    end
+    local name = ue.short(best)
+    local n = tonumber(ue.prop(best, "PickupCount")) or 1
+    local ok
+    if n > 1 then
+        ok = pcall(function() best:SetPickupCount(n - 1, {}) end)
+    else
+        ok = pcall(function() best:K2_DestroyActor() end)
+    end
+    M.stats.ground_taken = M.stats.ground_taken + 1
+    log.info("world: %s built from %s on the ground: the host's pickup %s taken (ok=%s, %d left)",
+        ue.short(pawn), want, name, tostring(ok), math.max(0, n - 1))
+end
+
+-- The self test asks with a real pickup: the same check the game's build does.
+M.ask_ground_take = ground_take_ask
+
 local function built_msg(f)
     if S.role ~= "client" or not on("world_build") then return end
     local bc, pawn = own_building()
@@ -6092,6 +6296,7 @@ local function built_msg(f)
         log.warn("world: placed from the ground pickup %s: the host's pickup stays (placing from the ground is not mirrored)",
             ue.short(pr))
         apply(function() pr:PickupBuildFromGround() end)
+        ground_take_ask(pr)
     end
     -- FGuid as a plain table (a struct read from one call is not passed to another)
     local uid = parse_guid(guid_str(ue.prop(bc, "BuildUID")))
@@ -6801,7 +7006,7 @@ function LK.on_tool(c)
     LK.dur = nil
     if clock() - d.t > 0.05 then return end
     local o = c and c:get()
-    if to_host("WTOOLDUR", d.u, string.format("%.3f", d.m), d.destroy and "1" or "0", ue.short(o)) then
+    if to_host("WTOOLDUR", wire.uid_enc(d.u), wire.num(d.m, 3), d.destroy and "1" or "0", ue.short(o)) then
         M.stats.lk_tools = M.stats.lk_tools + 1
         log.info("world: tool %s worn by %.1f using %s here: sent to the host", d.u, d.m, ue.short(o))
     end
@@ -6811,7 +7016,8 @@ end
 -- player's item (ServerFuncUpdateDurabilityByUID tells the client).
 function LK.tool_msg(f, pc)
     if not is_host() then return end
-    local g = parse_guid(f[1])
+    local uid = wire.uid_dec(f[1])
+    local g = parse_guid(uid)
     local m = math.max(0, math.min(100, num(f[2], 0)))
     local pawn = ue.pawn_of(pc)
     local jig = pawn and ue.prop(pawn, "BP_JigMultiplayer")
@@ -6823,7 +7029,7 @@ function LK.tool_msg(f, pc)
     local out = {}
     local ok, err = pcall(function() jig:ServerFuncUpdateDurabilityByUID(g, m, f[3] == "1", out) end)
     M.stats.lk_tools = M.stats.lk_tools + 1
-    log.info("world: %s's tool %s worn by %.1f (%s) on the host%s", ue.short(pc), tostring(f[1]), m, tostring(f[4] or "?"),
+    log.info("world: %s's tool %s worn by %.1f (%s) on the host%s", ue.short(pc), tostring(uid), m, tostring(f[4] or "?"),
         ok and string.format(": now %s", tostring(out.NewDur)) or (" FAILED " .. tostring(err)))
 end
 
@@ -7211,13 +7417,36 @@ for _, b in ipairs({ "BP_ZombieBossHorde_Infestation", "BP_ZombieBossHorde_Milit
 end
 
 HOOKS.missed = {}   -- [path] = true: its "not ready" was logged once
+-- A function that is named in the class but has no body in this build (UFunction::Func 0x0:
+-- BP_EnterArea_C:Event_EnteredArea and the like) never hooks, and each try costs ~22 ms inside
+-- UE4SS every 3 s. After TRIES attempts with the class itself loaded it is left alone until the
+-- next world (M.reset clears both tables).
+HOOKS.tries, HOOKS.dead = {}, {}
+local HOOK_TRIES = 8
 local function try_hooks(force, natives_only)
     local now = clock()
-    if not force and now - hook_try_at < 3 then return end
-    if not natives_only then hook_try_at = now end
-    for _, h in ipairs(HOOKS) do
+    -- a pass in progress (HOOKS.cursor) goes on at the next tick; a new one starts 3 s after the last ended
+    if not force and not HOOKS.cursor and now - hook_try_at < (HOOKS.idle or 3) then return end
+    if not natives_only and not HOOKS.cursor then hook_try_at = now end
+    -- A registration that fails (the class is not loaded: the main menu) costs ~22 ms inside
+    -- UE4SS, the ~60 of them in one pass held the game for 1280 ms (0.12.1 log): a tick's pass
+    -- stops after 3 ms and goes on from there at the next tick (force / natives: all at once).
+    local sliced = not force and not natives_only
+    local first = sliced and HOOKS.cursor or 1
+    if not natives_only then HOOKS.cursor = nil end   -- (the natives-only call of a reset leaves a pass in progress alone)
+    for i = first, #HOOKS do
+        local h = HOOKS[i]
         local path = h[1]
-        if not hooked[path] and (h.native or not natives_only) then
+        -- an entry whose path is not a string (a constant that came back nil) has nothing to
+        -- register and no name to match on, so it is left out once instead of failing every
+        -- pass. A safety net only: PW.PATHS.save / .delete are defined strings (checked 17.11)
+        if type(path) ~= "string" then
+            local k = "#" .. i
+            if not HOOKS.missed[k] then
+                HOOKS.missed[k] = true
+                log.warn("world: hook entry #%d has no path (%s): left out", i, type(path))
+            end
+        elseif not hooked[path] and not HOOKS.dead[path] and (h.native or not natives_only) then
             local cb = guarded(h[2], h[3])
             local ok, err
             if h.native then
@@ -7228,15 +7457,42 @@ local function try_hooks(force, natives_only)
             if ok then
                 hooked[path] = true
                 log.info("world: hook ok (%s)", path:match("([%w_]+%.[%w_]+:[%w_%?]+)$") or path)
-            elseif not HOOKS.missed[path] then
-                -- once per hook: in the main menu most classes are not loaded and
-                -- the retry every few seconds logged a full traceback each time
-                -- (0.7.1: 1802 of them in 8 min in the menu); it hooks later
-                HOOKS.missed[path] = true
-                log.debug("world: hook not ready yet %s (%s); retried quietly until it hooks", path,
-                    (tostring(err):match("^[^\r\n]*") or "?"))
+            else
+                if not HOOKS.missed[path] then
+                    -- once per hook: in the main menu most classes are not loaded and
+                    -- the retry every few seconds logged a full traceback each time
+                    -- (0.7.1: 1802 of them in 8 min in the menu); it hooks later
+                    HOOKS.missed[path] = true
+                    log.debug("world: hook not ready yet %s (%s); retried quietly until it hooks", path,
+                        (tostring(err):match("^[^\r\n]*") or "?"))
+                end
+                -- the class is loaded and the function still will not hook: it has no body here
+                -- (UFunction::Func 0x0), no retry will change that. Only a try made with the class
+                -- itself in memory says anything about the function: the tries of the main menu
+                -- (every class unloaded) do not count, or the first failure after a class loads
+                -- would end the hook for the whole world.
+                local cls = path:match("^([^:]+)")
+                local loaded = cls and ue.find_object(cls)
+                local n = (HOOKS.tries[path] or 0) + (loaded and 1 or 0)
+                HOOKS.tries[path] = n
+                if loaded and n >= HOOK_TRIES then
+                    HOOKS.dead[path] = true
+                    if ue.probe_hook then ue.probe_hook(path, "world") end
+                    log.info("world: hook %s gives up after %d tries: the class is here and the function has no body in this build",
+                        path, n)
+                end
+            end
+            if sliced and i < #HOOKS and clock() - now >= 0.003 then
+                HOOKS.cursor = i + 1
+                return
             end
         end
+    end
+    if sliced then
+        hook_try_at = clock()
+        -- the main menu: the classes are not loaded, every try fails (~22 ms each); a world load
+        -- is noticed by the next pass in 15 s at most, and the hooks of a loaded world every 3 s as before
+        HOOKS.idle = (ue.in_main_menu and ue.in_main_menu() == true) and 15 or 3
     end
 end
 
@@ -7452,26 +7708,26 @@ local function tick()
     if role ~= "host" and role ~= "client" then return end
     try_hooks(false)
     local now = clock()
-    if on("world_containers") then CB.pass(now) end
+    if on("world_containers") then ue.sub_time("world.containers", CB.pass, now) end
     -- mines whose 30 ms delay did not run
     if #MN.out > 0 and now - MN.out[1].t > 1 then MN.flush() end
     if role == "host" then
-        Q.host_pump()
+        ue.sub_time("world.queue", Q.host_pump)
         if on("world_harvest") then HV.wait_pass(now) end
         HV.pend_pass(now)
         if on("world_objects") then
-            RI.host_pass(now)
-            EV.host_pass()
+            ue.sub_time("world.inf", RI.host_pass, now)
+            ue.sub_time("world.events", EV.host_pass)
         end
         if on("world_doors") then PW.host_tick(now) end
-        if on("world_prefabs") then EV.crate_pass(now) end
+        if on("world_prefabs") then ue.sub_time("world.crates", EV.crate_pass, now) end
     else
-        Q.client_pump()
+        ue.sub_time("world.queue", Q.client_pump)
         if on("world_harvest") then
             HV.flush()
-            HV.dress_pass(now)
+            ue.sub_time("world.dress", HV.dress_pass, now)
         end
-        if on("world_objects") then RI.client_pass(now) end
+        if on("world_objects") then ue.sub_time("world.inf", RI.client_pass, now) end
         if on("world_doors") then PW.client_tick(now) end
     end
     if now - last_slow < 2 then return end
@@ -7517,6 +7773,11 @@ function M.tick()
 end
 
 function M.reset(why)
+    -- the first hook pass of the new world is not held back by the last pass's wait (15 s in the menu)
+    hook_try_at, HOOKS.idle, HOOKS.cursor = -100, nil, nil
+    -- a new world: the classes and their functions are loaded again, so the hooks left alone
+    -- in the last world get their tries back
+    HOOKS.tries, HOOKS.dead = {}, {}
     cls_cache, cls_cache_at, weapon_pc, swing = {}, 0, {}, nil
     hitters, grant_until = {}, {}
     fol_removed, fol_seen = {}, {}
@@ -7529,6 +7790,7 @@ function M.reset(why)
     Q.cref, Q.cref_set, Q.cref_head, Q.cwave = {}, {}, 1, nil
     -- (CB.live stays, like HV.live: gone ones drop out when looked up)
     CB.keys, CB.nkeys, CB.fresh = {}, 0, next(CB.live) ~= nil
+    CB.run, CB.waiting, CB.pr = nil, nil, nil
     cache = { block_cls = nil, harvest_cls = {}, scrap = nil, cue = nil }
     world_since = nil
     -- (HV.live stays: harvestables seen by the watch around a role change;
@@ -7573,6 +7835,7 @@ function M.register_handlers()
     net.on("WINFXP", IX.xp_msg)
     net.on("WBMODE", bmode_msg)
     net.on("WBUILT", built_msg)
+    net.on("GTAKE", ground_take_msg)
     net.on("WHHIT", HV.hit_msg)
     net.on("WSPOT", HV.spot_msg)
     -- (sent past the send queue like WHHIT: it must reach the host before the

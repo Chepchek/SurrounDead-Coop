@@ -147,6 +147,7 @@ local cfg = require("sdc_config")
 local net = require("sdc_net")
 local ctx = require("sdc_ctx")
 local notes = require("sdc_notes")
+local MD = require("sdc_markerdata")   -- the map marker's S_MarkerData (the game's 17.11 layout)
 
 local M = {
     stats = { events = 0, empty = 0, sent = 0, sounds = 0, far = 0, notes = 0, markers_sent = 0, wrecks = 0,
@@ -254,19 +255,18 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Host: the spawner's BP_Marker_C as the host shows it; spec, title.
+-- Since the game's 17.11.2026 update the marker's look is its MarkerData struct (sdc_markerdata); the
+-- description stays a property of BP_Marker.
 local function marker_spec(m)
     if not ue.valid(m) then return nil end
-    local tex = ue.prop(m, "MarkerTexture")
-    local title, desc = text_of(ue.prop(m, "MarkerTitle")), text_of(ue.prop(m, "MarkerDescription"))
-    local sz, c = ue.prop(m, "Texture Size"), ue.prop(m, "Color")
-    local function f(o, k) return num(ue.try(function() return o[k] end)) end
-    local sx, sy = sz and f(sz, "X"), sz and f(sz, "Y")
-    local r, g, b, a = c and f(c, "R"), c and f(c, "G"), c and f(c, "B"), c and f(c, "A")
+    local md = MD.read(m) or {}
+    local tex, title, desc = md.tex, md.title or "", text_of(ue.prop(m, "MarkerDescription"))
+    local sz, c = md.size, md.color
     local spec = table.concat({
         ue.valid(tex) and short_path(ue.path(tex)) or "", esc(title), esc(desc),
-        string.format("%.3f,%.3f", sx or SIZE0.X, sy or SIZE0.Y),
-        string.format("%.4f,%.4f,%.4f,%.4f", r or COL0.R, g or COL0.G, b or COL0.B, a or COL0.A),
-        ue.prop(m, "AddMarkerToCompass?") == true and "1" or "0",
+        string.format("%.3f,%.3f", sz and sz.X or SIZE0.X, sz and sz.Y or SIZE0.Y),
+        string.format("%.4f,%.4f,%.4f,%.4f", c and c.R or COL0.R, c and c.G or COL0.G, c and c.B or COL0.B, c and c.A or COL0.A),
+        md.compass and "1" or "0",
     }, ">")
     return spec, title
 end
@@ -832,12 +832,11 @@ function M.place_marker(key, loc, mk)
         return "map marker spawn FAILED"
     end
     local tex = mk.tex ~= "" and ue.loaded_asset(full_path(mk.tex), "events") or nil
-    if tex then ue.set_prop(a, "MarkerTexture", tex) end
-    ue.set_prop(a, "MarkerTitle", FText(mk.title))
     ue.set_prop(a, "MarkerDescription", FText(mk.desc))
-    ue.set_prop(a, "Texture Size", { X = mk.size.X, Y = mk.size.Y })
-    ue.set_prop(a, "Color", { R = mk.col.R, G = mk.col.G, B = mk.col.B, A = mk.col.A })
-    ue.set_prop(a, "AddMarkerToCompass?", mk.compass)
+    local okw, how = MD.write(a, { tex = tex, title = mk.title, size = mk.size, color = mk.col, compass = mk.compass })
+    if not okw then
+        log.err_throttled("events.marker.data", "events: the host's event marker '%s': %s", mk.title, tostring(how))
+    end
     local okf, done = pcall(function() return gs:FinishSpawningActor(a, tf, 1) end)
     local actor = (okf and ue.valid(done)) and done or a
     st.markers[key] = ue.path(actor)

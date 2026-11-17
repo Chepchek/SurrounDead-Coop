@@ -147,7 +147,10 @@ local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigCompone
 local WANDERER = "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C"
 local GIVER = "/Game/Quests/Blueprints/NPCs/BP_QuestGiver.BP_QuestGiver_C"
 local GIVER_SERVER = GIVER .. ":OnServerExecuteInteract"
-local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker.Quest_Event_SpawnMarker_C:ExecuteEvent"
+-- 17.11.2026: Quest_Event_SpawnMarker is gone: _AI / _Object (ActorTag only), the level's spawner places the marker
+local SPAWN_MARKER = "/Game/Quests/Events/Quest_Event_SpawnMarker_AI.Quest_Event_SpawnMarker_AI_C:ExecuteEvent"
+local SPAWN_MARKER_OBJ = "/Game/Quests/Events/Quest_Event_SpawnMarker_Object.Quest_Event_SpawnMarker_Object_C:ExecuteEvent"
+local MDF = require("sdc_markerdata").F   -- S_MarkerData member names
 local REMOVE_MARKER = "/Game/Quests/Events/Quest_Event_RemoveMarker.Quest_Event_RemoveMarker_C:ExecuteEvent"
 local REWARD_XP = "/Game/Quests/Events/Reward/Quest_Event_RewardPlayerXP.Quest_Event_RewardPlayerXP_C:ExecuteEvent"
 local CRATE_OPEN = "/Game/Quests/Blueprints/Objects/BP_GuaranteedSpawner.BP_GuaranteedSpawner_C:OpenContainer"
@@ -176,7 +179,7 @@ local function new_world(is_server)
     W.paths["/Script/Engine.Default__GameplayStatics"] = new({ "GameplayStatics" }, "GPS", {}, {
         DeleteGameInSlot = record("DeleteGameInSlot", true),
         BeginDeferredActorSpawnFromClass = function(_, _, _, tf)
-            local m = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147400000 - next_addr), { _loc = tf.Translation },
+            local m = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_" .. (2147400000 - next_addr), { _loc = tf.Translation, MarkerData = {} },
                 { K2_DestroyActor = function(self) self._valid = false end })
             W.spawned[#W.spawned + 1] = m
             return m
@@ -196,7 +199,7 @@ local function new_world(is_server)
     class_asset(MARKER, "BP_QuestMarker_C")
     for _, p in ipairs({ GNC, BEGIN, CBEGIN, CEXIT, SPAWN, CNDT, TEVENT, JIG .. ":Handle Comp to Comp Move",
             JIG .. ":CheckVendorAmountOfMoney", WANDERER .. ":OnExecuteInteractEnded", GIVER_SERVER,
-            SPAWN_MARKER, REMOVE_MARKER, REWARD_XP, CRATE_OPEN, JOURNAL .. ":Show Quest", JOURNAL .. ":ForgetQuest",
+            SPAWN_MARKER, SPAWN_MARKER_OBJ, REMOVE_MARKER, REWARD_XP, CRATE_OPEN, JOURNAL .. ":Show Quest", JOURNAL .. ":ForgetQuest",
             NC_BEGINQ, NC_FORGETQ, NC_ONREP }) do
         fn_obj(p)
     end
@@ -429,14 +432,26 @@ fire(GNC, param(LIBCDO), g2)
 check(g2:get() == gen, "host: generator at the host: untouched")
 
 -- markers / XP of the client's quest
-local hm_old = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_2147400500", { Tags = tarray({ "Bounty1" }) },
-    { K2_DestroyActor = function(self) self._valid = false end })
-local hm_new = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_2147300000", { Tags = tarray({ "Bounty1" }) },
-    { K2_DestroyActor = function(self) self._valid = false end })
-local ev = new({ "Quest_Event_SpawnMarker_C" }, "Event_SpawnMarker", { ActorTag = "Bounty1", Location = { X = 1, Y = 2, Z = 3 }, Text = "Camp" })
+local function host_marker_data()   -- what the level's spawner gave the marker (S_MarkerData)
+    return { [MDF.title] = "Camp", [MDF.color] = { R = 0.5, G = 0.25, B = 0.125, A = 1 }, [MDF.ug] = true,
+        [MDF.radius] = 3000, [MDF.tex_size] = { X = 4, Y = 4 }, [MDF.text_size] = { X = 1, Y = 1 } }
+end
+local hm_old = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_2147400500", { Tags = tarray({ "Bounty1" }), _loc = { X = 9, Y = 9, Z = 9 },
+    MarkerData = host_marker_data() }, { K2_DestroyActor = function(self) self._valid = false end })
+local hm_new = new({ "BP_QuestMarker_C" }, "BP_QuestMarker_C_2147300000", { Tags = tarray({ "Bounty1" }), _loc = { X = 1, Y = 2, Z = 3 },
+    MarkerData = host_marker_data() }, { K2_DestroyActor = function(self) self._valid = false end })
+-- the event itself only carries the tag now (the spawner already placed hm_new when the post-hook runs)
+local ev = new({ "Quest_Event_SpawnMarker_AI_C" }, "Event_SpawnMarker", { ActorTag = "Bounty1" })
 fire(SPAWN_MARKER, param(ev), param(rpawn), param(rpc), param(rcomp))
 local qm = msgs("QM", false)
 check(#qm == 1 and qm[1].pc == rpc and qm[1].f[3] == "a" and qm[1].f[4] == "Bounty1", "host: client's quest marker sent to that client only")
+check(qm[1].f[5] == "1" and qm[1].f[6] == "2" and qm[1].f[7] == "3" and qm[1].f[9] == "Camp" and qm[1].f[10] == "0.500"
+    and qm[1].f[14] == "1" and qm[1].f[15] == "3000" and qm[1].f[16] == "4.000" and qm[1].f[17] == "4.000"
+    and qm[1].f[18] == "1.000" and qm[1].f[19] == "1.000",
+    "host: QM carries the marker's place (the newest copy) and its MarkerData: title, colour, underground, radius, sizes: " .. table.concat(qm[1].f, "|", 3))
+local tag_obj = new({ "Quest_Event_SpawnMarker_Object_C" }, "Event_SpawnMarkerO", { ActorTag = "NoSuchTag" })
+fire(SPAWN_MARKER_OBJ, param(tag_obj), param(rpawn), param(rpc), param(rcomp))
+check(#msgs("QM", false) == 1 and logged("the spawner placed no marker") ~= nil, "host: an _Object event whose spawner placed no marker: nothing sent, noted")
 check(hm_new._valid == false and hm_old._valid == true, "host: the copy the client's quest placed in the host's world removed (the newest)")
 fire(SPAWN_MARKER, param(ev), param(hpawn), param(hpc), param(hcomp))
 check(#msgs("QM", false) == 1, "host: the host's own quest marker is not sent")
@@ -538,8 +553,14 @@ deliver("SDC1|QM|a|Bounty2|1|2|3||Camp|1|0|0|1|0")
 check(#W.spawned == 0, "client: marker placed here by the own quest already: not spawned again")
 deliver("SDC1|QM|a|Bounty3|1|2|3||Camp|1|0|0|1|0")
 check(#W.spawned == 1, "client: marker from the host spawned")
+deliver("SDC1|QM|a|Bounty4|1|2|3||Camp 4|1|0.5|0.25|1|1|2500|4.5|4.5|1|1")
+local sm = W.spawned[2]
+check(sm and sm._p.MarkerData[MDF.title] == "Camp 4" and sm._p.MarkerData[MDF.ug] == true and sm._p.MarkerData[MDF.radius] == 2500
+    and sm._p.MarkerData[MDF.color].G == 0.5 and sm._p.MarkerData[MDF.tex_size].X == 4.5 and sm._p.MarkerData[MDF.text_size].Y == 1,
+    "client: the marker's MarkerData set from QM (title, underground, radius, colour, sizes)")
+check(logged("quest marker 'Bounty4' placed (texture false, data members") ~= nil, "client: logged how the data went in")
 deliver("SDC1|QM|BP_MilitaryTrader_C|1200|0|0|5")
-check(#W.spawned == 1, "client: a stray QM (not a/d) is ignored")
+check(#W.spawned == 2, "client: a stray QM (not a/d) is ignored")
 -- journal forget
 local jq = new({ "Quest_Dungeon_LaboratoryBunker_C" }, "Quest_LB")
 jq._cls = W.lab_quest

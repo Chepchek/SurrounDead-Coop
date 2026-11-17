@@ -54,6 +54,9 @@ local JOIN_WAIT_S = 120    -- a join keeps retrying while the host has no world 
 local JOIN_RETRY_S = 6
 local JOIN_NO_ANSWER_S = 45
 local OPEN_TIMEOUT_S = 75
+-- No "closed or crashed" before this long into the join: a slow world load or a
+-- slow Steam rendezvous looks exactly like a host that is gone for a while.
+local SILENT_GRACE_S = 25
 
 local L = {
     S = nil, dir = nil, exe = nil, version = "?",
@@ -77,6 +80,9 @@ M._L = L   -- tests
 local TEXT = {
     sl_joining      = { "Connecting to %s through Steam...", "Подключение к %s через Steam..." },
     sl_wait_host    = { "%s has not opened a world yet: waiting up to 2 minutes...", "%s ещё не открыл мир — жду до 2 минут..." },
+    -- no answer yet: too early to tell a slow host from a gone one
+    sl_host_no_answer = { "%s does not answer through Steam yet: still trying (a slow world load or a slow connection looks the same for a while)...",
+                        "%s пока не отвечает через Steam — ещё пробую (медленная загрузка мира и медленная связь выглядят одинаково)..." },
     -- the host's Steam gives no answer at all (helper reason timeout / rendezvous)
     sl_host_silent  = { "%s does not answer through Steam: their game may be closed or may have crashed. Trying again for up to 2 minutes...",
                         "%s не отвечает через Steam — возможно, игра хоста закрыта или вылетела. Пробую снова до 2 минут..." },
@@ -106,6 +112,7 @@ local TEXT = {
     sl_st_ready     = { "Steam: ready.", "Steam: готово." },
     sl_st_hosting   = { "Open to Steam friends · connected: %d", "Открыт для друзей в Steam · подключено: %d" },
     sl_st_waiting   = { "Waiting for %s to open a world...", "Жду, пока %s откроет мир..." },
+    sl_st_no_answer = { "%s does not answer yet: still trying...", "%s пока не отвечает — ещё пробую..." },
     sl_st_silent    = { "%s does not answer (game closed or crashed?): trying again...",
                         "%s не отвечает (игра закрыта или вылетела?) — пробую снова..." },
     sl_st_silent_left = { "%s does not answer: the host's game seems to have closed or crashed. Trying again...",
@@ -657,7 +664,16 @@ local function join_tick(now)
             clear_join("own id")
         elseif RETRY[reason] and now < j.deadline then
             j.retry_at = now + JOIN_RETRY_S
-            j.silent = SILENT[reason] == true
+            local silent = SILENT[reason] == true
+            local started = j.started_at or j.sent_at or now
+            -- a connection that ended a moment ago says the host was there: the
+            -- "closed or crashed" word is right from the first failure then
+            local had_recent = L.left ~= nil and L.left.sid == j.sid and (now - L.left.t) <= LEFT_RECENT_S
+            local early = silent and not had_recent and (now - started < SILENT_GRACE_S)
+            -- until the grace is over only "does not answer yet" is shown: the
+            -- host may be loading its world or the line may be slow
+            j.waiting = early or nil
+            j.silent = silent and not early
             if j.silent then
                 -- no answer at all: not "has not opened a world yet"
                 if not j.silent_toasted then
@@ -669,6 +685,11 @@ local function join_tick(now)
                     else
                         notify("sl_host_silent", "warn", 10, { j.name }, { j.sid })
                     end
+                end
+            elseif early then
+                if not j.answer_toasted then
+                    j.answer_toasted = true
+                    notify("sl_host_no_answer", "info", 8, { j.name }, { j.sid })
                 end
             elseif not j.wait_toasted then
                 j.wait_toasted = true
@@ -870,7 +891,7 @@ function M.request_tunnel(sid)
         notify("sl_self", "warn", 6)
         return false, "self"
     end
-    L.join = { sid = sid, name = friend_name(sid), deadline = now + JOIN_WAIT_S, attempt = 0 }
+    L.join = { sid = sid, name = friend_name(sid), deadline = now + JOIN_WAIT_S, attempt = 0, started_at = now }
     send_join(now)
     notify("sl_joining", "info", 6, { L.join.name }, { sid })
     return true
@@ -942,8 +963,10 @@ function M.status()
             return detail(s, "sl_st_connected", j.name, (ping and ping >= 0) and tostring(ping) or "?")
         end
         s.state = "joining"
+        s.waiting = j.waiting == true
         s.silent = j.silent == true   -- the host's Steam gives no answer (its game closed / crashed?)
         if j.silent then return detail(s, j.silent_left and "sl_st_silent_left" or "sl_st_silent", j.name) end
+        if j.waiting then return detail(s, "sl_st_no_answer", j.name) end
         if j.retry_at or j.wait_toasted then return detail(s, "sl_st_waiting", j.name) end
         return detail(s, "sl_joining", j.name)
     end

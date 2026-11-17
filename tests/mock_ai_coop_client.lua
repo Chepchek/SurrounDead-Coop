@@ -605,14 +605,27 @@ local function swapped()
     return n
 end
 local looks = client_mod("sdc_ai_looks")
-local spread0 = looks.stats.spread
+local function spread_n() return looks.stats.spread + (looks.stats.cut_visits or 0) end   -- a pass cut short by an apply or by its time budget
+local spread0 = spread_n()
+local applied0 = looks.stats.applied
 batch(6, 2000, true)
 check(swapped() == 2, "6 looks at once: 2 applied at once (event budget), 4 wait (" .. swapped() .. ")")
 advance(1.1)
 client_tick()
-check(swapped() == 3 and looks.stats.spread == spread0 + 1, "slow applies (30 ms): one per pass (" .. swapped() .. ")")
+check(swapped() == 3 and spread_n() == spread0 + 1, "slow applies (30 ms): one per pass (" .. swapped() .. ")")
+-- 14.11: the apply was cut after its mesh (30 ms >= 20): bones / body / fx / name follow in a later pass; the pass
+-- itself was cut short by its time budget and goes on at the very next tick (no wait for the next list of copies)
+check((looks.stats.cut or 0) >= 1, "a slow apply is cut after its mesh and material (" .. tostring(looks.stats.cut) .. ")")
+check((looks.stats.cut_visits or 0) >= 1 and looks._t.cpass().more == true, "the pass stopped at its time budget and has the rest to do")
+local sw_before = swapped()
+client_tick()
+check(swapped() == sw_before + 1, "the next tick goes on at once with the rest of that pass (" .. swapped() .. ")")
 for _ = 1, 3 do advance(1.1); client_tick() end
 check(swapped() == 6, "the rest one per pass, 1 s apart (" .. swapped() .. ")")
+-- (a slow apply is cut after its mesh: what is left of each look is finished by later passes, 4 per pass)
+for _ = 1, 4 do advance(1.1); client_tick() end
+check(looks.stats.applied - applied0 == 6 and next(looks._t.deferred()) == nil, "all 6 looks finished (the cut ones too), nothing left waiting ("
+    .. (looks.stats.applied - applied0) .. ")")
 batch(6, 4000, false)
 check(swapped() == 2, "fast batch: 2 at once")
 advance(1.1)

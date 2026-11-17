@@ -72,6 +72,7 @@ local log = require("sdc_log")
 local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 local ctx = require("sdc_ctx")
 local items = require("sdc_items")
 local consume = require("sdc_consume")
@@ -498,8 +499,10 @@ end
 
 -- Host tick: (re)build the entries of every remote player's equipped weapons
 -- so the hooks only look them up; drop entries of weapons no longer equipped.
+local REFRESH_PER_TICK = 1
 local function refresh_remote(remote_pcs, now)
     local seen = {}
+    local refreshed = 0
     for _, pc in ipairs(remote_pcs) do
         if ue.valid(pc) then
             apply_skills(pc)
@@ -511,11 +514,15 @@ local function refresh_remote(remote_pcs, now)
                     if WEAPON_SLOTS[it.slot] and ue.valid(it.actor) then
                         uids = uids or equipment_uids(pawn)
                         local e = entries[a]
-                        if e and e.remote and e.pawn_a == pa and e.slot == it.slot and e.uid == uids[it.slot]
-                            and now - e.built < REFRESH_S then
+                        local same = e and e.remote and e.pawn_a == pa and e.slot == it.slot and e.uid == uids[it.slot]
+                        -- the periodic re-read (REFRESH_S) of a weapon that is still the same: one per
+                        -- tick, the others wait for the next second (every weapon of every player in the
+                        -- same second was 30-48 ms in a frame); a new or changed weapon is built at once
+                        if same and (now - e.built < REFRESH_S or refreshed >= REFRESH_PER_TICK) then
                             e.t = now
                             fix_weapon_skills(it.actor, pc)
                         else
+                            if same then refreshed = refreshed + 1 end
                             e = build(it.actor, pawn, pc, it.slot, uids, nil, now, e)
                             entries[a] = e
                         end
@@ -848,7 +855,7 @@ function M.client_tick()
     for slot, r in pairs(own_weapon_stats() or {}) do
         local key = r.uid .. "|" .. r.text
         if client.sent[slot] ~= key or now - (client.sent_t[slot] or 0) >= RESEND_S then
-            if net.send_to_host("WSTAT", slot, r.uid, r.text) then
+            if net.send_to_host("WSTAT", slot, r.uid ~= "" and wire.uid_enc(r.uid) or "", r.text) then
                 client.sent[slot], client.sent_t[slot] = key, now
                 log.debug("damage: reported %s stats (%s)", slot_short(slot), r.text)
             end
@@ -894,7 +901,7 @@ function M.register_handlers()
     -- (empty text: the item has no stats; "-": the slot holds no item)
     net.on("WSTAT", function(f, pc)
         if not S or S.role ~= "host" then return end
-        local slot, uid, text = f[1] or "", known_uid(f[2]) or "", f[3] or ""
+        local slot, uid, text = f[1] or "", known_uid(wire.uid_dec(f[2])) or "", f[3] or ""
         if not WEAPON_SLOTS[slot] or not ue.valid(pc) then return end
         local k = addr(pc)
         if not k then return end

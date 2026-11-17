@@ -11,7 +11,7 @@
   <a href="../../actions/workflows/check.yml"><img alt="check" src="https://img.shields.io/github/actions/workflow/status/Chepchek/SurrounDead-Coop/check.yml?style=flat-square&label=check"></a>
   <img alt="SurrounDead v0.8.0" src="https://img.shields.io/badge/SurrounDead-v0.8.0-2c3a28?style=flat-square">
   <img alt="Unreal Engine 5.6" src="https://img.shields.io/badge/Unreal%20Engine-5.6-2c3a28?style=flat-square&logo=unrealengine">
-  <img alt="UE4SS 3.0.1" src="https://img.shields.io/badge/UE4SS-3.0.1%20experimental-2c3a28?style=flat-square">
+  <img alt="UE4SS 4.0.0" src="https://img.shields.io/badge/UE4SS-4.0.0-2c3a28?style=flat-square">
   <img alt="Lua 5.4" src="https://img.shields.io/badge/Lua-5.4-2c3a28?style=flat-square&logo=lua">
   <img alt="Windows" src="https://img.shields.io/badge/platform-Windows-2c3a28?style=flat-square">
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-2c3a28?style=flat-square"></a>
@@ -164,7 +164,7 @@
 
 Удаление: удалите `dwmapi.dll` и папку `ue4ss` из `SurrounDead\Binaries\Win64`.
 
-**Из исходников:** нужен UE4SS с поддержкой UE 5.6 (мод проверялся на v3.0.1 Experimental, сборка `4fb9b615`). Скопируйте папку `mods/SDCoop` в `SurrounDead\Binaries\Win64\ue4ss\Mods\` — файл `enabled.txt` включит мод. Помощник для Steam собирается из `tools/steamlink` командой `powershell -ExecutionPolicy Bypass -File tools\steamlink\build.ps1 -Out <папка игры>\SurrounDead\Binaries\Win64\ue4ss\Mods\SDCoop\steamlink` (нужен только .NET Framework 4, он есть в Windows).
+**Из исходников:** нужен UE4SS с поддержкой UE 5.6 (мод проверялся на v4.0.0). Скопируйте папку `mods/SDCoop` в `SurrounDead\Binaries\Win64\ue4ss\Mods\` — файл `enabled.txt` включит мод. Помощник для Steam собирается из `tools/steamlink` командой `powershell -ExecutionPolicy Bypass -File tools\steamlink\build.ps1 -Out <папка игры>\SurrounDead\Binaries\Win64\ue4ss\Mods\SDCoop\steamlink` (нужен только .NET Framework 4, он есть в Windows).
 
 ## Как играть
 

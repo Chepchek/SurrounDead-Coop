@@ -9,6 +9,10 @@
 -- usage: lua mock_weapon_wear.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
+-- messages carry the short UID: tests write "A:B:C:D" and convert
+local function w(t) return (t:gsub("%-?%d+:%-?%d+:%-?%d+:%-?%d+", wire.uid_enc)) end
+local function d(t) return (t:gsub("[%w_%-]+", function(x) return wire.uid_dec(x) or x end)) end
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -123,7 +127,7 @@ local function fire(path, obj, ...)
 end
 local function gwear(from)
   local out = {}
-  for i = (from or 1), #to_host do if to_host[i].kind == "GWEAR" then out[#out + 1] = to_host[i].args[1] end end
+  for i = (from or 1), #to_host do if to_host[i].kind == "GWEAR" then out[#out + 1] = d(to_host[i].args[1]) end end
   return out
 end
 
@@ -179,7 +183,7 @@ check(hooks[GETDUR] ~= nil, "the GetDurability fix is registered")
 check(handlers.GWEAR ~= nil, "GWEAR handler registered")
 
 print("client: a shot of the own suppressed rifle")
-handlers.ITEMS({ "1:0:0:0=50.0;2:0:0:0=30.0;9:0:0:0=80.0" }, my_pc)
+handlers.ITEMS({ w("1:0:0:0=50.0;2:0:0:0=30.0;9:0:0:0=80.0") }, my_pc)
 check(read_dur(1) == 50, "the host's value before any shot")
 shot(my_jig, rifle, 1, 0.25, 2, 0.1)
 check(#gwear() == 0, "nothing sent inside the shot")
@@ -193,7 +197,7 @@ check(pending_delays("wear-flush") == 1, "still one delayed send for four shots"
 T = T + 0.5
 run_due("wear-flush")
 local g = gwear()
-check(#g == 1 and g[1] == "1:0:0:0=1.0000/4;2:0:0:0=0.4000/4", "one message with the sums: " .. tostring(g[1]))
+check(#g == 1 and g[1] == "1:0:0:0=1/4;2:0:0:0=0.4/4", "one message with the sums: " .. tostring(g[1]))
 check(near(read_dur(1), 49.0), "sent, not confirmed: still subtracted: " .. tostring(read_dur(1)))
 check(count_log("info", "own wear sent to the host") == 1, "the send is logged")
 
@@ -264,7 +268,7 @@ delayed = {}                      -- the timer never runs
 T = T + 3
 items.client_tick()
 g = gwear(from)
-check(#g == 1 and g[1] == "1:0:0:0=0.2500/1", "the client tick sends what a lost timer left: " .. tostring(g[1]))
+check(#g == 1 and g[1] == "1:0:0:0=0.25/1", "the client tick sends what a lost timer left: " .. tostring(g[1]))
 host_link = false
 from = #to_host + 1
 T = T + 1
@@ -297,12 +301,12 @@ check(wear.stats.weapon == st and pending_delays("wear-flush") == 0, "the host's
 print("client: equipment UIDs whose durabilities change")
 S.role = "client"
 local info0 = count_log("info", "equipment UIDs from the host written")
-handlers.UIDS({ "Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=1:0:0:0@50.00" })
+handlers.UIDS({ w("Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=1:0:0:0@50.00") })
 check(count_log("info", "equipment UIDs from the host written") == info0 + 1 and eq_writes == 2, "a new map: info line, written")
-handlers.UIDS({ "Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=1:0:0:0@49.75" })
+handlers.UIDS({ w("Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=1:0:0:0@49.75") })
 check(count_log("info", "equipment UIDs from the host written") == info0 + 1 and eq_writes == 4
   and count_log("debug", "(durabilities only)") == 1, "durabilities only: written again, a debug line")
-handlers.UIDS({ "Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=3:0:0:0@100.00" })
+handlers.UIDS({ w("Jig.PlayerSlot.Headwear=5:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=3:0:0:0@100.00") })
 check(count_log("info", "equipment UIDs from the host written") == info0 + 2, "another gun: info line")
 
 -- ------------------------------------------------------------ host
@@ -361,7 +365,7 @@ pawn.BP_JigHelperComp = { __name = "Helper1", RepActorsData = A({}), ServerEquip
   EquipmentUIDs = { ForEach = function(_, f)
     for _, e in ipairs(equip) do if f(PV({ TagName = e[1] }), PV(G(e[2]))) == true then break end end
   end } }
-handlers.GWEAR({ "20:0:0:0=1.3000/5;21:0:0:0=0.5000/5" }, pc)
+handlers.GWEAR({ w("20:0:0:0=1.3000/5;21:0:0:0=0.5000/5") }, pc)
 check(#calls == 2 and calls[1].uid == 20 and near(calls[1].minus, 1.3) and calls[1].destroy == false
   and calls[2].uid == 21 and near(calls[2].minus, 0.5), "the game's function per item, summed wear, no destroy")
 check(near(inv[1].items[1].dur, 54.2) and near(inv[2].items[1].dur, 29.5), "the host's copy wore")
@@ -371,21 +375,21 @@ sent = {}
 items.host_tick({ pc })
 local it_msg, uid_msg
 for _, m in ipairs(sent) do
-  if m.kind == "ITEMS" then it_msg = m.args[1] end
-  if m.kind == "UIDS" then uid_msg = m.args[1] end
+  if m.kind == "ITEMS" then it_msg = d(m.args[1]) end
+  if m.kind == "UIDS" then uid_msg = d(m.args[1]) end
 end
-check(it_msg and it_msg:find("20:0:0:0=54.2", 1, true) and it_msg:find("21:0:0:0=29.5", 1, true),
+check(it_msg and it_msg:find("20:0:0:0=54;", 1, true) and it_msg:find("21:0:0:0=30;", 1, true),
   "ITEMS carries the worn values: " .. tostring(it_msg))
-check(uid_msg and uid_msg:find("SecondaryWeapon=20:0:0:0@54.20", 1, true), "UIDS too: " .. tostring(uid_msg))
+check(uid_msg and uid_msg:find("SecondaryWeapon=20:0:0:0@54", 1, true), "UIDS too: " .. tostring(uid_msg))
 
 print("host: what is refused")
 calls = {}
-handlers.GWEAR({ "77:0:0:0=0.2000/1" }, pc)
+handlers.GWEAR({ w("77:0:0:0=0.2000/1") }, pc)
 check(#calls == 1 and count_log("warn", "item 77:0:0:0 is not in their inventory here") == 1, "an unknown item: warned")
-handlers.GWEAR({ "77:0:0:0=0.2000/1" }, pc)
+handlers.GWEAR({ w("77:0:0:0=0.2000/1") }, pc)
 check(count_log("warn", "item 77:0:0:0 is not in their inventory here") == 1, "warned once")
 calls = {}
-handlers.GWEAR({ "20:0:0:0=500.0000/1;x=1/1;21:0:0:0=-1/1" }, pc)
+handlers.GWEAR({ w("20:0:0:0=500.0000/1;x=1/1;21:0:0:0=-1/1") }, pc)
 check(#calls == 1 and calls[1].minus == 100, "wear clamped to 100, bad entries refused")
 check(wear.stats.host_refused == 2, "two refused")
 check(count_log("info", "Char1's MarksmansLegacy is worn out (durability 0)") == 1, "a worn-out gun is logged")
@@ -393,17 +397,17 @@ local own_pc = { __name = "HostPC" }
 local host_char = character("HostChar", true, own_pc)
 host_char.BP_JigMultiplayer = make_jig("HostJig", inv)
 calls = {}
-handlers.GWEAR({ "21:0:0:0=1.0000/1" }, own_pc)
+handlers.GWEAR({ w("21:0:0:0=1.0000/1") }, own_pc)
 check(#calls == 0, "not from a remote player: ignored")
 cfgv.client_durability_from_host = false
-handlers.GWEAR({ "21:0:0:0=1.0000/1" }, pc)
+handlers.GWEAR({ w("21:0:0:0=1.0000/1") }, pc)
 check(#calls == 0, "switched off: ignored")
 cfgv.client_durability_from_host = nil
 S.role = "client"
-handlers.GWEAR({ "21:0:0:0=1.0000/1" }, pc)
+handlers.GWEAR({ w("21:0:0:0=1.0000/1") }, pc)
 check(#calls == 0, "a client ignores GWEAR")
 S.role = "host"
-for i = 1, 30 do handlers.GWEAR({ "21:0:0:0=0.1000/1" }, pc) end
+for i = 1, 30 do handlers.GWEAR({ w("21:0:0:0=0.1000/1") }, pc) end
 check(#calls == 30, "every message applied")
 check(count_log("debug", "Char1's MakeshiftMuffler2 worn by") + count_log("debug", "Char1's 21:0:0:0 worn by") >= 1,
   "after the first applications the lines go to debug")

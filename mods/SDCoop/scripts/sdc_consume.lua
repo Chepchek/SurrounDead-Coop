@@ -81,6 +81,7 @@ local ue = require("sdc_ue")
 local cfg = require("sdc_config")
 local ctx = require("sdc_ctx")
 local net = require("sdc_net")
+local wire = require("sdc_wire")   -- UIDs on the wire: 22 characters, not 43
 local containers = require("sdc_containers")
 local place = require("sdc_place")
 
@@ -90,7 +91,9 @@ local place = require("sdc_place")
 -- slices started over because the inventory changed under them)
 local M = {
     stats = { crafts_sent = 0, crafts_answered = 0, host_crafts = 0, uses = 0, desync_reports = 0,
-              ghosts_asked = 0, ghosts_ended = 0, walks_sliced = 0, walk_slices = 0, walk_restarts = 0,
+              slot_mismatch = 0,
+              ghosts_asked = 0, ghosts_ended = 0, ghosts_waiting = 0,
+              ghosts_dry = 0, walks_sliced = 0, walk_slices = 0, walk_restarts = 0,
               walks_full = 0, verifies = 0, verify_diffs = 0, signals = 0, dur_patched = 0, dur_unread = 0 },
 }
 local S
@@ -501,8 +504,12 @@ end
 -- MainJigContainers has all of these (flat), so the view must too.
 -- `grids` (optional): [grid uid] = true for each container widget (its
 -- ContainerID: the server grid it shows).
-local function scan_container(w, out, depth, seen, grids)
+-- `want` (optional): { [uid] = true, left = n }: only these items get an entry
+-- (the scan reads one property per slot instead of eight and stops when all
+-- are found: the craft check asks about a few components, 9 times a second).
+local function scan_container(w, out, depth, seen, grids, want)
     if depth > 4 or not ue.valid(w) then return end
+    if want and want.left <= 0 then return end
     local k = addr(w)
     if not k or seen[k] then return end
     seen[k] = true
@@ -513,17 +520,19 @@ local function scan_container(w, out, depth, seen, grids)
     for _, slot in ipairs(list_of(ue.prop(w, "ArrayOfItems"))) do
         if ue.valid(slot) then
             local ok, uid = pcall(function() return guid_str(slot.ItemUniqueID) end)
-            if ok and uid ~= "0:0:0:0" and not out[uid] then
+            if ok and uid ~= "0:0:0:0" and not out[uid] and (not want or want[uid]) then
                 out[uid] = { n = ue.prop(slot, "ItemCount"), name = item_name(ue.prop(slot, "JigDataAsset")),
                              da = ue.prop(slot, "JigDataAsset"), slot = slot, where = ue.try(slot_where, slot, w) or "?" }
+                if want then want.left = want.left - 1 end
             end
+            if want and want.left <= 0 then return end
             local special = ue.prop(slot, "SpecialContainerRef")
             if ue.valid(special) then
                 for _, c in ipairs(list_of(ue.prop(special, "AllContainers"))) do
-                    scan_container(c, out, depth + 1, seen, grids)
+                    scan_container(c, out, depth + 1, seen, grids, want)
                 end
             end
-            scan_container(ue.prop(slot, "SlotContainer"), out, depth + 1, seen, grids)
+            scan_container(ue.prop(slot, "SlotContainer"), out, depth + 1, seen, grids, want)
         end
     end
 end
@@ -531,12 +540,12 @@ end
 -- Client: { [uid] = { n = count, name = item name, where = slot_where() } } of
 -- what the own inventory widgets show (LocalJSIContainers -> JSI_Slot, and
 -- the containers inside worn items); with `grids` also the grids they show.
-local function client_view(jig, grids)
+local function client_view(jig, grids, want)
     local out = {}
     if not ue.valid(jig) then return out end
     local seen = {}
     for _, w in ipairs(list_of(ue.prop(jig, "LocalJSIContainers"))) do
-        pcall(scan_container, w, out, 0, seen, grids)
+        pcall(scan_container, w, out, 0, seen, grids, want)
     end
     return out
 end
@@ -560,6 +569,17 @@ local function new_gate()
     }
 end
 local gate = new_gate()
+-- After an answer whose slot held another item, the screen is out of step with
+-- the host's inventory: the slot goes and the host sends the real item again.
+-- No craft is built from that screen until the resend is here or the pause is
+-- over - a request made meanwhile picks components by the UID of an item the
+-- screen no longer shows.
+local craft_pause_until = 0
+local resync_uids = {}    -- [uid] = os.clock(): the items asked for again (RESEND)
+local function pause_crafting()
+    local s = tonumber(cfg.get("craft_resync_pause_s")) or 3
+    craft_pause_until = os.clock() + s
+end
 local widgets = {}        -- [widget address] = { w = widget, ui = CRAFT_UIS entry, at = os.clock() }
 
 local function own_jig_comp(c)
@@ -696,10 +716,16 @@ local function ghost_components(w)
     local uids = list_of(ue.prop(w, "RequestConsume"))
     if #uids == 0 then return nil end
     local me = ue.local_pawn()
-    local view = client_view(me and ue.prop(me, "BP_JigMultiplayer"))
-    local bad = {}
-    for _, g in ipairs(uids) do
+    local want, us = { left = 0 }, {}
+    for i, g in ipairs(uids) do
         local u = ue.try(guid_str, g)
+        us[i] = u or false
+        if u and not want[u] then want[u] = true; want.left = want.left + 1 end
+    end
+    local view = client_view(me and ue.prop(me, "BP_JigMultiplayer"), nil, want)
+    local bad = {}
+    for i in ipairs(uids) do
+        local u = us[i]
         local e = u and view[u]
         if e and host[u] == nil then
             bad[#bad + 1] = string.format("%s x%s (uid %s, %s)", e.name, tostring(e.n), u, e.where)
@@ -718,6 +744,12 @@ local function on_check_ingredients(ui, c, proceed_p)
     if not k then return end
     widgets[k] = { w = w, ui = ui, at = os.clock() }
     if param(proceed_p) ~= true then return end
+    -- the inventory is being resynced (a slot held another item): the screen
+    -- cannot say what the components are, so no request goes out
+    if os.clock() < craft_pause_until then
+        pcall(function() proceed_p:set(false) end)
+        return
+    end
     -- a station the host does not have: refused; otherwise the host gets the
     -- recipe table of this window first (sdc_stations)
     local stations = package.loaded["sdc_stations"]
@@ -767,6 +799,7 @@ end
 -- BP_JigComponent.CLIENT_ItemCraftedResponse(TempUID, ItemAdded, Success?,
 -- UpdateUIDS, WithCounts, IsCraftingStation?, ItemInside), post (client): the
 -- game has applied the answer.
+local remove_local_slot   -- the game's own slot removal for a failed request (defined below)
 local function on_craft_answer(c, _, added_p, ok_p, uids_p, counts_p)
     if S.role ~= "client" then return end
     local comp = own_jig_comp(c)
@@ -788,7 +821,14 @@ local function on_craft_answer(c, _, added_p, ok_p, uids_p, counts_p)
     M.stats.crafts_answered = M.stats.crafts_answered + 1
     local uids = list_of(param(uids_p))
     local counts = list_of(param(counts_p))
-    local view = client_view(comp)
+    -- only the answer's components and the added item are looked up (one property per slot)
+    local want = { left = 0 }
+    local function want_uid(u)
+        if u and not want[u] then want[u] = true; want.left = want.left + 1 end
+    end
+    for _, g in ipairs(uids) do want_uid(ue.try(function() return guid_str(g) end)) end
+    want_uid(added and ue.try(function() return guid_str(added[F_USID]) end))
+    local view = client_view(comp, nil, want)
     local parts, wrong = {}, 0
     for i, g in ipairs(uids) do
         local u = ue.try(function() return guid_str(g) end) or "?"
@@ -818,16 +858,27 @@ local function on_craft_answer(c, _, added_p, ok_p, uids_p, counts_p)
     -- goes and the host sends the real item again (RESEND).
     local added_da = added and ue.try(function() return added[F_INFO][F_ITEMID] end)
     local added_u = added and ue.try(function() return guid_str(added[F_USID]) end)
+    local resynced = false
     if success and ue.valid(added_da) and added_u and added_u ~= "0:0:0:0" then
-        local e = view[added_u] or client_view(comp)[added_u]
+        local e = view[added_u] or client_view(comp, nil, { [added_u] = true, left = 1 })[added_u]
         if e and ue.valid(e.da) and ue.name(e.da) ~= ue.name(added_da) then
-            local removed = ue.valid(e.slot) and pcall(function() e.slot:RemoveFromJSIParent({}) end)
-            net.send_to_host("RESEND", added_u)
-            log.warn("consume: craft answer: the host made %s (uid %s), this inventory showed %s there (%s); slot removed=%s, asked the host to send it again",
-                item_name(added_da), added_u, e.name, e.where, tostring(removed))
+            local removed, how = remove_local_slot(comp, e.slot)
+            resynced = true
+            resync_uids[added_u] = os.clock()
+            M.stats.slot_mismatch = M.stats.slot_mismatch + 1
+            pause_crafting()
+            net.send_to_host("RESEND", wire.uid_enc(added_u))
+            log.warn("consume: craft answer: the host made %s (uid %s), this inventory showed %s there (%s); slot removed=%s (%s), asked the host to send it again; crafting waits %.0f s",
+                item_name(added_da), added_u, e.name, e.where, tostring(removed), tostring(how),
+                math.max(0, craft_pause_until - os.clock()))
         end
     end
-    release(success, success and "answer" or "the host refused the craft")
+    if resynced then
+        -- the rest of a "craft N" click would go on a screen being resynced
+        release(false, "a slot held another item; the inventory is resynced")
+    else
+        release(success, success and "answer" or "the host refused the craft")
+    end
 end
 
 -- ===========================================================================
@@ -838,7 +889,7 @@ end
 -- failed pending request (ClientFuncItemCrafted: RemoveRequestByUID ->
 -- SetPending(false), RemoveFromJSIParent); one that is no longer pending
 -- (resolved locally) is taken out of its container directly.
-local function remove_local_slot(comp, slot)
+remove_local_slot = function(comp, slot)
     local g = ue.try(function() return guid_tbl(slot.ItemUniqueID) end)
     if g then
         local out = {}
@@ -991,6 +1042,13 @@ local function on_client_add(c, info_p, _, comp_p, pending_p)
     local mother = ue.try(function() return guid_str(it[F_MOTHER]) end) or "?"
     local slot_i = ue.try(function() return it[F_SLOT] end)
     local now = os.clock()
+    -- the item the host sent again is here: the screen is in step again and
+    -- crafting may go on (the pause is only a fallback)
+    if resync_uids[u] then
+        resync_uids[u] = nil
+        craft_pause_until = 0
+        log.info("consume: %s (uid %s) came again from the host: crafting allowed again", name, u)
+    end
     local asked = nil
     for i, w in ipairs(GAIN.wait) do
         if w.name == name and now - w.at <= GAIN.WAIT_S then
@@ -1021,7 +1079,7 @@ local function on_client_add(c, info_p, _, comp_p, pending_p)
         if now - t > 60 then GAIN.told[k] = nil end
     end
     GAIN.told[u] = now
-    net.send_to_host("IGLOST", u)
+    net.send_to_host("IGLOST", wire.uid_enc(u))
     log.warn("consume: the host added %s x%s (uid %s) to grid %s slot %s, whose widget here does not take it (not shown): asked the host to drop it at this player's feet",
         name, tostring(n), u, mother, tostring(slot_i))
 end
@@ -1037,7 +1095,7 @@ local function on_client_set_dur(c, uid_p, dur_p, updated_p)
     local u = ue.try(function() return guid_str(param(uid_p)) end)
     local x = ue.try(function() return tonumber(param(dur_p).X) end)
     if not u or not x then return end
-    net.send_to_host("SETDUR", u, string.format("%.3f", x))
+    net.send_to_host("SETDUR", wire.uid_enc(u), wire.num(x, 3))
     pcall(function() updated_p:set(true) end)
     dur_sent = dur_sent + 1
     local line = string.format("consume: durability of %s -> %.1f sent to the host", u, x)
@@ -1485,7 +1543,7 @@ end
 -- why not.
 function GAIN.into_grid(comp, da, n, grid, atts)
     local g = guid_of(grid)
-    if not g then return nil, "no grid in its word" end
+    if not g then return nil, "no grid in its world" end
     local want = { [grid] = true }
     local before, grids, read = GAIN.walk(comp, want)
     if not read then return nil, "its inventory here could not be read" end
@@ -1667,7 +1725,7 @@ local function on_lost_msg(f, pc)
     local pawn = ue.pawn_of(pc)
     if not is_remote_character(pawn) then return end
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
-    local u = f[1] or ""
+    local u = wire.uid_dec(f[1]) or ""
     local g = guid_of(u)
     if not ue.valid(comp) or not g or u == "0:0:0:0" then return end
     local key = tostring(addr(pawn)) .. "|" .. u
@@ -1729,7 +1787,7 @@ local function on_resend_msg(f, pc)
     local pawn = ue.pawn_of(pc)
     if not is_remote_character(pawn) then return end
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
-    local u = f[1] or ""
+    local u = wire.uid_dec(f[1]) or ""
     local key = tostring(addr(pawn)) .. "|" .. u
     local now = os.clock()
     if not ue.valid(comp) or now - (resend_at[key] or -100) < 2 then return end
@@ -1963,7 +2021,7 @@ local function on_dur_msg(f, pc)
     if S.role ~= "host" or cfg.get("client_durability_from_host") == false then return end
     local pawn = ue.pawn_of(pc)
     if not is_remote_character(pawn) then return end
-    local u, x = f[1] or "", tonumber(f[2])
+    local u, x = wire.uid_dec(f[1]) or "", tonumber(f[2])
     local comp = ue.prop(pawn, "BP_JigMultiplayer")
     local it = x and ue.valid(comp) and item_durability(comp, u)
     if not it then
@@ -2202,25 +2260,45 @@ end
 -- the host's list may be old). 0.8.1: Rags x2 the restore had replaced were
 -- reported here 14 times in 16 minutes and stayed.
 -- GHOST: AGAIN s between two questions about one item, MAX items per
--- question; host: one answer per player in HOST_EVERY s (at: [character
--- address] = os.clock()).
-local GHOST = { AGAIN = 30, MAX = 16, HOST_EVERY = 3, at = {} }
+-- question, ASK_EVERY s between two questions (a screen full of stale slots
+-- must not turn into a stream of RPCs); an item whose answer may still be on
+-- its way is never a ghost (host_may_have_it); host: one answer per player in
+-- HOST_EVERY s (at: [character address] = os.clock()).
+local GHOST = { AGAIN = 30, MAX = 16, ASK_EVERY = 2, HOST_EVERY = 3, at = {}, empty_at = {} }
+local ghost_ask_at = -100   -- client: os.clock() of the last GHOSTQ
+
+-- An item the host may still be answering about is not a ghost: a request is
+-- in flight (the caller checks gate.n), the slot was reserved on this screen
+-- and may exist on the host's side only yet (placeholders), or the host was
+-- asked to send it again (a RESEND answer is on its way). Ending one of those
+-- takes a real item away from the player.
+local function host_may_have_it(u, now)
+    local p = placeholders[u]
+    if p and now - p <= STALE_PENDING then return true end
+    return resync_uids[u] ~= nil
+end
 
 local desync = { at = -100, last = nil, asked = {} }
 
 local function ask_ghosts(uids, now)
+    -- one question per ASK_EVERY s: the answers come back as CLIENT_UpdateCount
+    -- and a fresh ITEMS, so asking again at once would only repeat them
+    if now - ghost_ask_at < GHOST.ASK_EVERY then return end
     local ask = {}
     table.sort(uids)
     for _, u in ipairs(uids) do
         if #ask >= GHOST.MAX then break end
-        if now - (desync.asked[u] or -1000) >= GHOST.AGAIN then
+        if not host_may_have_it(u, now) and now - (desync.asked[u] or -1000) >= GHOST.AGAIN then
             desync.asked[u] = now
             ask[#ask + 1] = u
         end
     end
     if #ask == 0 then return end
+    ghost_ask_at = now
     M.stats.ghosts_asked = M.stats.ghosts_asked + #ask
-    net.send_to_host("GHOSTQ", table.concat(ask, ";"))
+    local coded = {}
+    for i, u in ipairs(ask) do coded[i] = wire.uid_enc(u) end
+    net.send_to_host("GHOSTQ", table.concat(coded, ";"))
     log.info("consume: asked the host about %d item(s) shown only in this inventory: %s", #ask, table.concat(ask, ", "))
 end
 
@@ -2234,11 +2312,21 @@ local function check_desync(now)
     local jig = me and ue.prop(me, "BP_JigMultiplayer")
     if not ue.valid(jig) then return end
     local only_here, uids = {}, {}
+    local waiting = 0
     for u, e in pairs(client_view(jig)) do
         if host[u] == nil then
-            only_here[#only_here + 1] = string.format("%s x%s (uid %s, %s)", e.name, tostring(e.n), u, e.where or "?")
-            uids[#uids + 1] = u
+            -- the host is still answering about it (see host_may_have_it)
+            if host_may_have_it(u, now) then
+                waiting = waiting + 1
+            else
+                only_here[#only_here + 1] = string.format("%s x%s (uid %s, %s)", e.name, tostring(e.n), u, e.where or "?")
+                uids[#uids + 1] = u
+            end
         end
+    end
+    if waiting > 0 then
+        M.stats.ghosts_waiting = M.stats.ghosts_waiting + waiting
+        log.debug("consume: %d item(s) look missing from the host's copy, but their answer is still on its way: not asked about", waiting)
     end
     table.sort(only_here)
     local key = table.concat(only_here, "; ")
@@ -2278,20 +2366,47 @@ local function on_ghost_msg(f, pc)
             ue.short(pawn), tostring(here.bad))
         return
     end
-    local ended, held = {}, {}
-    for u in tostring(f[1] or ""):gmatch("[^;]+") do
-        if #ended + #held >= GHOST.MAX then break end
+    local clean = cfg.get("ghost_cleanup") ~= false
+    -- A save written over the co-op world (a single-player one in the same slot):
+    -- the host has no copy of this player's inventory at all, while their screen
+    -- still shows the items. Ending them here would delete real things from it,
+    -- so the host answers "held" (nothing removed) and the case is logged.
+    local empty_here = next(here.by_uid) == nil
+    if empty_here then
+        local ek = addr(pawn)
+        if now - (GHOST.empty_at[ek] or -100) >= 60 then
+            GHOST.empty_at[ek] = now
+            log.warn("consume: the host's copy of %s's inventory is empty while their screen shows items"
+                .. " (a save written over the co-op world?): nothing ended, the items stay on their screen,"
+                .. " but the host cannot use them for crafting or loot", ue.short(pawn))
+        end
+    end
+    local ended, held, dry = {}, {}, {}
+    for code in tostring(f[1] or ""):gmatch("[^;]+") do
+        if #ended + #held + #dry >= GHOST.MAX then break end
+        local u = wire.uid_dec(code) or ""
         local a, b, c, d = u:match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+)$")
-        if a and here.by_uid[u] then
+        if a and (here.by_uid[u] or empty_here) then
             held[#held + 1] = u
         elseif a then
-            local g = { A = tonumber(a), B = tonumber(b), C = tonumber(c), D = tonumber(d) }
-            local ok, err = pcall(function() comp:CLIENT_UpdateCount(comp, g, 0, { A = 0, B = 0, C = 0, D = 0 }) end)
-            ended[#ended + 1] = ok and u or string.format("%s (FAILED: %s)", u, tostring(err))
+            if not clean then
+                -- the answer is worked out and logged, nothing is removed:
+                -- for comparing a session with the log before trusting the end
+                dry[#dry + 1] = u
+            else
+                local g = { A = tonumber(a), B = tonumber(b), C = tonumber(c), D = tonumber(d) }
+                local ok, err = pcall(function() comp:CLIENT_UpdateCount(comp, g, 0, { A = 0, B = 0, C = 0, D = 0 }) end)
+                ended[#ended + 1] = ok and u or string.format("%s (FAILED: %s)", u, tostring(err))
+            end
         end
     end
     local k = addr(comp)
     if k and ledger[k] then ledger[k] = here.by_uid end
+    if #dry > 0 then
+        M.stats.ghosts_dry = M.stats.ghosts_dry + #dry
+        log.warn("consume: %s's screen showed %d item(s) their inventory here does not have, but ghost_cleanup is off: nothing removed: %s",
+            ue.short(pawn), #dry, table.concat(dry, ", "))
+    end
     if #ended > 0 then
         M.stats.ghosts_ended = M.stats.ghosts_ended + #ended
         log.warn("consume: %s's screen showed %d item(s) their inventory here does not have: the client was told they are gone (CLIENT_UpdateCount 0): %s",
@@ -2839,6 +2954,7 @@ end
 
 function M.reset()
     gate = new_gate()
+    craft_pause_until, resync_uids = 0, {}
     widgets = {}
     ledger, health = {}, {}
     last_ci = nil
@@ -2875,7 +2991,12 @@ end
 -- (tests: the sliced walks and the use / craft snapshot; the gains' state)
 M.touch = walking.touch
 M.note_dur = walking.note_dur
+-- What the own inventory widgets show (client): { [uid] = { n, name, da, slot, where } }.
+-- sdc_items reads the durability each slot widget holds (JSI_Slot.Dur) for the items
+-- the host's copy does not have (a save written over the co-op world).
+M.client_view = client_view
 
-M._t = { walking = walking, ledger = function() return ledger end, gain = GAIN, gate = function() return gate end }
+M._t = { walking = walking, ledger = function() return ledger end, gain = GAIN, gate = function() return gate end,
+         client_view = client_view }
 
 return M

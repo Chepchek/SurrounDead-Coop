@@ -196,6 +196,10 @@ end
 -- fails) or another recipe. The client names the table its window uses
 -- (STABLE); the host runs the same SetItemsToCraft on its copy.
 local TABLE_OF_UI = { W_CookingUI_C = 2, W_CraftingWorkbenchUI_C = 1, W_ConstructionWorkbenchUI_C = "bench" }
+-- Stations whose window is the crafting workbench's (W_CraftingWorkbenchUI) but whose own code
+-- sets another table: the weapons workbench = 3 (24 recipes: cartridges...), not 1 (the crafting
+-- workbench's 15: bandage...). The station's class decides, not the window's.
+local TABLE_OF_STATION = { Buildable_WeaponsEquipmentWorkbench_C = 3 }
 local table_sent = {}   -- [station address|table] = os.clock()
 
 local function station_of(w)
@@ -208,7 +212,8 @@ end
 local function table_of(w)
     local t = TABLE_OF_UI[ue.class_name(w)]
     if t == "bench" then t = tonumber(ue.prop(ue.prop(w, "StationOwner"), "CurrentCraftingTable")) end
-    return t
+    local st = station_of(w)
+    return st and TABLE_OF_STATION[ue.class_name(st)] or t
 end
 
 local function sync_table(w, st, why, force)
@@ -532,9 +537,33 @@ local function add_output(comp, pawn, da, n, grid)
 end
 
 -- The button handler's steps, on the host, for the station's own data.
-local function disassemble(station, pawn)
+-- A disassembly runs in slices of DISASM_SLICE_S (one item of the station at a
+-- time, never split): a station full of stacks held the game for 114 ms in one
+-- frame (0.12.1 log; ~4.5 s before the adds were batched). It is a plain state
+-- (disasm_run: the list, the next index, the results so far) that a timer steps
+-- on: no coroutines, UE4SS's functions fail inside a second Lua thread. One run
+-- at a time: a second click waits.
+local DISASM_SLICE_S = 0.003
+local disasm_run = nil
+
+-- is the item (uid string) still in the station with at least n of it?
+local function station_has(comp, u, n)
+    local found = false
+    pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            c:get()[F_ITEMS]:ForEach(function(_, it)
+                local item = it:get()
+                if guid_str(item[F_USID]) == u and (tonumber(item[F_INFO][F_COUNT]) or 0) >= n then found = true end
+            end)
+        end)
+    end)
+    return found
+end
+
+-- the run's start: the items of the station taken once, the output grid
+local function dis_start(station, pawn)
     local comp = ue.prop(station, "BP_JigMultiplayer")
-    if not ue.valid(comp) then return end
+    if not ue.valid(comp) then return nil end
     -- the handler's GetContainerItems(true): every item of the station, taken once
     local list = {}
     pcall(function()
@@ -549,72 +578,89 @@ local function disassemble(station, pawn)
     end)
     M.stats.disasm_runs = M.stats.disasm_runs + 1
     run_fallbacks = 0
-    -- where the results go: the output grid, as the station's window adds them
-    local grid = M.output_grid(comp)
-    local placed = { grid = 0, dropped = 0, other = 0 }
-    local done, skipped = {}, {}
-    local no_disasm = {}   -- the DAs' "name" (the game's 'Item "X" cannot be disassembled', handler @1797)
-    for _, e in ipairs(list) do
-        local da = e.da
-        if not ue.valid(da) or e.n <= 0 then
-            skipped[#skipped + 1] = "?"
-        elseif ue.prop(da, "CanBeDisassembled?") ~= true then
-            skipped[#skipped + 1] = item_name(da) .. " (cannot be disassembled)"
-            local okn, nm = pcall(function() return ue.fstring(ue.prop(da, "name")) end)
-            if not okn or type(nm) ~= "string" or nm == "" then nm = item_name(da) end
-            no_disasm[#no_disasm + 1] = nm
-        else
-            local parts = list_of(ue.prop(da, "DisassemblyItems"))
-            if #parts > 0 then
-                local got = {}
-                for _, p in ipairs(parts) do
-                    local out_da = p[R_ID]
-                    local chance = tonumber(p[R_CHANCE]) or 0
-                    local lo, hi = math.floor(tonumber(p[R_MIN]) or 1), math.floor(tonumber(p[R_MAX]) or 1)
-                    if hi < lo then hi = lo end
-                    -- the rolls are the game's (once per unit); the hits of one output item are
-                    -- added together, as stacks of at most its MaxStack (up to 0.12.0 every hit was
-                    -- an add of its own: a stack of 1000 = ~3500 adds, each with two grid walks, a
-                    -- reliable message per viewer and a log line)
-                    local total, hits, hitlist = 0, 0, {}
-                    if ue.valid(out_da) then
-                        for _ = 1, e.n do
-                            if math.random() * 100 <= chance then
-                                local cnt = math.random(lo, hi)
-                                if cnt > 0 then
-                                    total = total + cnt
-                                    hits = hits + 1
-                                    hitlist[hits] = cnt
-                                end
+    return { station = station, pawn = pawn, comp = comp, list = list, i = 1, yielded = false, interrupted = false,
+             -- where the results go: the output grid, as the station's window adds them
+             grid = M.output_grid(comp), placed = { grid = 0, dropped = 0, other = 0 }, done = {}, skipped = {},
+             no_disasm = {} }   -- no_disasm: the DAs' "name" (the game's 'Item "X" cannot be disassembled', handler @1797)
+end
+
+-- one item of the station
+local function dis_item(R, e)
+    local comp, pawn, grid, placed = R.comp, R.pawn, R.grid, R.placed
+    local done, skipped, no_disasm = R.done, R.skipped, R.no_disasm
+    local da = e.da
+    if R.yielded and not station_has(comp, e.u, e.n) then
+        -- the player took it out of the station between two slices: nothing is given for it
+        skipped[#skipped + 1] = item_name(da) .. " (no longer in the station)"
+    elseif not ue.valid(da) or e.n <= 0 then
+        skipped[#skipped + 1] = "?"
+    elseif ue.prop(da, "CanBeDisassembled?") ~= true then
+        skipped[#skipped + 1] = item_name(da) .. " (cannot be disassembled)"
+        local okn, nm = pcall(function() return ue.fstring(ue.prop(da, "name")) end)
+        if not okn or type(nm) ~= "string" or nm == "" then nm = item_name(da) end
+        no_disasm[#no_disasm + 1] = nm
+    else
+        local parts = list_of(ue.prop(da, "DisassemblyItems"))
+        if #parts > 0 then
+            local got = {}
+            -- The source goes first (the slices let the player act between two items): what is
+            -- given for it only after it is consumed here, so it can never be given and kept.
+            local ok, err = pcall(function() comp:SERVER_RequestConsumeItem(comp, e.uid, e.n, "") end)
+            M.stats.disasm_items = M.stats.disasm_items + 1
+            for _, p in ipairs(ok and parts or {}) do
+                local out_da = p[R_ID]
+                local chance = tonumber(p[R_CHANCE]) or 0
+                local lo, hi = math.floor(tonumber(p[R_MIN]) or 1), math.floor(tonumber(p[R_MAX]) or 1)
+                if hi < lo then hi = lo end
+                -- the rolls are the game's (once per unit); the hits of one output item are
+                -- added together, as stacks of at most its MaxStack (up to 0.12.0 every hit was
+                -- an add of its own: a stack of 1000 = ~3500 adds, each with two grid walks, a
+                -- reliable message per viewer and a log line)
+                local total, hits, hitlist = 0, 0, {}
+                if ue.valid(out_da) then
+                    for _ = 1, e.n do
+                        if math.random() * 100 <= chance then
+                            local cnt = math.random(lo, hi)
+                            if cnt > 0 then
+                                total = total + cnt
+                                hits = hits + 1
+                                hitlist[hits] = cnt
                             end
                         end
                     end
-                    if total > 0 then
-                        local max = math.floor(tonumber(ue.prop(out_da, "MaxStack")) or 0)
-                        -- (MaxStack unreadable: every hit is an add of its own, as before)
-                        local pieces = hitlist
-                        if max >= 1 then
-                            pieces = {}
-                            for left = total, 1, -max do pieces[#pieces + 1] = math.min(left, max) end
-                        end
-                        local how_n, hows = 0, {}
-                        for _, cnt in ipairs(pieces) do
-                            local how, went = add_output(comp, pawn, out_da, cnt, grid)
-                            M.stats.disasm_outputs = M.stats.disasm_outputs + 1
-                            placed[went] = placed[went] + 1
-                            how_n = how_n + 1
-                            if how ~= "" and not hows[how] then hows[how] = true; hows[#hows + 1] = how end
-                        end
-                        got[#got + 1] = string.format("%s x%d (%d hit(s), %d add(s))%s", item_name(out_da), total, hits,
-                            how_n, table.concat(hows))
-                    end
                 end
-                local ok, err = pcall(function() comp:SERVER_RequestConsumeItem(comp, e.uid, e.n, "") end)
-                M.stats.disasm_items = M.stats.disasm_items + 1
-                done[#done + 1] = string.format("%s x%d -> %s%s", item_name(da), e.n,
-                    #got > 0 and table.concat(got, ", ") or "nothing", ok and "" or (" (consume FAILED: " .. tostring(err) .. ")"))
+                if total > 0 then
+                    local max = math.floor(tonumber(ue.prop(out_da, "MaxStack")) or 0)
+                    -- (MaxStack unreadable: every hit is an add of its own, as before)
+                    local pieces = hitlist
+                    if max >= 1 then
+                        pieces = {}
+                        for left = total, 1, -max do pieces[#pieces + 1] = math.min(left, max) end
+                    end
+                    local how_n, hows = 0, {}
+                    for _, cnt in ipairs(pieces) do
+                        local how, went = add_output(comp, pawn, out_da, cnt, grid)
+                        M.stats.disasm_outputs = M.stats.disasm_outputs + 1
+                        placed[went] = placed[went] + 1
+                        how_n = how_n + 1
+                        if how ~= "" and not hows[how] then hows[how] = true; hows[#hows + 1] = how end
+                    end
+                    got[#got + 1] = string.format("%s x%d (%d hit(s), %d add(s))%s", item_name(out_da), total, hits,
+                        how_n, table.concat(hows))
+                end
             end
+            done[#done + 1] = string.format("%s x%d -> %s%s", item_name(da), e.n,
+                #got > 0 and table.concat(got, ", ") or "nothing", ok and "" or (" (consume FAILED: " .. tostring(err) .. ")"))
         end
+    end
+end
+
+-- the end of a run (also of one that was stopped half way)
+local function dis_finish(R)
+    local station, pawn, grid, placed = R.station, R.pawn, R.grid, R.placed
+    local done, skipped, no_disasm = R.done, R.skipped, R.no_disasm
+    if R.interrupted then
+        log.warn("stations: disassembly stopped half way: the station or the player is gone (%d item(s) done)", #done)
     end
     local where = grid and string.format("output grid %d of %d '%s'", grid.idx, grid.n, tostring(grid.name))
         or "no output grid found: the first grid with room"
@@ -627,7 +673,7 @@ local function disassemble(station, pawn)
     -- results went (the player's log)
     if containers.flush_viewers then pcall(containers.flush_viewers) end
     local pc = ue.prop(pawn, "Controller")
-    if ue.valid(pc) then
+    if ue.valid(pc) and not R.interrupted then
         net.send_to(pc, "DISASMR", grid and grid.idx or 0, grid and grid.n or 0, grid and grid.name or "",
             placed.grid, placed.dropped, placed.other)
     end
@@ -644,6 +690,59 @@ end
 local last_request = {}   -- [character address] = os.clock()
 
 -- net DISASM|<station class>|<x>|<y>|<z>, client -> host.
+-- one disassembly at a time, in slices (see the top of this part)
+local disasm_at = 0   -- os.clock() of the last slice: a run silent for 10 s lost its timer
+local function disassemble(station, pawn)
+    if disasm_run ~= nil and os.clock() - disasm_at > 10 then
+        log.warn("stations: a disassembly waited %.0f s for its next slice: its lock is cleared", os.clock() - disasm_at)
+        disasm_run = nil
+    end
+    if disasm_run ~= nil then
+        M.stats.disasm_refused = M.stats.disasm_refused + 1
+        log.warn("stations: %s asked to disassemble while another disassembly is still running: refused", ue.short(pawn))
+        local notes = package.loaded["sdc_notes"]
+        local pc = ue.prop(pawn, "Controller")
+        if notes and notes.show_to and ue.valid(pc) then
+            pcall(notes.show_to, pc, "Разборка занята, подождите секунду / Disassembly busy, wait a second",
+                "/Game/UI/Textures/over_250_survival_flat_icons/hammer.hammer", nil, 2, "stations: disassembly busy")
+        end
+        return
+    end
+    local R = dis_start(station, pawn)
+    if not R then return end
+    disasm_run = R
+    disasm_at = os.clock()
+    local function step()
+        if disasm_run ~= R then return end   -- a run whose lock was cleared does not go on
+        disasm_at = os.clock()
+        local t0 = disasm_at
+        local timer = type(ue.delay) == "function"
+        while R.i <= #R.list do
+            -- (a destroyed actor stays "valid" until the collector: the controller says the player is still here)
+            if R.yielded and not (ue.valid(R.station) and ue.valid(R.pawn) and ue.valid(R.comp)
+                and ue.valid(ue.prop(R.pawn, "Controller"))) then
+                R.interrupted = true
+                break
+            end
+            local e = R.list[R.i]
+            R.i = R.i + 1
+            local ok, err = pcall(dis_item, R, e)
+            if not ok then log.err_throttled("stations.disassemble", "stations: disassembly: %s", tostring(err)) end
+            if timer and R.i <= #R.list and os.clock() - t0 >= DISASM_SLICE_S then
+                if ue.delay("stations.disassemble", 1, step) ~= false then
+                    R.yielded = true
+                    return
+                end
+                timer = false   -- no timer: the rest now
+            end
+        end
+        local okf, errf = pcall(dis_finish, R)
+        if not okf then log.err_throttled("stations.disassemble", "stations: disassembly: %s", tostring(errf)) end
+        if disasm_run == R then disasm_run = nil end
+    end
+    step()
+end
+
 local function on_disasm_msg(f, pc)
     if S.role ~= "host" then return end
     local pawn = ue.pawn_of(pc)
@@ -678,6 +777,7 @@ end
 local GFL = "/Game/Blueprints/GameFunctionLibrary.Default__GameFunctionLibrary_C"
 local TABLES = { [1] = true, [2] = true, [3] = true, [4] = true, [5] = true }
 local table_set = {}   -- [station address] = { t = table, n = recipes } last set here
+local station_cache = {}   -- [station path|class] = the station found for it
 
 local function recipe_count(comp)
     return ue.try(function() return comp.ItemsToCraft:GetArrayNum() end)
@@ -693,11 +793,23 @@ local function on_table_msg(f, pc)
         log.warn("stations: %s sent recipe table %s for %s: refused", ue.short(pawn), tostring(f[1]), cls)
         return
     end
-    -- a level-placed station has the same path here; a built one is found by place
-    local station = ue.find_object(path)
-    if not station or ue.class_name(station) ~= cls
-        or dist2(ue.location(station), ue.location(pawn)) > USE_REACH * USE_REACH then
-        station = find_station(pawn, cls, at)
+    -- a level-placed station has the same path here; a built one is found by place.
+    -- The station found last time is kept by its path (a built one needed a
+    -- FindAllOf of its whole class on every message).
+    local ck = path .. "|" .. cls
+    local station = station_cache[ck]
+    if station ~= nil and (not ue.valid(station) or ue.class_name(station) ~= cls
+        or dist2(ue.location(station), ue.location(pawn)) > USE_REACH * USE_REACH) then
+        station = nil
+        station_cache[ck] = nil
+    end
+    if not station then
+        station = ue.find_object(path)
+        if not station or ue.class_name(station) ~= cls
+            or dist2(ue.location(station), ue.location(pawn)) > USE_REACH * USE_REACH then
+            station = find_station(pawn, cls, at)
+        end
+        if station then station_cache[ck] = station end
     end
     local comp = station and ue.prop(station, "BP_JigMultiplayer")
     if not ue.valid(comp) then
@@ -706,13 +818,22 @@ local function on_table_msg(f, pc)
             ue.short(pawn), cls, at.X, at.Y, at.Z)
         return
     end
-    local gfl = ue.find_object(GFL)
+    -- the station's class decides the table, not the number sent (also for the cache below)
+    t = TABLE_OF_STATION[ue.class_name(station)] or t
+    local k = tostring(addr(station))
+    local last = table_set[k]
     local before = recipe_count(comp)
+    -- Already set to this table and the list is still as long as it was left:
+    -- the game's SetItemsToCraft (a Blueprint loop over the data table, 30-95 ms
+    -- in a log) is not run again for every window opened or craft checked.
+    if last and last.t == t and last.n ~= nil and last.n > 0 and before == last.n then
+        M.stats.table_skipped = (M.stats.table_skipped or 0) + 1
+        return
+    end
+    local gfl = ue.find_object(GFL)
     local ok, err = false, "no GameFunctionLibrary"
     if gfl then ok, err = pcall(function() gfl:SetItemsToCraft(t, comp, station) end) end
     local n = recipe_count(comp)
-    local k = tostring(addr(station))
-    local last = table_set[k]
     if not ok or not last or last.t ~= t or last.n ~= n then
         log.info("stations: recipe table %d of %s set on the host for %s: %s recipes (were %s)%s", t, ue.short(station),
             ue.short(pawn), tostring(n), tostring(before), ok and "" or (" - FAILED: " .. tostring(err)))
@@ -759,6 +880,7 @@ end
 function M.reset()
     last_request = {}
     table_sent, table_set, refused_logged, loot_wait = {}, {}, {}, {}
+    station_cache = {}
     hook_at = -100
 end
 

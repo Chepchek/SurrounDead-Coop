@@ -140,6 +140,7 @@ local FWD_FN = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComp
 local NEST_FN = "/Game/Infestation/BP_Infestation.BP_Infestation_C:Damage_Object"
 local GPC_FN = "/Script/Engine.GameplayStatics:GetPlayerController"
 local SPAWN_FN = "/Script/Engine.GameplayStatics:BeginDeferredActorSpawnFromClass"
+local MDF = require("sdc_markerdata").F   -- S_MarkerData member names (BP_Marker keeps its look there since 17.11.2026)
 local EVENT_FN = "/Game/Prefabs/BP_PrefabSpawner.BP_PrefabSpawner_C:SpawnRandomEvent"
 local PREFAB_P = "/Game/Prefabs/PrefabMaster.PrefabMaster_C"
 local MARKER_P = "/Game/Blueprints/MinimapSystem/Blueprints/Marker/BP_Marker.BP_Marker_C"
@@ -230,7 +231,7 @@ local function engine(w)
             if not c or not c._actor then return nil end
             local t = tf.Translation
             local a = new(w, { c._name, "Actor" }, c._name .. "_" .. (2147400000 + #w.spawned),
-                { _loc = { X = t.X, Y = t.Y, Z = t.Z }, Role = 3 }, {})
+                { _loc = { X = t.X, Y = t.Y, Z = t.Z }, Role = 3, MarkerData = {} }, {})
             w.spawned[#w.spawned + 1] = a
             return a
         end,
@@ -415,9 +416,9 @@ local function spawn_random_event(w, sp, opts)
         fire(w, SPAWN_FN, param(w.gps), param(sp), mp, param(tf))
         if mp._v() == w.marker_cls then
             sp._p.Marker = new(w, { "BP_Marker_C", "Actor" }, "BP_Marker_C_" .. (2147420000 + #w.objects), {
-                _loc = sp._p._loc, MarkerTexture = sp._p["Marker Texture"], MarkerTitle = sp._p["Marker Title"],
-                MarkerDescription = sp._p["Marker Description"], ["Texture Size"] = { X = 3.5, Y = 3.5 },
-                Color = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, ["AddMarkerToCompass?"] = false })
+                _loc = sp._p._loc, MarkerDescription = sp._p["Marker Description"], MarkerData = {
+                    [MDF.title] = sp._p["Marker Title"], [MDF.texture] = sp._p["Marker Texture"], [MDF.tex_size] = { X = 3.5, Y = 3.5 },
+                    [MDF.color] = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, [MDF.compass] = false } })
         end
     end
     if sp._p.SoundOnSpawn and sp._p.SoundOnSpawn._valid then
@@ -471,10 +472,11 @@ deliver_all()
 check(#CW.sounds == cs0 + 1 and CW.sounds[#CW.sounds].snd == CW.cue and CW.sounds[#CW.sounds].loc.X == E.X
     and CW.sounds[#CW.sounds].att == nil and CW.sounds[#CW.sounds].vol == 1.0, "the game's cue at the spawner, its own attenuation")
 local mk = CW.spawned[#CW.spawned]
-check(mk and mk._chain[1] == "BP_Marker_C" and mk._finished and mk._p.MarkerTexture == CW.heli_tex
-    and mk._p.MarkerTitle:ToString() == APACHE_MK.title and mk._p.MarkerDescription:ToString() == APACHE_MK.desc
-    and math.abs(mk._p["Texture Size"].X - 3.5) < 1e-6 and math.abs(mk._p.Color.R - 0.5052) < 1e-3
-    and mk._p["AddMarkerToCompass?"] == false and mk._p._loc.Y == E.Y, "BP_Marker_C spawned the spawner's way")
+local MD1 = mk and mk._p.MarkerData or {}
+check(mk and mk._chain[1] == "BP_Marker_C" and mk._finished and MD1[MDF.texture] == CW.heli_tex
+    and MD1[MDF.title]:ToString() == APACHE_MK.title and mk._p.MarkerDescription:ToString() == APACHE_MK.desc
+    and math.abs(MD1[MDF.tex_size].X - 3.5) < 1e-6 and math.abs(MD1[MDF.color].R - 0.5052) < 1e-3
+    and MD1[MDF.compass] == false and mk._p._loc.Y == E.Y, "BP_Marker_C spawned the spawner's way (look in MarkerData)")
 check(#CW.loads == 0, "nothing loaded synchronously on the client")
 check(logged("client", "events: the host's random event Prefab_CrashedApache01_C at 173901,22718,1931 (1000 m from here): sound explosion_deep_low_1_Cue played here (1000 m away, it carries 3500 m, Nuke); map marker 'Crashed Military Apache' placed (texture Helicopter, finish ok=true)") ~= nil,
     "client log line")
@@ -664,9 +666,9 @@ local function spawn_camp(w, sp, opts)
         fire(w, SPAWN_FN, param(w.gps), param(sp), mp, param(tf))
         if mp._v() == w.marker_cls then
             sp._p.Marker = new(w, { "BP_Marker_C", "Actor" }, "BP_Marker_C_" .. (2147430000 + #w.objects), {
-                _loc = sp._p._loc, MarkerTexture = sp._p["Marker Texture"], MarkerTitle = sp._p["Marker Title"],
-                MarkerDescription = sp._p["Marker Description"], ["Texture Size"] = { X = 3.5, Y = 3.5 },
-                Color = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, ["AddMarkerToCompass?"] = false })
+                _loc = sp._p._loc, MarkerDescription = sp._p["Marker Description"], MarkerData = {
+                    [MDF.title] = sp._p["Marker Title"], [MDF.texture] = sp._p["Marker Texture"], [MDF.tex_size] = { X = 3.5, Y = 3.5 },
+                    [MDF.color] = { R = 0.505208, G = 0.169744, B = 0.034207, A = 1 }, [MDF.compass] = false } })
         end
     end
     if not opts.no_hook then fire(w, MARKER_FN, param(sp)) end
@@ -698,7 +700,7 @@ check(#H.events._st.camps == 1, "a camp without a marker: nothing")
 local dsp = spawner(HW, "BP_PrefabSpawner_Dynamic_C_21", { X = 30000, Y = -60000, Z = 800 }, HW.apache, HW.cue,
     { tex = HW.heli_tex, title = "Crashed Military Helicopter", desc = "y" })
 dsp._p.Marker = new(HW, { "BP_Marker_C", "Actor" }, "BP_Marker_C_2147439999", { _loc = dsp._p._loc,
-    MarkerTitle = FText("Crashed Military Helicopter"), MarkerDescription = FText("y") })
+    MarkerDescription = FText("y"), MarkerData = { [MDF.title] = FText("Crashed Military Helicopter") } })
 fire(HW, MARKER_FN, param(dsp))
 check(#H.events._st.camps == 1 and H.events._st.done[H.ue.path(dsp)] == nil,
     "a random event's SpawnMarker: not a camp (its SpawnRandomEvent post-hook relays it)")
@@ -725,7 +727,7 @@ cs0 = #CW.sounds
 deliver_all()
 local lmk = CW.spawned[#CW.spawned]
 check(#CW.spawned == n_spawned + 2 and lmk._chain[1] == "BP_Marker_C" and lmk._finished
-    and lmk._p.MarkerTexture == CW.lab_tex and lmk._p.MarkerTitle:ToString() == LAB_MK.title
+    and lmk._p.MarkerData[MDF.texture] == CW.lab_tex and lmk._p.MarkerData[MDF.title]:ToString() == LAB_MK.title
     and lmk._p.MarkerDescription:ToString() == LAB_MK.desc and lmk._p._loc.X == LAB.X and lmk._p._loc.Y == LAB.Y,
     "client: the laboratory's BP_Marker_C at the spawner, its texture, title and description")
 check(#CW.sounds == cs0, "client: no sound")

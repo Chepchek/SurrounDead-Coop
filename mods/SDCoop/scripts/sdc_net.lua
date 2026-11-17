@@ -43,6 +43,13 @@ function M.decode(s)
     return kind, fields
 end
 
+-- Sending: send_to / send_to_host / broadcast as ever. 0.12.2 additions:
+--   M.send_to_cb(pc, on_out, kind, ...)   M.send_to_host_cb(on_out, kind, ...)
+--     on_out() runs after the RPC of that very message went out (see out_done).
+--   M.congested(pc) -> bool   (pc nil on a client) the peer is silent or its reliable
+--     window estimate is high: skip optional PAIRED sends meanwhile.
+--   M.SNAPSHOT / M.MERGE / M.FAST / M.PAIRED / M.NOW: the message classes (see below).
+
 -- handler(fields, sender_pc) ; sender_pc is the remote controller on the host
 -- and the local controller on a client.
 function M.on(kind, handler)
@@ -53,7 +60,7 @@ end
 -- log lines a second: disk writes on both machines).
 local FREQUENT = {
     MYSTATE = true, PSTATE = true, PPOS = true, MYGPS = true, STEALTH = true, ENV = true,
-    PCVAR = true, PINFO = true, PEQUIP = true, VSTATE = true, VCAP = true, AIHP = true,
+    PCVAR = true, PINFO = true, PEQUIP = true, VSTATE = true, VCAP = true, AIHP = true, NPCHP = true,
     VOCC = true,   -- sdc_vehicles: the seats 3+ of a car (next to its VSTATE records)
     AIHPQ = true, AIM = true, DXP = true, SKL = true, WSTAT = true, ITEMS = true, UIDS = true,
     PTOOLS = true, QS = true, QH = true, SKTREE = true, AIAPP = true, SND = true, MHIT = true,
@@ -108,6 +115,18 @@ local function sent_text(msg)
     return string.format("%s... (%d bytes, logged whole by the receiver)", msg:sub(1, SENT_LOG_MAX), #msg)
 end
 
+-- on_out (optional, send_to_cb / send_to_host_cb): called once, with no arguments, right
+-- after the RPC of THIS message went out (immediately, or from the queue later). Not called
+-- when the RPC failed, when a newer snapshot replaced the message in the queue, or when
+-- the queue was dropped (the player left, a world reset). For a sender that must know what
+-- the other side really got, not what the queue accepted.
+local function out_done(on_out)
+    if on_out then
+        local ok, err = pcall(on_out)
+        if not ok then log.err_throttled("net.on_out", "net on_out callback: %s", tostring(err)) end
+    end
+end
+
 local function client_message(pc, msg) pc:ClientMessage(msg, FName("SDCoop"), 0.0) end
 local function server_exec(pc, msg) pc:ServerExecRPC(msg) end
 
@@ -145,8 +164,12 @@ end
 -- BUDGET.burst_bytes bytes (2x the normal 250 ms peaks), refilled at
 -- rate_msgs / rate_bytes a second (several times the normal rate; a 9 s
 -- freeze of the other game at that rate still stays far below 256). Within
--- it a message goes out at once, as before. Over it, it waits in a FIFO queue
--- per connection, drained by a game-thread loop every tick_ms.
+-- it a message goes out at once, as before. Over it, it waits in a queue per
+-- connection, drained by a game-thread loop every tick_ms. Two queues: FAST
+-- (the answers a player waits for) is drained first, BULK is FIFO. Both keep
+-- the order of what they hold; the only exception is a SNAPSHOT kind (see
+-- M.SNAPSHOT below): a newer message replaces the older queued one of the same
+-- key, so a stalled peer gets the latest state, not every state in between.
 -- NOW kinds never wait: movement, combat, vehicles / seats, session control,
 -- and the payloads paired with a ClientRepObjRef RPC (sdc_ai, sdc_npc: the
 -- object must follow its payload directly). They use the budget too, so
@@ -156,14 +179,27 @@ end
 -- LastReceiveTime unchanged: the other game is frozen, or the link) gets no
 -- queueable message until it is heard again.
 -- Config net_send_budget = false: every message at once (as before 0.6.58).
+-- burst_msgs / rate_msgs count reliable BUNCHES, not messages (0.12.2): a
+-- message costs 1 + size / packet_bytes (a 2.3 KB one is 3; the engine's window
+-- of 256 is counted in bunches).
+-- infl_soft / infl_hard: our estimate of the reliable bunches the other game
+-- has not acked yet (see submit); the engine closes a connection at 256.
+-- fast_*: the FAST queue has a budget of its own (the same shape, half the burst): an
+-- answer is never held up by the debt a snapshot burst left in the bulk budget. The
+-- infl_* estimate is shared and is what really protects the engine's window.
+-- fast_run: after this many fast-queue messages in a row one bulk one goes.
+-- batch_gap: parts of a snapshot with no id in the message (a SNAPSHOT entry that returns
+-- the gen "batch"; none registered now) sent within it belong together.
 M.BUDGET = { burst_msgs = 48, burst_bytes = 32768, rate_msgs = 24, rate_bytes = 24576,
-             tick_ms = 50, sample_s = 0.1, stall_s = 0.5 }
+             tick_ms = 50, sample_s = 0.1, stall_s = 0.5,
+             packet_bytes = 1100, infl_soft = 128, infl_hard = 192, fast_run = 16, batch_gap = 0.2,
+             fast_burst_msgs = 24, fast_burst_bytes = 16384, fast_rate_msgs = 24, fast_rate_bytes = 24576 }
 local NOW = {}
 for _, k in ipairs({
     -- movement / player state
     "MYSTATE", "PSTATE", "PPOS", "MYGPS", "PINFO", "PCVAR", "PEQUIP", "MYNVG", "SETMOVE", "STEALTH",
     -- combat, AI, sounds, throws (AIM AIHP AIKL AIAPP AIDEAD NPC*: paired with ClientRepObjRef)
-    "AIM", "AIHP", "AIKL", "AIKILL", "AIDEAD", "AIAPP", "AIFX", "AIDAY", "NPCSET", "NPCFIRE", "NPCBLOOD",
+    "AIM", "AIHP", "AIKL", "AIKILL", "AIDEAD", "AIAPP", "AIFX", "AIDAY", "NPCSET", "NPCHP", "NPCFIRE", "NPCBLOOD",
     "NPCROCK", "MHIT", "MONT", "EXPL", "WMINE", "DMGNUM", "THROW", "THROWN", "THRFX", "THRACK", "OSND", "SND",
     "WHISTLE", "RLSTOP", "RADZ", "TURFIRE", "TURHIT",
     -- vehicles and seats
@@ -182,8 +218,96 @@ for _, k in ipairs({
 }) do NOW[k] = true end
 M.NOW = NOW
 
+-- ---------------------------------------------------------------------------
+-- Message classes beyond NOW (0.12.2). The default for every kind is "an
+-- event": it waits in the bulk queue, in order, and is never merged with
+-- another message. A kind is only treated differently when it is named here.
+-- ---------------------------------------------------------------------------
+-- PAIRED: a payload whose ClientRepObjRef RPC follows it directly. Never
+-- held back, never merged, whatever the connection's state.
+local PAIRED = {}
+for _, k in ipairs({ "AIM", "AIHP", "AIKL", "AIKILL", "AIAPP", "AIDEAD", "NPCSET", "NPCHP", "NPCFIRE", "NPCBLOOD", "NPCROCK" }) do
+    PAIRED[k] = true
+end
+M.PAIRED = PAIRED
+
+-- FAST: the answer a player waits for (or the request that starts it). A
+-- second, priority queue per connection: it is drained before the bulk queue
+-- (a world snapshot burst, 92 JMC messages of a disassembly...), still within
+-- the same budget and still not while the other game is silent. A kind is
+-- always in ONE lane, so the order inside a kind is kept; kinds of one
+-- protocol that depend on each other (JMC -> DISASMR) are all fast.
+local FAST = {}
+for _, k in ipairs({
+    "JMC", "JADD",                       -- sdc_containers: an open container's ops / a missing item
+    "WBDOOR",                            -- sdc_bdoors: a door's change ("c") and its list ("s", join / periodic delta): one lane, in order, never merged
+    "NOTE", "RLNOTE",                    -- notes for a player's action, the reload-cap answer
+    "IFAIL", "IHID",                     -- sdc_place: an item that could not be given / was hidden
+    "DISASM", "DISASMR", "STABLE",       -- sdc_stations: a disassembly's request / answer / table
+    "RNOPEN", "RNREQ",                   -- sdc_rename
+    "GOTO", "GOTOST", "GOTOASK", "GOTOANS", "GOTOACK",   -- sdc_players: teleport to a friend
+    "MKSYNC", "MKREQ", "MKDEL",          -- sdc_playermarks: a map marker placed / removed, the list back
+    "ACCESS", "KICK", "HOSTMENU", "RULES",   -- join approval, kick, host menu, rules
+    "DICT", "DICTQ",                     -- sdc_dict: a dictionary question / answer
+}) do FAST[k] = true end
+M.FAST = FAST
+
+-- SNAPSHOT: each message carries a whole state, so only the newest matters.
+-- A queued older message of the same kind AND key for the same connection is
+-- thrown away when a newer one is queued; the newer one goes to the END of the
+-- queue (see the header of this block for why not into the old place).
+--   true                  one record per connection (key "")
+--   function(fields)      -> key (a record per key), [gen]; nil = not mergeable
+--     gen: the messages of one snapshot that is sent in several parts share a
+--     gen; a message with another gen replaces ALL queued parts of the old
+--     one, one with the same gen is just one more part. "batch": no id in the
+--     message, parts sent within batch_gap seconds belong together.
+-- Nothing else is merged: events, deltas, JMC, TURSTATE, DXP, GWEAR, AIHPQ,
+-- WBDOOR ("s" is a DELTA too: a periodic one carries only the doors that changed
+-- or are due, so a newer one must not replace an older queued join list) ...
+-- keep every message and its order.
+local function field1(f) return f[1] or "" end
+M.SNAPSHOT = {
+    ROSTER = true, ENV = true, MYLOOK = true, PTOOLS = true, ITEMS = true, UIDS = true, INFUI = true,
+    RESPUI = true, PRJCAP = true, QS = true, PEQUIP = true, PCVAR = true, SKL = true, SKTREE = true,
+    MYSTATE = true, MYGPS = true, STEALTH = true, MYNVG = true,
+    LOOK = field1,       -- LOOK|<player id>|<look>
+    RULES = field1,      -- RULES|<rule>|...
+    WSTAT = field1,      -- WSTAT|<slot>|<uid>|<stats>
+    PSTATE = field1,     -- PSTATE|<player id>|<mask>|<bs>|<ln>|<hy>  (see MERGE)
+    PPOS = field1,       -- PPOS|<player id>|x|y|z
+    PINFO = field1,      -- PINFO|<player id>|<gps>|<name>
+    MKSYNC = function(f) return "", f[1] end,                       -- MKSYNC|<seq>|<part>|<parts>|...
+}
+local SNAPSHOT = M.SNAPSHOT
+
+-- MERGE[kind](old_fields, new_fields): a snapshot whose wire format is partial ("" = "not
+-- sent, keep what you have") must not lose the older queued message's fields when it
+-- replaces that message: the empty fields of the new one are filled from the old one.
+-- MYSTATE|mask|bs|ln|hy and PSTATE|id|mask|bs|ln|hy (sdc_pawnstate): ln, hy.
+local function fill_empty(first, last)
+    return function(old, new)
+        for i = first, last do
+            if (new[i] or "") == "" and (old[i] or "") ~= "" then new[i] = old[i] end
+        end
+    end
+end
+M.MERGE = { MYSTATE = fill_empty(3, 4), PSTATE = fill_empty(4, 5) }
+
+local function merge_old(lane, ckey, kind, msg, mf)
+    local rec = lane.idx[ckey]
+    local old = rec and rec.list[#rec.list]
+    if not old or old.dead then return msg end
+    local _, of = M.decode(old.msg)
+    local _, nf = M.decode(msg)
+    if not of or not nf then return msg end
+    mf(of, nf)
+    return M.encode(kind, table.unpack(nf))
+end
+
 -- totals since start ([PERF]: sdc_perf)
-M.budget_stats = { episodes = 0, queued = 0, sent_late = 0, dropped = 0, max_wait = 0 }
+M.budget_stats = { episodes = 0, queued = 0, sent_late = 0, dropped = 0, max_wait = 0,
+                   replaced = 0, held_now = 0, fast_sent = 0 }
 local lanes = {}           -- [key] = lane (host: controller address, client: "host")
 local loop = { started = false, hooked_reset = false }
 
@@ -219,37 +343,105 @@ local function refill(lane, now)
     if dt <= 0 then return end
     lane.tm = math.min(B.burst_msgs, lane.tm + dt * B.rate_msgs)
     lane.tb = math.min(B.burst_bytes, lane.tb + dt * B.rate_bytes)
+    lane.fm = math.min(B.fast_burst_msgs, lane.fm + dt * B.fast_rate_msgs)
+    lane.fb = math.min(B.fast_burst_bytes, lane.fb + dt * B.fast_rate_bytes)
 end
+
+-- What a message costs in the engine's reliable window (256 bunches): one
+-- plus one more per packet_bytes of its text (a 2.3 KB message is 3 of them).
+local function cost_of(size) return 1 + size / M.BUDGET.packet_bytes end
 
 -- room for one message of `size` bytes (a bigger one than the whole byte
--- budget goes when the bucket is full)
-local function fits(lane, size)
+-- budget goes when the bucket is full; the message bucket may go into debt)
+local function fits(lane, size, fast)
     local B = M.BUDGET
-    return lane.tm >= 1 and (lane.tb >= size or lane.tb >= B.burst_bytes)
+    if fast then return lane.fm > 0 and (lane.fb >= size or lane.fb >= B.fast_burst_bytes) end
+    return lane.tm > 0 and (lane.tb >= size or lane.tb >= B.burst_bytes)
 end
 
-local function spend(lane, size)
+local function spend(lane, size, cost, fast)
     local B = M.BUDGET
-    lane.tm = math.max(-B.burst_msgs, lane.tm - 1)
-    lane.tb = math.max(-B.burst_bytes, lane.tb - size)
+    if fast then
+        lane.fm = math.max(-B.fast_burst_msgs, lane.fm - cost)
+        lane.fb = math.max(-B.fast_burst_bytes, lane.fb - size)
+    else
+        lane.tm = math.max(-B.burst_msgs, lane.tm - cost)
+        lane.tb = math.max(-B.burst_bytes, lane.tb - size)
+    end
+    lane.infl = lane.infl + cost
 end
 
-local function queued(lane) return lane.qt - lane.qh + 1 end
+-- ---- the two queues of a lane (fast, bulk): arrays with a head, entries are
+-- marked dead when a newer snapshot replaced them (skipped at the head)
+local function new_q() return { q = {}, h = 1, t = 0 } end
+
+local function qhead(qq)
+    while qq.h <= qq.t do
+        local e = qq.q[qq.h]
+        if e and not e.dead then return e end
+        qq.q[qq.h] = nil
+        qq.h = qq.h + 1
+    end
+    return nil
+end
+
+local function reset_queues(lane)
+    lane.f, lane.b = new_q(), new_q()
+    lane.nlive, lane.nfast, lane.nnow, lane.qbytes = 0, 0, 0, 0
+    lane.kcount, lane.idx, lane.fast_run = {}, {}, 0
+    lane.ep = nil
+end
+
+-- the entry stops waiting (sent, or replaced)
+local function unlink(lane, e)
+    lane.nlive = lane.nlive - 1
+    lane.qbytes = lane.qbytes - #e.msg
+    lane.kcount[e.kind] = lane.kcount[e.kind] - 1
+    if e.fast then lane.nfast = lane.nfast - 1 end
+    if e.now then lane.nnow = lane.nnow - 1 end
+end
+
+local function forget_idx(lane, e)
+    local rec = e.ckey and lane.idx[e.ckey]
+    if not rec then return end
+    for i, x in ipairs(rec.list) do
+        if x == e then table.remove(rec.list, i); break end
+    end
+    if #rec.list == 0 then lane.idx[e.ckey] = nil end
+end
+
+local function oldest_t(lane)
+    local a, b = qhead(lane.f), qhead(lane.b)
+    if a and b then return math.min(a.t, b.t) end
+    return (a or b or { t = 0 }).t
+end
 
 -- Throws away what waits for this connection (it left, world change).
 local function drop(lane, why)
-    local n = queued(lane)
+    local n = lane.nlive
     if n > 0 then
         M.budget_stats.dropped = M.budget_stats.dropped + n
         log.info("[NET] send budget: %d queued message(s) to %s dropped (%s; %s)", n, lane.name, why,
             kinds_text(lane.ep and lane.ep.kinds or {}))
     end
-    lane.q, lane.qh, lane.qt, lane.qbytes, lane.ep = {}, 1, 0, 0, nil
+    reset_queues(lane)
+end
+
+-- the queue is empty: one summary line, fresh queues
+local function finish(lane)
+    local ep = lane.ep
+    if ep then
+        log.info("[NET] send budget: queue to %s drained: %d message(s), %.1f KB, waited up to %.1f s, longest"
+            .. " queue %d (%s)%s", lane.name, ep.n, ep.bytes / 1024, ep.max_wait, ep.peak, kinds_text(ep.kinds),
+            ep.replaced > 0 and string.format("; %d replaced by a newer one", ep.replaced) or "")
+    end
+    reset_queues(lane)
 end
 
 -- Is the other game still talking to us? NetConnection.LastReceiveTime is
 -- the engine's time of the last packet from it; unchanged for stall_s by our
--- clock = nothing came (sampled every sample_s from the loop).
+-- clock = nothing came (sampled every sample_s from the loop). A packet that
+-- came also acks what we sent: the reliable window estimate starts over.
 local function sample(lane, pc, now)
     lane.sampled = now
     local conn = ue.prop(pc, "NetConnection")
@@ -260,62 +452,130 @@ local function sample(lane, pc, now)
             log.info("[NET] send budget: no NetConnection.LastReceiveTime for %s (%s); the budget works without"
                 .. " the stall check", lane.name, ue.valid(conn) and type(rt) or "no connection")
         end
-        lane.rt_ok, lane.stalled = false, false
+        lane.rt_ok, lane.stalled, lane.infl = false, false, 0
         return
     end
     lane.rt_ok = true
-    if rt ~= lane.rt then lane.rt, lane.rt_at = rt, now end
+    if rt ~= lane.rt then lane.rt, lane.rt_at, lane.infl = rt, now, 0 end
     lane.stalled = now - lane.rt_at > M.BUDGET.stall_s
 end
 
 local function drain(lane, pc, now)
+    local B = M.BUDGET
     local ep = lane.ep
-    while lane.qh <= lane.qt and not lane.stalled do
-        local e = lane.q[lane.qh]
+    while lane.nlive > 0 and not lane.stalled and lane.infl < B.infl_soft do
+        local ef, eb = qhead(lane.f), qhead(lane.b)
+        local e
+        -- the fast queue first; after fast_run in a row one bulk message
+        -- goes (a long burst of answers must not starve the snapshots)
+        if ef and (not eb or lane.fast_run < B.fast_run) then e = ef else e = eb or ef end
+        if not e then break end
         local size = #e.msg
-        if not fits(lane, size) then break end
-        lane.q[lane.qh] = nil
-        lane.qh = lane.qh + 1
-        lane.qbytes = lane.qbytes - size
-        spend(lane, size)
+        if not fits(lane, size, e.fast) then
+            -- the head of the chosen queue has no room: the fast head may still go when
+            -- it was the forced bulk turn that did not fit
+            local alt = (e == eb) and ef or nil
+            if alt and fits(lane, #alt.msg, alt.fast) then e, size = alt, #alt.msg else break end
+        end
+        local qq = e.fast and lane.f or lane.b
+        qq.q[qq.h] = nil
+        qq.h = qq.h + 1
+        forget_idx(lane, e)
+        unlink(lane, e)
+        if e.fast and eb then lane.fast_run = lane.fast_run + 1 else lane.fast_run = 0 end
+        spend(lane, size, e.cost, e.fast)
         local waited = now - e.t
         if ep and waited > ep.max_wait then ep.max_wait = waited end
         if waited > M.budget_stats.max_wait then M.budget_stats.max_wait = waited end
         M.budget_stats.sent_late = M.budget_stats.sent_late + 1
-        raw_send(pc, lane.to_host, e.kind, e.msg, waited)
+        if e.fast then M.budget_stats.fast_sent = M.budget_stats.fast_sent + 1 end
+        if raw_send(pc, lane.to_host, e.kind, e.msg, waited) then out_done(e.on_out) end
     end
-    if lane.qh > lane.qt then
-        if ep then
-            log.info("[NET] send budget: queue to %s drained: %d message(s), %.1f KB, waited up to %.1f s, longest"
-                .. " queue %d (%s)", lane.name, ep.n, ep.bytes / 1024, ep.max_wait, ep.peak, kinds_text(ep.kinds))
-        end
-        lane.q, lane.qh, lane.qt, lane.qbytes, lane.ep = {}, 1, 0, 0, nil
-    end
+    if lane.nlive == 0 then finish(lane) end
 end
 
-local function enqueue(lane, kind, msg, now)
+-- The key of a snapshot message (nil = not mergeable) and its gen.
+local function snap_key(kind, msg, reg)
+    if reg == true then return kind .. "\0", nil end
+    local _, f = M.decode(msg)
+    if not f then return nil end
+    local ok, k, g = pcall(reg, f)
+    if not ok or k == nil then return nil end
+    return kind .. "\0" .. tostring(k), g
+end
+
+-- A newer message of this snapshot key is coming: what is queued for the key
+-- from an older snapshot goes (parts of the same gen stay). Returns the gen.
+local function supersede(lane, ckey, gen, now)
+    if gen == "batch" then
+        local b = lane.bt[ckey]
+        if not b then
+            b = { t = now, id = 1 }
+            lane.bt[ckey] = b
+        elseif now - b.t > M.BUDGET.batch_gap then
+            b.id = b.id + 1
+        end
+        b.t = now
+        gen = b.id
+    end
+    local rec = lane.idx[ckey]
+    if rec and (gen == nil or rec.gen ~= gen) then
+        for _, e in ipairs(rec.list) do
+            if not e.dead then
+                e.dead = true
+                unlink(lane, e)
+                M.budget_stats.replaced = M.budget_stats.replaced + 1
+                if lane.ep then lane.ep.replaced = lane.ep.replaced + 1 end
+            end
+        end
+        lane.idx[ckey] = nil
+    end
+    return gen
+end
+
+local function enqueue(lane, kind, msg, now, fast, hev, ckey, gen, cost, on_out)
     local B = M.BUDGET
-    if queued(lane) == 0 then
+    if not lane.ep then
         M.budget_stats.episodes = M.budget_stats.episodes + 1
-        lane.ep = { n = 0, bytes = 0, max_wait = 0, peak = 0, kinds = {}, next_note = 500 }
+        lane.ep = { n = 0, bytes = 0, max_wait = 0, peak = 0, kinds = {}, next_note = 500, replaced = 0 }
         log.info("[NET] send budget: messages to %s wait in a queue from now (%s; first %s, %d B; budget %d msgs /"
             .. " %d KB at once, then %d msgs / %d KB a second; %s never wait)", lane.name,
             lane.stalled and string.format("nothing received from it for %.1f s", now - (lane.rt_at or now))
                 or "over the budget", kind, #msg, B.burst_msgs, B.burst_bytes // 1024, B.rate_msgs,
             B.rate_bytes // 1024, "movement, combat, vehicles, session")
     end
-    lane.qt = lane.qt + 1
-    lane.q[lane.qt] = { kind = kind, msg = msg, t = now }
+    local e = { kind = kind, msg = msg, t = now, cost = cost, fast = fast, now = hev, ckey = ckey, on_out = on_out }
+    local qq = fast and lane.f or lane.b
+    qq.t = qq.t + 1
+    qq.q[qq.t] = e
+    lane.nlive = lane.nlive + 1
     lane.qbytes = lane.qbytes + #msg
+    lane.kcount[kind] = (lane.kcount[kind] or 0) + 1
+    if fast then lane.nfast = lane.nfast + 1 end
+    if hev then lane.nnow = lane.nnow + 1 end
+    if ckey then
+        local rec = lane.idx[ckey]
+        if not rec then rec = { gen = gen, list = {} }; lane.idx[ckey] = rec end
+        rec.list[#rec.list + 1] = e
+    end
     local ep = lane.ep
     ep.n, ep.bytes = ep.n + 1, ep.bytes + #msg
     ep.kinds[kind] = (ep.kinds[kind] or 0) + 1
-    local n = queued(lane)
-    if n > ep.peak then ep.peak = n end
-    if n >= ep.next_note then
+    if lane.nlive > ep.peak then ep.peak = lane.nlive end
+    if lane.nlive >= ep.next_note then
         ep.next_note = ep.next_note * 2
-        log.info("[NET] send budget: %d message(s) (%.0f KB) wait for %s, the oldest %.1f s (%s)", n,
-            lane.qbytes / 1024, lane.name, now - lane.q[lane.qh].t, kinds_text(ep.kinds))
+        log.info("[NET] send budget: %d message(s) (%.0f KB) wait for %s, the oldest %.1f s (%s)", lane.nlive,
+            lane.qbytes / 1024, lane.name, now - oldest_t(lane), kinds_text(ep.kinds))
+    end
+    -- dead entries in the middle of a long queue (a stalled client, a snapshot
+    -- sent every second): squeeze them out now and then
+    if qq.t - qq.h > 4 * lane.nlive + 256 then
+        local nq, n = {}, 0
+        for i = qq.h, qq.t do
+            local x = qq.q[i]
+            if x and not x.dead then n = n + 1; nq[n] = x end
+        end
+        qq.q, qq.h, qq.t = nq, 1, n
     end
     M.budget_stats.queued = M.budget_stats.queued + 1
 end
@@ -342,7 +602,7 @@ local IDLE_S = 10
 function M.budget_tick()
     local now = os.clock()
     for key, lane in pairs(lanes) do
-        local busy = lane.qt >= lane.qh
+        local busy = lane.nlive > 0
         if busy or now - lane.last_submit <= IDLE_S then
             local pc = lane_pc(lane)
             if not pc then
@@ -351,8 +611,10 @@ function M.budget_tick()
             else
                 if now - (lane.sampled or -1e9) >= M.BUDGET.sample_s then sample(lane, pc, now) end
                 refill(lane, now)
-                if busy then drain(lane, pc, now) end
+                if busy then drain(lane, pc, now) elseif lane.ep then finish(lane) end
             end
+        elseif not lane_pc(lane) then
+            lanes[key] = nil   -- idle and its controller is gone: forget the lane
         end
     end
 end
@@ -385,11 +647,16 @@ local function lane_for(pc, to_host)
         drop(lane, "the connection to the host changed")
         lane = nil
     end
+    if lane and not to_host and lane.pc ~= pc and not ue.valid(lane.pc) then
+        drop(lane, "the controller changed")   -- same address, a new controller object
+        lane = nil
+    end
     if not lane then
         local B = M.BUDGET
         lane = { key = key, to_host = to_host, pc_addr = a, name = to_host and "the host" or ue.short(pc),
-                 q = {}, qh = 1, qt = 0, qbytes = 0, tm = B.burst_msgs, tb = B.burst_bytes, at = os.clock(),
-                 stalled = false }
+                 tm = B.burst_msgs, tb = B.burst_bytes, fm = B.fast_burst_msgs, fb = B.fast_burst_bytes,
+                 at = os.clock(), stalled = false, infl = 0, bt = {} }
+        reset_queues(lane)
         lanes[key] = lane
         start_loop()
     end
@@ -398,35 +665,111 @@ local function lane_for(pc, to_host)
     return lane
 end
 
-local function submit(pc, to_host, kind, msg)
-    if not budget_on() then return raw_send(pc, to_host, kind, msg, nil) end
+-- The reliable window: UE closes a connection with 256 unacked reliable
+-- bunches in a channel. `infl` is our estimate of what the other game has not
+-- acked (everything sent since it was last heard, in bunches). Below infl_soft
+-- everything goes as before. From infl_soft, or while the other game is silent,
+-- the NOW kinds that are SNAPSHOTs wait too (their newest message per key goes
+-- when it is heard again); from infl_hard so do the other NOW kinds, the events
+-- (in order, and behind each other: once one waited, the next NOW event of any
+-- kind waits behind it; VSTATE -> VOCC). Only PAIRED payloads always go.
+local function sent_now(pc, to_host, kind, msg, on_out)
+    local ok = raw_send(pc, to_host, kind, msg, nil)
+    if ok then out_done(on_out) end
+    return ok
+end
+
+local function submit(pc, to_host, kind, msg, on_out)
+    if not budget_on() then return sent_now(pc, to_host, kind, msg, on_out) end
+    local B = M.BUDGET
     local lane = lane_for(pc, to_host)
     local now = os.clock()
     refill(lane, now)
-    if lane.qt >= lane.qh then drain(lane, pc, now) end   -- older messages first
+    if now - (lane.sampled or -1e9) >= B.sample_s then sample(lane, pc, now) end   -- (also without the loop)
+    if lane.nlive > 0 then drain(lane, pc, now) end   -- older messages first
+    local size = #msg
+    local cost = cost_of(size)
+    local reg = SNAPSHOT[kind]
+    local ckey, gen, keyed
+    if reg and lane.nlive > 0 then
+        keyed = true
+        ckey, gen = snap_key(kind, msg, reg)
+        if ckey then
+            local mf = M.MERGE[kind]
+            if mf then msg = merge_old(lane, ckey, kind, msg, mf); size = #msg; cost = cost_of(size) end
+            gen = supersede(lane, ckey, gen, now)
+        end
+    end
+    local fast, held, hev = false, false, false
     if NOW[kind] then
-        spend(lane, #msg)
-        return raw_send(pc, to_host, kind, msg, nil)
+        if not PAIRED[kind] then
+            if reg and (lane.stalled or lane.infl >= B.infl_soft) then
+                if not keyed then keyed = true; ckey, gen = snap_key(kind, msg, reg) end
+                held = ckey ~= nil
+            end
+            if not held and (lane.nnow > 0 or lane.infl >= B.infl_hard or (lane.kcount[kind] or 0) > 0) then
+                held, hev = true, true   -- an event: it must keep its place among the other held events
+            end
+        end
+        fast = held
+        if not held then
+            spend(lane, size, cost, false)
+            return sent_now(pc, to_host, kind, msg, on_out)
+        end
+        M.budget_stats.held_now = M.budget_stats.held_now + 1
+    else
+        fast = FAST[kind] == true
+        local clear = lane.nlive == 0 or (fast and lane.nfast == 0)
+        if clear and not lane.stalled and lane.infl < B.infl_soft and fits(lane, size, fast) then
+            spend(lane, size, cost, fast)
+            return sent_now(pc, to_host, kind, msg, on_out)
+        end
     end
-    if lane.qt < lane.qh and not lane.stalled and fits(lane, #msg) then
-        spend(lane, #msg)
-        return raw_send(pc, to_host, kind, msg, nil)
+    if reg and not keyed then
+        ckey, gen = snap_key(kind, msg, reg)
+        if ckey then gen = supersede(lane, ckey, gen, now) end
     end
-    enqueue(lane, kind, msg, now)
+    enqueue(lane, kind, msg, now, fast, hev, ckey, gen, cost, on_out)
     return true   -- accepted: it goes out in order
+end
+
+-- Is this peer's connection congested (the other game silent, or our estimate of
+-- unacked reliable bunches >= infl_soft)? For a sender of PAIRED payloads, which always go
+-- out and so cannot be held: it should skip optional ones (NPCHP) while this is true.
+-- pc = the remote controller on the host; nil on a client (the lane to the host).
+function M.congested(pc)
+    local lane
+    if pc == nil then lane = lanes["host"] else
+        local ok, a = pcall(addr_of, pc)
+        lane = ok and lanes[a] or nil
+    end
+    return lane ~= nil and (lane.stalled or lane.infl >= M.BUDGET.infl_soft) or false
+end
+
+-- How many connection lanes exist (tests, [PERF]).
+function M.lane_count()
+    local n = 0
+    for _ in pairs(lanes) do n = n + 1 end
+    return n
 end
 
 -- Messages waiting in the send queues (all connections).
 function M.queued_count()
     local n = 0
-    for _, lane in pairs(lanes) do n = n + queued(lane) end
+    for _, lane in pairs(lanes) do n = n + lane.nlive end
     return n
 end
 
 -- Host -> one client.
 function M.send_to(pc, kind, ...)
     if not ue.valid(pc) then return false end
-    return submit(pc, false, kind, M.encode(kind, ...))
+    return submit(pc, false, kind, M.encode(kind, ...), nil)
+end
+
+-- The same with on_out (see out_done): M.send_to_cb(pc, on_out, kind, ...)
+function M.send_to_cb(pc, on_out, kind, ...)
+    if not ue.valid(pc) then return false end
+    return submit(pc, false, kind, M.encode(kind, ...), on_out)
 end
 
 -- Host -> every connected client.
@@ -438,7 +781,13 @@ end
 function M.send_to_host(kind, ...)
     local pc = ue.local_pc()
     if not pc then return false end
-    return submit(pc, true, kind, M.encode(kind, ...))
+    return submit(pc, true, kind, M.encode(kind, ...), nil)
+end
+
+function M.send_to_host_cb(on_out, kind, ...)
+    local pc = ue.local_pc()
+    if not pc then return false end
+    return submit(pc, true, kind, M.encode(kind, ...), on_out)
 end
 
 -- ---------------------------------------------------------------------------

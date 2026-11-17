@@ -267,7 +267,7 @@ local ME = make_pawn("Me", { role = 2, is_local = true, id = 2 })
 local H = make_pawn("HostChar", { role = 1, id = 1, tag = "Jig.PlayerSlot.PrimaryWeapon", hf = true })
 local W1, R1 = make_weapon("Rifle1", SOCK, H.mesh)
 equip[H.p] = { { actor = W1, slot = "Jig.PlayerSlot.PrimaryWeapon" } }
-handlers.PSTATE({ "1", "hf=1;hm=0;sp=0;cs=0;hip=0;ln=0.00;bs=1;fl=0;hy=20" })
+handlers.PSTATE({ "1", "2", "1", "0", "5" })
 local scans0, walks0 = scans.BP_PlayerCharacter_C or 0, walks
 frames(60)
 check(lh_is(H.p, SOCK, HAND), "LeftHandLoc = the game's math (socket in Hand_R space)")
@@ -290,13 +290,13 @@ check(writes(H.p, "LeftHandLoc") - w0 == 30, "moving hand: written every frame")
 check(lh_is(H.p, SOCK, rawget(H.mesh, "_hand")), "and right")
 
 out("== client: straight head")
-handlers.PSTATE({ "1", "hf=1;hm=0;sp=0;cs=0;hip=0;ln=0.00;bs=1;fl=0;hy=0" })
+handlers.PSTATE({ "1", "2", "1", "0", "0" })
 frames(60)
 check(P(H.anim).HeadRotation.Yaw == 0, "head back to 0")
 local hw, idx0 = writes(H.anim, "HeadRotation"), E.index
 frames(60)
 check(writes(H.anim, "HeadRotation") == hw, "straight head: nothing written")
-handlers.PSTATE({ "1", "hf=1;hm=0;sp=0;cs=0;hip=0;ln=0.00;bs=1;fl=0;hy=30" })
+handlers.PSTATE({ "1", "2", "1", "0", "8" })
 P(H.p)["IsADS?"] = true
 frames(30)
 check(near(P(H.anim).HeadRotation.Yaw, 0, 1e-9), "aiming: head kept straight")
@@ -361,8 +361,8 @@ P(H.p)["HoldingFirearm?"] = true
 
 out("== client: 1 s tick still re-applies the state")
 P(H.p)["Sprinting?"] = true
-handlers.PSTATE({ "1", "hf=1;hm=0;sp=0;cs=0;hip=0;ln=0.25;bs=1;fl=0;hy=0" })
-check(P(H.p)["Sprinting?"] == false and near(P(H.p).Lean, 0.25), "PSTATE applied to the copy")
+handlers.PSTATE({ "1", "2", "1", "45", "0" })
+check(P(H.p)["Sprinting?"] == false and near(P(H.p).Lean, 45), "PSTATE applied to the copy")
 P(H.p)["Sprinting?"] = true
 pawnstate.tick()
 check(P(H.p)["Sprinting?"] == false, "tick re-applied it")
@@ -418,7 +418,7 @@ check(scans.BP_PlayerCharacter_C - hs <= 2, "FindAllOf " .. (scans.BP_PlayerChar
 check(writes(HP.p, "LeftHandLoc") == 0 and writes(HP.anim, "HeadRotation") == 0, "own character untouched")
 sent = {}
 local wm = walks
-handlers.MYSTATE({ "fl=0;hf=1;hm=0;sp=0;cs=0;hip=0;ads=0;ms=0;ln=0.00;bs=0;hy=0" }, pc)
+handlers.MYSTATE({ "2", "0", "0", "0" }, pc)
 check(pawnstate.state_of(CL.p) and pawnstate.state_of(CL.p).bs == "1", "MYSTATE: bs from the host's active slot")
 check(walks == wm, "MYSTATE: held weapon from the cache")
 wm = walks

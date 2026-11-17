@@ -33,6 +33,10 @@ package.loaded["sdc_ue"] = {
     find_object = function() return { __name = "MeshComponent" } end,
     try = function(fn, ...) local ok, v = pcall(fn, ...); if ok then return v end return nil end,
 }
+do local net = package.loaded["sdc_net"]
+  net.send_to_cb = function(pc, cb, kind, ...) local r = net.send_to(pc, kind, ...); if r and cb then cb() end return r end
+  net.send_to_host_cb = function(cb, kind, ...) local r = net.send_to_host(kind, ...); if r and cb then cb() end return r end
+end
 local appearance = require("sdc_appearance")
 appearance.init({ role = "client" })
 
@@ -173,7 +177,22 @@ local ue = package.loaded["sdc_ue"]
 local net = package.loaded["sdc_net"]
 local handlers, sent = {}, {}
 net.on = function(kind, fn) handlers[kind] = fn end
-net.send_to = function(pc, kind, id, s) sent[#sent + 1] = { to = { pc }, kind = kind, id = id, s = s }; return true end
+local dict = require("sdc_dict")
+-- LOOK|id|definitions|packed look: decoded on the receiving side (one table per receiving client)
+net.send_to = function(pc, kind, id, defs, packed)
+    local d = dict.decoder("recv:" .. pc.name)
+    d:receive(defs)
+    local s = require("sdc_appearance").unpack_look(d, packed)
+    assert(s, "a look this test's receiver could not decode")
+    sent[#sent + 1] = { to = { pc }, kind = kind, id = id, s = s, wire = #defs + #packed }
+    return true
+end
+-- what client A's mod sends as MYLOOK (its own encoder: the host's pc name is not its peer)
+local function mylook(s, pc)
+    local e = dict.encoder("client-of-" .. pc.name, "q")
+    local packed = require("sdc_appearance").pack_look(e, s)
+    handlers.MYLOOK({ e:defs(), packed }, pc)
+end
 net.broadcast = function(pcs, kind, id, s) for _, pc in ipairs(pcs) do sent[#sent + 1] = { to = { pc }, kind = kind, id = id, s = s } end end
 ue.name = function(o) return o.name end
 local function count_id(id) local n = 0; for _, m in ipairs(sent) do if m.id == id then n = n + 1 end end; return n end
@@ -208,9 +227,9 @@ host.init({ role = "host", remote_pcs = { pcA, pcB } })
 host.register_handlers()
 check(handlers.MYLOOK ~= nil, "setup: MYLOOK handler registered")
 
-handlers.MYLOOK({ tp }, pcA)
+mylook(tp, pcA)
 check(byA.HairMesh.bHiddenInGame == true and all_shown(byA, "HairMesh"), "client A third person: copy shown, hair under the helmet hidden")
-handlers.MYLOOK({ sc }, pcA)                     -- what A sends while scoped
+mylook(sc, pcA)                     -- what A sends while scoped
 local ok_sc, bad_sc = all_shown(byA, "HairMesh")
 check(ok_sc, "client A scoped: the host still shows A's body and head" .. (bad_sc and (" (hidden: " .. bad_sc .. ")") or ""))
 local relay = sent[#sent]
@@ -224,12 +243,12 @@ local function any_v(s)                          -- a component published as inv
     return false
 end
 check(relay and not any_v(relay.s), "relayed look carries no 'v' (B shows A's body too)")
-handlers.MYLOOK({ bn }, pcA)                     -- what A sends with binoculars
+mylook(bn, pcA)                     -- what A sends with binoculars
 check(all_shown(byA, "HairMesh"), "client A with binoculars: the host still shows A's head")
 
 -- a part of the copy hidden by something else comes back with the next look
 byA.Torso.bVisible, byA.Arms.bVisible = false, false
-handlers.MYLOOK({ sc }, pcA)
+mylook(sc, pcA)
 check(all_shown(byA, "HairMesh"), "a hidden part of the copy is shown again by the next look")
 
 print("== looks from an older SDCoop (raw own-camera flags): the host keeps the body")
@@ -259,26 +278,26 @@ binoculars(false)
 check(any_v(old_sc) and flags_in(old_sc, "Torso") == "v" and flags_in(old_sc, "Head") == "hv",
     "setup: the old scope look: 'v' on the body, 'hv' on the head")
 check(not any_v(old_bn) and flags_in(old_bn, "Head") == "h", "setup: the old binoculars look: 'h' on the head")
-handlers.MYLOOK({ old_sc }, pcA)
+mylook(old_sc, pcA)
 local ok_o, bad_o = all_shown(byA, "HairMesh")
 check(ok_o, "old client A scoped: the host still shows A's body and head" .. (bad_o and (" (hidden: " .. bad_o .. ")") or ""))
 check(byA.HairMesh.bHiddenInGame == true, "old client A scoped: hair under the helmet stays hidden")
 check(sent[#sent].s == old_sc and sent[#sent].to[1] == pcB, "relayed as it came (client B applies it the same way)")
 byA.Torso.bVisible = false                       -- a part hidden by something else meanwhile
-handlers.MYLOOK({ old_sc }, pcA)                 -- the same look again (every 2 s)
+mylook(old_sc, pcA)                 -- the same look again (every 2 s)
 check(all_shown(byA, "HairMesh") and byA.HairMesh.bHiddenInGame == true,
     "old client A scoped, applied again: still shown (a hidden body part shown again)")
-handlers.MYLOOK({ old_bn }, pcA)
+mylook(old_bn, pcA)
 check(all_shown(byA, "HairMesh") and byA.HairMesh.bHiddenInGame == true,
     "old client A with binoculars: the host still shows A's head, hair under the helmet hidden")
-handlers.MYLOOK({ tp }, pcA)
+mylook(tp, pcA)
 check(all_shown(byA, "HairMesh") and byA.HairMesh.bHiddenInGame == true, "old client A back in third person: unchanged")
 local nohelm = tp:gsub("(;HairMesh=[^,]*,[^,]*,)h", "%1")
-handlers.MYLOOK({ nohelm }, pcA)
+mylook(nohelm, pcA)
 check(byA.HairMesh.bHiddenInGame == false, "a normal look still changes the head flags (helmet off: hair shown)")
 local vpath = tp:gsub(";Torso=,,", ";Torso=Characters/Vest_v,M_vv,")
 check(vpath ~= tp, "setup: a look with 'v' in an asset path")
-handlers.MYLOOK({ vpath }, pcA)
+mylook(vpath, pcA)
 check(byA.HairMesh.bHiddenInGame == true and all_shown(byA, "HairMesh"),
     "a 'v' in an asset path is not a flag (helmet on: hair hidden again)")
 
@@ -321,7 +340,7 @@ do
     end
     if comps[#comps] == tmp then comps[#comps] = nil end
     os.clock = clock
-    for _, m in ipairs(sent) do if m.kind == "LOOK" then n = n + 1; bytes = bytes + #m.s + 8 end end
+    for _, m in ipairs(sent) do if m.kind == "LOOK" then n = n + 1; bytes = bytes + m.wire + 8 end end
     io.write(string.format("NETQ LOOK idle (host + 2 clients, 10 min) msgs/min=%.1f bytes/min=%.0f", n / 10, bytes / 10), string.char(10))
 end
 
@@ -366,6 +385,19 @@ do
     t0 = t0 + 210
     cl.tick()
     check(#to_host == n0 + 1, "client: the verify after 300 s: MYLOOK again")
+    -- the definitions count as known only when the MYLOOK really left the queue (on_out)
+    do
+        local nets = package.loaded["sdc_net"]
+        local caps = {}
+        nets.send_to_host_cb = function(cb, kind, defs, packed) caps[#caps + 1] = { cb = cb, defs = defs }; return true end
+        require("sdc_netsync").drop("host")
+        t0 = t0 + 400; cl.tick()
+        t0 = t0 + 400; cl.tick()
+        check(#caps == 2 and caps[1].defs ~= "" and caps[2].defs ~= "", "client: MYLOOK still waiting in the queue: the next one defines its strings again")
+        for _, c in ipairs(caps) do c.cb() end
+        t0 = t0 + 400; cl.tick()
+        check(#caps == 3 and caps[3].defs == "", "client: after on_out the host knows them: only tokens")
+    end
     os.clock = clock
 end
 

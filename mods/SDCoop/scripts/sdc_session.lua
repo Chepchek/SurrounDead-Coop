@@ -14,6 +14,7 @@ local cfg = require("sdc_config")
 local net = require("sdc_net")
 local sync = require("sdc_sync")
 local netsync = require("sdc_netsync")
+local dict = require("sdc_dict")
 local ctx = require("sdc_ctx")
 local players = require("sdc_players")
 local items = require("sdc_items")
@@ -887,6 +888,7 @@ local function send_roster(now)
         end
     end
     netsync.prune(live)
+    dict.prune(live)
 end
 
 -- Every part of the 1 s ticks is timed ([PERF] "parts", sdc_ue.sub_time:
@@ -895,22 +897,118 @@ end
 -- second apart (phase B: sdc_ue.delay 500 ms after phase A), so one frame
 -- never carries all of it; every part still runs once a second, in the same
 -- order.
-local function part(label, fn, ...)
+-- Frame slicing. Each 1 s tick and each phase B is PLANNED first: its body runs
+-- once and every part(...) / defer(...) call in it only appends {label, fn,
+-- args} to a list (the plain code between the parts - cheap reads and the
+-- time gates - runs at that moment). The list is then run in slices: parts
+-- until SLICE_S of this frame's work is used, the next index is kept, and the
+-- rest goes on in a later frame (sdc_ue.delay 1 ms, the same task label), so
+-- one frame never carries the whole second (host phase B alone was 10 ms/s
+-- with parts of 30-50 ms, and 150-200 ms [SLOW] on a load). A part runs whole;
+-- the order is kept. No coroutines: UE4SS keys its Lua functions by lua_State,
+-- and every UE4SS call (print, RegisterHook, UFunction calls) fails inside a
+-- second Lua thread. The world changing between two slices (role, controller) drops
+-- the rest. A tick of a kind that is still waiting for its next slices is
+-- skipped (the next second runs it again).
+local SLICE_S = 0.0025
+local plan = nil     -- the list being planned (nil: parts run at once)
+local busy = {}   -- [kind] = { t = os.clock(), id = n } while a sliced run waits for its next slice
+local STALE_S = 10  -- a flag older than this belongs to a timer that never came: it is cleared
+local run_id = 0
+M.busy = busy
+
+local function run_part(label, fn, ...)
     if ue.sub_time then return ue.sub_time(label, fn, ...) end
     local ok, err = pcall(fn, ...)
     if not ok then log.err_throttled(label, "%s: %s", label, tostring(err)) end
     return ok
 end
 
+local function part(label, fn, ...)
+    if plan then
+        plan[#plan + 1] = { label, fn, table.pack(...) }
+        return true
+    end
+    return run_part(label, fn, ...)
+end
+
+-- a step that is not a timed part (it runs in its place in the order)
+local function defer(fn, ...)
+    if plan then
+        plan[#plan + 1] = { false, fn, table.pack(...) }
+        return
+    end
+    fn(...)
+end
+
+-- fn(...) planned, then run in slices; `label` is the task the later slices run
+-- under, `kind` the sort of run that must not overlap itself, done() when it
+-- ended (or was dropped). Returns false when a run of this kind is still waiting.
+local function run_sliced(label, kind, fn, done, ...)
+    local b = busy[kind]
+    if b then
+        if os.clock() - b.t <= STALE_S then return false end
+        log.warn("session: a sliced '%s' run waited %.0f s for its next slice: its flag is cleared", kind, os.clock() - b.t)
+        busy[kind] = nil
+    end
+    run_id = run_id + 1
+    local my = { t = os.clock(), id = run_id }
+    local args = table.pack(...)
+    local role, pc_key = st.role, st.pc_key
+    local items, i = nil, 1
+    local function finish()
+        if busy[kind] ~= my then return end   -- a replaced run touches nothing
+        busy[kind] = nil
+        if done then done() end
+    end
+    local step
+    step = function()
+        -- (a run whose flag was cleared as stale, or replaced, ends without running again)
+        if items and (busy[kind] ~= my or st.role ~= role or st.pc_key ~= pc_key) then return finish() end
+        my.t = os.clock()
+        local t0 = my.t
+        if not items then
+            local prev = plan
+            plan = {}
+            local ok, err = pcall(fn, table.unpack(args, 1, args.n))
+            items, plan = plan, prev
+            if not ok then log.err_throttled("session.slice." .. kind, "%s: %s", label, tostring(err)) end
+        end
+        local timer = type(ue.delay) == "function"
+        while i <= #items do
+            local it = items[i]
+            i = i + 1
+            if it[1] then
+                run_part(it[1], it[2], table.unpack(it[3], 1, it[3].n))
+            else
+                local ok, err = pcall(it[2], table.unpack(it[3], 1, it[3].n))
+                if not ok then log.err_throttled("session.slice." .. kind, "%s: %s", label, tostring(err)) end
+            end
+            if timer and i <= #items and os.clock() - t0 >= SLICE_S then
+                if ue.delay(label, 1, step) ~= false then return end
+                timer = false   -- no timer: the rest now (as before the slicing)
+            end
+        end
+        finish()
+    end
+    busy[kind] = my
+    step()
+    return true
+end
+
 local PHASE_B_MS = 500
-local phase_b_pending = false
+local phase_b_pending = false   -- false, or the os.clock() it was set at
 
 local function schedule_phase_b(label, fn, now)
-    if phase_b_pending then return end
-    phase_b_pending = true
+    if phase_b_pending then
+        if os.clock() - phase_b_pending <= STALE_S then return end
+        log.warn("session: phase B waited %.0f s for its timer: its flag is cleared", os.clock() - phase_b_pending)
+    end
+    phase_b_pending = os.clock()
     local function run()
-        phase_b_pending = false
-        fn(now)
+        if not run_sliced(label, "B", fn, function() phase_b_pending = false end, now) then
+            phase_b_pending = false
+        end
     end
     if type(ue.delay) ~= "function" or ue.delay(label, PHASE_B_MS, run) == false then run() end
 end
@@ -968,7 +1066,7 @@ local function host_phase_b(now)
     end
 end
 
-local function host_tick(now)
+local function host_tick_body(now)
     local present, list = {}, {}
     for _, pc in ipairs(ue.find_all("PlayerController")) do
         if ue.valid(pc) and ue.valid(ue.prop(pc, "NetConnection")) then
@@ -998,7 +1096,10 @@ local function host_tick(now)
     part("h:dialogue", dialogue.host_tick, now)
     part("h:quests", quests.host_tick, now)
     part("h:skipsave", players.host_skip_save_tick)
-    for _, r in pairs(st.remote) do
+    -- (a snapshot: st.remote can change between two slices)
+    local remotes = {}
+    for _, r in pairs(st.remote) do remotes[#remotes + 1] = r end
+    for _, r in ipairs(remotes) do
         part("h:players", function()
             players.host_player_tick(r, now)
             local pawn = ue.pawn_of(r.pc)
@@ -1011,7 +1112,12 @@ local function host_tick(now)
     end
     part("h:pause", sync.pause_policy, #list > 0)
     part("h:hostmenu", M.host_menu_tick, now, st.in_menu)
-    schedule_phase_b("session-host-b", host_phase_b, now)
+    defer(schedule_phase_b, "session-host-b", host_phase_b, now)
+end
+
+-- the 1 s host tick, in slices (see "Frame slicing")
+local function host_tick(now)
+    run_sliced("session", "A", host_tick_body, nil, now)
 end
 
 -- Host, 1 s: the host's quit to its main menu. The pause / respawn screen's
@@ -1175,7 +1281,7 @@ local function client_phase_b(now)
     end
 end
 
-local function client_tick(now)
+local function client_tick_body(now)
     local cs = st.client
     -- other players' characters must not act on this player through "player 0"
     ctx.tick_client(cfg.get("client_quiet_others") ~= false)
@@ -1185,7 +1291,7 @@ local function client_tick(now)
     -- host's map and its controller. Only the AI tick runs without an own
     -- character (phase B, client_ai_without_character).
     if ue.in_main_menu() then
-        if cs.host_world then schedule_phase_b("session-client-b", client_phase_b, now) end
+        if cs.host_world then defer(schedule_phase_b, "session-client-b", client_phase_b, now) end
         return
     end
     cs.host_world = true
@@ -1227,7 +1333,12 @@ local function client_tick(now)
     part("c:widgets", players.client_widgets_tick)
     part("c:dialogue", dialogue.client_tick, now, pc, pawn)
     part("c:quests", quests.client_tick, now, pc, pawn)
-    schedule_phase_b("session-client-b", client_phase_b, now)
+    defer(schedule_phase_b, "session-client-b", client_phase_b, now)
+end
+
+-- the 1 s client tick, in slices (see "Frame slicing")
+local function client_tick(now)
+    run_sliced("session", "A", client_tick_body, nil, now)
 end
 
 -- Console helpers.
@@ -1308,7 +1419,19 @@ local function backup_saves()
         'robocopy "%s" "%s" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP >nul 2>&1', src, dst))
     log.info("saves: backup to %s (ok=%s, robocopy exit %s)", dst, tostring(ok), tostring(code))
     local sc = package.loaded["sdc_savecheck"]
-    if type(sc) == "table" and sc.after_backup then pcall(sc.after_backup, dst, ok and code or nil) end
+    -- the check at once (a hash of the slot's Level.sav, ~20 ms), the pruning of old backups (three
+    -- shells, ~450 ms in a log) a few seconds later in a frame of its own
+    if type(sc) == "table" and sc.after_backup then pcall(sc.after_backup, dst, ok and code or nil, true) end
+end
+
+-- The copy itself (robocopy, ~350 ms: the game waits for it) is not part of
+-- the role change's frame; it runs in a task of its own a moment later (the
+-- world is still loading from the menu: nobody has joined, nothing is saved).
+local backup_scheduled = false
+local function backup_saves_later()
+    if saves_backed_up or backup_scheduled then return end
+    backup_scheduled = true
+    if type(ue.delay) ~= "function" or ue.delay("saves-backup", 1500, backup_saves) == false then backup_saves() end
 end
 
 -- Client: the quick-save key and sleeping still run the game's save on the
@@ -1400,7 +1523,7 @@ local function on_role_change(old, new)
         appearance.reset()
         pawnstate.reset()
         damage.reset()
-        backup_saves()
+        backup_saves_later()
         st.host_state = nil
         pcall(paks.mine)   -- read now (a level load), not when the first player says HI
         log.info("net: listening through %s, own SteamID %s",
@@ -1630,6 +1753,7 @@ function M.register_handlers()
         local r = remote_record(pc)
         local first = not r.hello
         netsync.drop(ue.name(pc))   -- it says HI: it knows nothing yet
+        dict.reset_peer(ue.name(pc))   -- ... and what it sent before (its dictionary ids) is from another session
         r.hello, r.version = true, f[1]
         if f[2] and f[2] ~= "" then r.name = f[2] end
         net.send_to(pc, "HELLO", M.VERSION, cfg.player_name(), "ack", paks.mine())
@@ -1673,6 +1797,7 @@ function M.register_handlers()
         cs.host_version, cs.host_name = f[1], (f[2] ~= "" and f[2]) or "host"
         if f[3] == "ack" and not cs.acked then
             cs.acked = true
+            dict.reset_peer("host")   -- a new session of the host: its dictionary ids mean other strings
             log.info("client: host acknowledged handshake")
             -- the pause menu state again (the host may not have had the record)
             cs.away_sent = nil

@@ -322,6 +322,8 @@ function M.try_hooks(force)
                 if h[3] == "enter" then st.rescan = RESCAN_TRIES end
             elseif not st.hook_logged[h[3]] then
                 st.hook_logged[h[3]] = true
+                -- what the class offers and why the function cannot be hooked
+                if ue.probe_hook then ue.probe_hook(h[1], "zones") end
                 log.warn("zones: cannot hook %s: %s", h[1], tostring(err))
             end
         end

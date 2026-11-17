@@ -130,6 +130,7 @@ check(#r == 0, "wrapped hook still returns nothing")
 check(seen_activity == "hook AnimNotify_BeginEvent:Received_NotifyBegin", "activity inside a hook: " .. tostring(seen_activity))
 check(perf.current == nil, "hook marker cleared after the call")
 log.info("next")   -- carries the [SLOWLOG] note
+perf.frame()       -- the slow hook line is queued and written here, not inside the hook
 log.flush()
 local joined = {}
 for i = n4 + 1, #out do joined[#joined + 1] = out[i].s end

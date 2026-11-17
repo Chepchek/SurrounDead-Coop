@@ -36,7 +36,7 @@ local function stub()
         return f
     end })
 end
-local REAL = { sdc_charcreate = true, sdc_appearance = true }
+local REAL = { sdc_charcreate = true, sdc_appearance = true, sdc_dict = true, sdc_netsync = true }
 table.insert(package.searchers, 2, function(name)
     if REAL[name] or not name:match("^sdc_") then return nil end
     return function() return stub() end
@@ -68,6 +68,10 @@ package.loaded["sdc_net"] = {
     broadcast = function(_, kind, ...) SENT[#SENT + 1] = { to = "all", kind = kind, f = { ... } } end,
     on = function(kind, fn) HANDLERS[kind] = fn end,
 }
+do local n = package.loaded["sdc_net"]
+    n.send_to_cb = function(pc, cb, kind, ...) local r = n.send_to(pc, kind, ...); if r and cb then cb() end return r end
+    n.send_to_host_cb = function(cb, kind, ...) local r = n.send_to_host(kind, ...); if r and cb then cb() end return r end
+end
 local function sent(kind, to)
     local out = {}
     for _, m in ipairs(SENT) do
@@ -183,7 +187,9 @@ check(logged("look applied to own BP_PlayerCharacter_C_2147473627", l0) ~= nil, 
 LOOK = "m=1;BeardMesh=PlayerModel/Hair/Beard/Chr_Beard4.Chr_Beard4,PlayerModel/Hair/Material/Brown/MI_CharacterHair_Brown.MI_CharacterHair_Brown,"
 look.tick({})
 local my = sent("MYLOOK")
-check(#my == 1 and my[1].f[1] == LOOK, "the look on: MYLOOK sent with it")
+local dd = require("sdc_dict").decoder("host")
+dd:receive(my[1] and my[1].f[1])
+check(#my == 1 and look.unpack_look(dd, my[1].f[2]) == LOOK, "the look on: MYLOOK sent with it (decoded: the same string)")
 -- a character whose look never gets its try: MYLOOK after 10 s at most
 local pawn2 = obj("BP_PlayerCharacter_C", "BP_PlayerCharacter_C_2147473999", {
     PlayerState = obj("PlayerState", "PS_8", {}, { GetPlayerId = function() return 258 end }) })

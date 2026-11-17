@@ -35,7 +35,7 @@
 --   sdc_chat     text chat between the players (Enter opens a line bottom left; host relays, names are the host's)
 --   sdc_persist other players' characters saved with the host's world (installed by sdc_progress via sdc_respawn)
 
-local VERSION = "0.12.1"
+local VERSION = "0.12.2"
 
 local log = require("sdc_log")
 local perf = require("sdc_perf")         -- [PERF] cost of every mod hook and task; wraps RegisterHook first
@@ -76,7 +76,7 @@ end
 
 local MOD_DIR = mod_dir()
 cfg.load(MOD_DIR .. "/config.ini")
--- Lua collector: incremental 150/200 by default ("generational" = experiment); see sdc_perf
+-- Lua collector: incremental by default; generational and paced (experimental: lost in the in-game A/B, 14.11) are opt-in; see sdc_perf
 pcall(perf.set_gc_mode, cfg.get("lua_gc"), cfg.get("lua_gc_pause"), cfg.get("lua_gc_stepmul"))
 pcall(require("sdc_steam").ensure_server_api, cfg)   -- Engine.ini: bUseSteamNetworking=False (plain UDP sockets under Steam)
 local steamlink = require("sdc_steamlink")   -- Steam join: SDCoopSteamLink.exe carries the game's UDP over Steam P2P
@@ -182,6 +182,7 @@ session.world_reset_hooks.down = function(why) down.reset(why) end
 local chat = require("sdc_chat")         -- text chat between the players of one co-op world (Enter; config chat)
 chat.install(session.state)              -- CHATON/CHAT/CHATM handlers; the line and feed are built from its tick
 session.world_reset_hooks.chat = function(why) chat.reset(why) end
+require("sdc_selftest").install(session.state)   -- in-game self test (config selftest, off by default): STEST* handlers; run from ui_test.txt selftest=1
 session.install_item_watch()
 session.install_death_watch()
 sync.install_time_dilation_guard()
@@ -266,6 +267,7 @@ ue.delay("boot", 4000, function()
     local perf_last = os.clock()
     ue.every("perf", 1000, function()
         pcall(speed.sample)
+        pcall(perf.gc_watch)   -- the paced collector catches up when the frame loop stood still
         -- debug switches set in the settings panel take effect here
         start_gaptrace()
         start_report()

@@ -306,7 +306,7 @@ check(#registered == n0, "each hook once")
 host_use(hwood, host_pawn)
 check(hwood.DotProduct > 0, "host: player 0 = the host, dot > 0")
 local ch1 = take("WBDOOR")
-check(#ch1 == 1 and ch1[1].msg:find("Buildable_WoodenDoor_C 0,0,0 1 1.000 -", 1, true) ~= nil,
+check(#ch1 == 1 and ch1[1].msg:find("d 0,0,0 1 1 -", 1, true) ~= nil,
     "host: WBDOOR with open state and its DotProduct: " .. tostring(ch1[1] and ch1[1].msg))
 -- the multicast on the client: the game used the CLIENT (other side) -> fixed from the opener
 local u0 = calls.update
@@ -464,7 +464,7 @@ T = T + 21
 tick("host", host_mod)
 do
     local m = take("WBDOOR")
-    check(#m >= 1 and m[1].msg:find("GarageDoor", 1, true) and not m[1].msg:find("WoodenDoor_C", 1, true),
+    check(#m >= 1 and m[1].msg:find("r ", 1, true) and not m[1].msg:find("d ", 1, true),
         "host: door A's silent change goes with the next check (only A: it is B's own record that was marked)")
 end
 host_use(hwood, host_pawn)   -- back
@@ -486,7 +486,7 @@ T = T + 181
 tick("host", host_mod)
 check(#take("WBDOOR") >= 1, "host: the verify: all doors again after 180 s")
 on("client")
-net.handlers.WBDOOR({ "s", "Buildable_WoodenDoor_C 160579,129273,1735 0 - -" }, client_pc)
+net.handlers.WBDOOR({ "s", "d 160579,129273,1735 0 - -" }, client_pc)
 T = T + 300
 tick("client", fresh)
 check(fresh.status_line():find("known=0", 1, true) == nil, "client: a host state is still kept some minutes without a refresh (400 s)")

@@ -2705,6 +2705,7 @@ end
 
 local JC = {
     TIMEOUT_S = 60,       -- in the host's world: the game is shown after this long anyway
+    STEAM_TIMEOUT_S = 90, -- a Steam join waits for the tunnel itself (OPEN_TIMEOUT_S) longer
     LOAD_MAX_S = 120,     -- from the join's start to the host's world
     GRACE_S = 3,          -- a join just asked: its connection attempt shows up within this
     FRESH_MAX_S = 10,     -- a new character: set up here (sdc_progress, 6 s after it came) or this long
@@ -2785,7 +2786,8 @@ if type(i18n.SAY_CLASS) == "table" and i18n.SAY_CLASS.host_menu_you == nil then 
 JC.QUIET = { connecting = true, sl_joining = true, connected = true, connected_to = true, sl_wait_host = true,
              persist_fresh_client = true, persist_restored_client = true, access_ok_you = true,
              -- the cover's line says it (sdc_steamlink.status: sl_st_silent / sl_st_silent_left)
-             sl_host_silent = true, sl_host_silent_left = true }
+             sl_host_silent = true, sl_host_silent_left = true,
+             sl_host_no_answer = true, sl_st_no_answer = true }
 -- Said on the cover only while it shows (or is about to show) the wait for the
 -- host's answer: before this player's character exists.
 JC.BEFORE_CHAR = { connect = true, load = true, pawn = true, wait = true }
@@ -3125,8 +3127,9 @@ function JC.update(now)
                     end
                 end
             end
-            if now - s.loaded_at >= JC.TIMEOUT_S then
-                return JC.finish(now, "timeout", string.format("%d s in the host's world", JC.TIMEOUT_S))
+            local limit = (s.via == "steam" and JC.STEAM_TIMEOUT_S) or JC.TIMEOUT_S
+            if now - s.loaded_at >= limit then
+                return JC.finish(now, "timeout", string.format("%d s in the host's world", limit))
             end
         end
     end
@@ -4060,6 +4063,11 @@ local function apply_test(k, v)
             end
         end
         log.info("ui: test: journal tab %s (%d journal widget(s), ok=%s)", tostring(v), #arr, tostring(okj))
+    elseif k == "selftest" then
+        -- the in-game self test (sdc_selftest, config selftest): 1 = start on this client, 0 = stop
+        local st = package.loaded["sdc_selftest"]
+        log.info("ui: test: selftest=%s (%s)", log.ascii(v), st and "module loaded" or "module missing")
+        if st then st.command(v) end
     elseif k == "weather" then
         local okw = require("sdc_sync").test_weather(v)
         log.info("ui: test: weather channels %s (ok=%s)", log.ascii(v), tostring(okw))

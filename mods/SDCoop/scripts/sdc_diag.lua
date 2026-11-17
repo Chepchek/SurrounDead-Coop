@@ -190,8 +190,29 @@ local function snapshot(S, own_line, own_pawn)
     M.stats.snaps = M.stats.snaps + 1
     local nrem = 0
     for _ in pairs(S.remote or {}) do nrem = nrem + 1 end
-    log.info("[SNAP] head v=%s role=%s map=%s in_menu=%s remotes=%d uptime=%ds", st.version, tostring(S.role),
-        tostring(S.map), tostring(S.in_menu), nrem, os.time() - st.started)
+    -- characters in this world and how many of them are other players' copies here: a client
+    -- that keeps proxies of players the host no longer has shows chars above the roster size
+    local chars, sim = 0, 0
+    for _, p in ipairs(ue.find_all("BP_PlayerCharacter_C") or {}) do
+        if ue.valid(p) then
+            chars = chars + 1
+            if S.role == "client" and ue.role(p) == ue.ROLE_SIMULATED then sim = sim + 1 end
+        end
+    end
+    local roster_n = 0
+    local session = package.loaded["sdc_session"]
+    if session and session.roster then
+        local ok, list = pcall(session.roster)
+        if ok and type(list) == "table" then roster_n = #list end
+    end
+    -- A client keeps one copy of every other player (role 1) and one hidden local
+    -- copy of its own character (role 3, moved far away), so chars alone says
+    -- little. Proxies over the roster are the stale ones (the "dolls").
+    local expect = roster_n > 0 and math.max(0, roster_n - 1) or 0
+    local proxies = S.role == "client" and math.max(0, sim - expect) or 0
+    log.info("[SNAP] head v=%s role=%s map=%s in_menu=%s remotes=%d chars=%d sim=%d roster=%d proxies=%d uptime=%ds",
+        st.version, tostring(S.role), tostring(S.map), tostring(S.in_menu), nrem, chars, sim, roster_n, proxies,
+        os.time() - st.started)
     log.info("[SNAP] own %s", own_line)
     local center = ue.valid(own_pawn) and ue.location(own_pawn) or nil
     if S.role == "host" then

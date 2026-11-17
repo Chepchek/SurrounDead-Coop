@@ -22,6 +22,7 @@
 -- usage: lua mock_world_rockloot.lua <scripts dir>
 local SCRIPTS = arg[1]
 package.path = SCRIPTS .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
 
 local T = 100.0
 os.clock = function() return T end
@@ -530,7 +531,7 @@ check(HW.hooks[JIG .. "JigTryAddGetPendingRef"] ~= nil and HW.hooks[JIG .. "CLIE
 print("== 1. the client breaks a rock: a new stack where its screen put it")
 local n_log = #logs
 client_local_add("DA_Rock", 12, slot_widget(w_bp, 0, ZERO, 12), false)
-check(#CW.outbox == 1 and CW.outbox[1]:find("WSPOT|DA_Rock|c|" .. gs(G_BP), 1, true) ~= nil,
+check(#CW.outbox == 1 and CW.outbox[1]:find("WSPOT|DA_Rock|c|" .. wire.uid_enc(gs(G_BP)), 1, true) ~= nil,
     "client: its screen's grid sent (" .. tostring(CW.outbox[1]) .. ")")
 check(log_has("client info: world: DA_Rock x12 added here by the game: this screen puts it in Backpack slot 0; the host is told", n_log) ~= nil,
     "client: logged where its screen puts it")
@@ -557,7 +558,7 @@ print("== 2. the next rock: onto the stack its screen grows")
 n_log = #logs
 local stack_uid = list[1] and list[1].it[F.USID] or ZERO
 client_local_add("DA_Rock", 10, cl[1] and cl[1].s or slot_widget(w_bp, 0, ZERO, 1), true)
-check(#CW.outbox == 1 and CW.outbox[1]:find("WSPOT|DA_Rock|s|" .. gs(stack_uid), 1, true) ~= nil, "client: the stack sent")
+check(#CW.outbox == 1 and CW.outbox[1]:find("WSPOT|DA_Rock|s|" .. wire.uid_enc(gs(stack_uid)), 1, true) ~= nil, "client: the stack sent")
 deliver()
 local r2 = host_grant("DA_Rock", 9, rpc)
 list, total = rocks_on_host()
@@ -716,7 +717,7 @@ print("== 11. the host: words it does not take")
 WORLD = HW
 advance(31)   -- (step 8's word, unused: the host's own swing, too old now)
 local hs = #logs
-H.net.handlers.WSPOT({ "DA_Pistol", "c", gs(G_BP) }, rpc)
+H.net.handlers.WSPOT({ "DA_Pistol", "c", wire.uid_enc(gs(G_BP)) }, rpc)
 H.net.handlers.WSPOT({ "DA_Rock", "c", "not-a-guid" }, rpc)
 H.net.handlers.WSPOT({ "DA_Rock", "x" }, rpc)
 check(log_has("puts", hs) == nil, "not a resource / a bad uid / an unknown kind: ignored")
@@ -726,7 +727,7 @@ host_grant("DA_Rock", 9, rpc)
 settle()
 check(ncalls(rjig, "AddNewItemSomewhere") == adds0 and #asked == ask0 + 1, "and the next grant asks that screen")
 -- a word for one player is not another's (the host's own drop is no remote grant at all)
-H.net.handlers.WSPOT({ "DA_WoodenLog", "c", gs(G_BP) }, HW.pc)
+H.net.handlers.WSPOT({ "DA_WoodenLog", "c", wire.uid_enc(gs(G_BP)) }, HW.pc)
 adds0 = ncalls(rjig, "AddNewItemSomewhere")
 ask0 = #asked
 host_grant("DA_WoodenLog", 10, rpc)

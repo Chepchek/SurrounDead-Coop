@@ -5,6 +5,8 @@
 -- usage: lua mock_items_perf.lua <scripts dir>
 local dir = arg[1]
 package.path = dir .. "/?.lua;" .. package.path
+local wire = require("sdc_wire")
+local function U(a) return wire.uid_enc(a .. ":0:0:0") end
 
 local fails, checks = 0, 0
 local function check(cond, what)
@@ -187,6 +189,9 @@ items.init(S_)
 items.register_handlers()
 items.install()
 
+check(items.q1(0.3) == "1" and items.q1(0) == "0" and items.q1(0.49) == "1" and items.q1(55.5) == "56" and items.q1(99.4) == "99",
+  "durability on the wire: above 0 never 0, 0 stays 0, rounded to 1")
+
 -- ------------------------------------------------------------ 0 remote players
 print("no remote player:")
 local p1 = player(1, std_inventory(), { X = 0, Y = 0, Z = 0 })
@@ -204,10 +209,10 @@ items.host_tick({ p1.pc })
 check(p1.walks() == 1, "one walk of the inventory per tick (was 4): " .. p1.walks())
 check(reads <= 6 * 15 + 3 * 8 + 3 * 6 + 2 * 6, "struct reads bounded: " .. reads)
 local u = msgs("PC1", "UIDS")
-check(#u == 1 and u[1].args[1] == "Jig.PlayerSlot.Headwear=10:0:0:0@90.00;Jig.PlayerSlot.PrimaryWeapon=20:0:0:0@55.50",
+check(#u == 1 and u[1].args[1] == "Jig.PlayerSlot.Headwear=" .. U(10) .. "@90;Jig.PlayerSlot.PrimaryWeapon=" .. U(20) .. "@56",
   "UIDS with durabilities: " .. tostring(u[1] and u[1].args[1]))
 local it = msgs("PC1", "ITEMS")
-check(#it == 1 and it[1].args[1] == "10:0:0:0=90.0/80.0;11:0:0:0=80.0/40.0;12:0:0:0=40.0;20:0:0:0=55.5;30:0:0:0=100.0",
+check(#it == 1 and it[1].args[1] == U(10) .. "=90/80;" .. U(11) .. "=80/40;" .. U(12) .. "=40;" .. U(20) .. "=56;" .. U(30) .. "=100",
   "ITEMS with battery charges: " .. tostring(it[1] and it[1].args[1]))
 local pt = msgs("PC1", "PTOOLS")
 check(#pt == 1 and pt[1].args[2] == "40.00", "PTOOLS with the NVG battery: " .. tostring(pt[1] and pt[1].args[2]))
@@ -224,14 +229,36 @@ check(p1.walks() == 1, "an unchanged inventory is not walked again (the drain is
 pt = msgs("PC1", "PTOOLS")
 it = msgs("PC1", "ITEMS")
 check(#pt == 1 and pt[1].args[2] == "39.85", "PTOOLS after the drain: " .. tostring(pt[1] and pt[1].args[2]))
-check(#it == 1 and it[1].args[1]:find("11:0:0:0=80.0/39.9;12:0:0:0=39.9", 1, true) ~= nil,
-  "ITEMS after the drain: " .. tostring(it[1] and it[1].args[1]))
+-- (39.9 / 39.85 round to the same 40 as before: a change of less than 1 % sends no ITEMS)
+check(#it == 0, "ITEMS after a drain of less than 1 %: not sent again (" .. #it .. ")")
 handlers.MYNVG({ "0" }, p1.pc)
 -- unchanged: no UIDS / ITEMS again
 sent = {}
 T = T + 1
 items.host_tick({ p1.pc })
 check(#msgs("PC1", "UIDS") == 0 and #msgs("PC1", "ITEMS") == 0, "unchanged inventory: no UIDS / ITEMS")
+-- a durability changes by less than 1 %: the walk sees it, ITEMS is not sent (the number on the wire is the same);
+-- by 1 % or more: sent. (Item 30 is 100: 99.7 -> "100", 98.7 -> "99".)
+p1.jig:ServerFuncUpdateDurabilityByUID({ A = 30, B = 0, C = 0, D = 0 }, 0.3, false, {})
+sent = {}
+T = T + 15
+items.host_tick({ p1.pc })
+check(#msgs("PC1", "ITEMS") == 0, "durability 100 -> 99.7: below the 1 % step, no ITEMS")
+p1.jig:ServerFuncUpdateDurabilityByUID({ A = 30, B = 0, C = 0, D = 0 }, 1.0, false, {})
+sent = {}
+T = T + 15
+items.host_tick({ p1.pc })
+local it_step = msgs("PC1", "ITEMS")
+check(#it_step == 1 and it_step[1].args[1]:find(U(30) .. "=99", 1, true) ~= nil,
+  "durability 98.7: a step of more than 1 %, ITEMS sent at once with 99: " .. tostring(it_step[1] and it_step[1].args[1]))
+-- unchanged for the verify interval (60 s): the same ITEMS / UIDS go again (a lost one heals)
+sent = {}
+T = T + 30
+items.host_tick({ p1.pc })
+check(#msgs("PC1", "ITEMS") == 0, "30 s later, nothing changed: not sent")
+T = T + 40
+items.host_tick({ p1.pc })
+check(#msgs("PC1", "ITEMS") == 1 and #msgs("PC1", "UIDS") == 1, "70 s after the last send: the verify sends both again")
 
 -- ------------------------------------------------------------ 2 remote players
 print("two remote players:")
